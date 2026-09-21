@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: mcp-agent-proxy
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: UPSTREAM_BASE_URL
+        sync: false
+      - key: UPSTREAM_API_KEY
+        sync: false
+      - key: PROXY_API_KEY
+        sync: false
