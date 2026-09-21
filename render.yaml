@@ -13,3 +13,7 @@ services:
         sync: false
       - key: PROXY_API_KEY
         sync: false
+      - key: PANEL_PASSWORD
+        sync: false
+      - key: DATABASE_URL
+        sync: false
