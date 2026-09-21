@@ -91,6 +91,7 @@ async function initDatabase() {
       connectionString: DATABASE_URL,
       ssl: { rejectUnauthorized: false }
     });
+    pgPool.on("error", () => {});
     await pgPool.query(`
       CREATE TABLE IF NOT EXISTS mcp_servers (
         id TEXT PRIMARY KEY,
@@ -288,36 +289,7 @@ function readRequestBody(request) {
 
 function isMcpContext(requestBody) {
   if (mcpToolRegistry.size === 0) return false;
-  const rawMessages = requestBody.messages || [];
-  if (!Array.isArray(rawMessages) || rawMessages.length === 0) return false;
-
-  const combinedText = rawMessages
-    .map((m) => {
-      if (typeof m.content === "string") return m.content;
-      if (Array.isArray(m.content)) {
-        return m.content
-          .map((c) => (typeof c === "string" ? c : c?.text || ""))
-          .join(" ");
-      }
-      return "";
-    })
-    .join("\n");
-
-  const serverNames = Array.from(mcpServers.values())
-    .filter((s) => s.status === "active")
-    .map((s) => s.name.replace(/[^a-zA-Z0-9_\u4e00-\u9fa5]/g, ""))
-    .filter(Boolean);
-
-  const keywords = [
-    "mcp", "github", "git\\b", "repo", "代码库", "仓库", "commit", "pr\\b", "pull request",
-    "分支", "branch", "提取代码", "读取文件", "查看文件", "修改文件", "创建文件", "新建文件", "删除文件",
-    "提交", "推送", "push", "写入", "更新", "修改", "替换", "帮我修改", "帮我提交",
-    "cloudflare", "cf\\b", "worker", "workers", "kv\\b", "d1\\b", "r2\\b", "dns", "domain", "域名",
-    ...serverNames
-  ];
-
-  const pattern = new RegExp(`(${keywords.join("|")})`, "i");
-  return pattern.test(combinedText);
+  return true;
 }
 
 async function parseMcpResponse(res) {
@@ -492,7 +464,8 @@ function buildToolPrompt() {
     `2. 识别用户的意图时必须包容各种简写、代称（例如：cf = Cloudflare、gh = GitHub、k8s = Kubernetes 等）。`,
     `3. 只要存在与用户请求意图相关的工具，第一步必须调用该工具获取真实数据，严禁凭空臆造结果。`,
     `4. 严禁假操作、假提交与虚构结果：凡涉及文件修改、创建、删除、代码提交（commit）、分支或PR操作等写入类请求，必须发起真实的工具调用。在未调用工具或工具未返回成功结果前，严禁编造 Commit SHA、链接或声称“已提交/已修改”。`,
-    `5. 工具执行若返回错误或失败，必须如实向用户说明失败详情，严禁隐瞒错误或将失败伪造成成功。`
+    `5. 工具执行若返回错误或失败，必须如实向用户说明失败详情，严禁隐瞒错误或将失败伪造成成功。`,
+    `6. 严禁编造不存在的仓库文件或虚构项目架构：严格以当前仓库实际拉取到的文件为准，不得凭空假想 worker.js、index.js 等无关文件。`
   ].join("\n");
 }
 
