@@ -255,6 +255,43 @@ function readRequestBody(request) {
   });
 }
 
+// 统一标准网络搜索引擎（免 Key，实时聚合网页资讯）
+async function executeWebSearch(query) {
+  const cleanQuery = (query || "").trim();
+  if (!cleanQuery) return "搜索关键词不能为空";
+
+  try {
+    const res = await fetch("https://html.duckduckgo.com/html/", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+      },
+      body: `q=${encodeURIComponent(cleanQuery)}`,
+      signal: AbortSignal.timeout(12000)
+    });
+
+    if (!res.ok) throw new Error(`搜索引擎响应错误 (${res.status})`);
+    const html = await res.text();
+    const results = [];
+    const snippetRe = /<a class="result__snippet[^>]*>(.*?)<\/a>/g;
+    let match;
+    while ((match = snippetRe.exec(html)) !== null && results.length < 5) {
+      const clean = match[1].replace(/<[^>]+>/g, "").trim();
+      if (clean) results.push(clean);
+    }
+
+    if (results.length === 0) {
+      return `针对 "${cleanQuery}" 暂未检索到公开网页结果。`;
+    }
+
+    return `针对 "${cleanQuery}" 的实时互联网检索结果：\n\n` +
+      results.map((item, idx) => `[${idx + 1}] ${item}`).join("\n\n");
+  } catch (err) {
+    return `网络搜索执行失败：${err instanceof Error ? err.message : "未知错误"}`;
+  }
+}
+
 async function parseMcpResponse(res) {
   const contentType = res.headers.get("Content-Type") || "";
   if (contentType.includes("text/event-stream")) {
@@ -385,7 +422,11 @@ async function connectToMcpServer({ name, url, token }) {
   return serverInfo;
 }
 
-async function callMcpTool(toolKey, args) {
+async function callTool(toolKey, args) {
+  if (toolKey === "web_search") {
+    return await executeWebSearch(args?.query || "");
+  }
+
   let info = mcpToolRegistry.get(toolKey);
   if (!info) {
     for (const [k, v] of mcpToolRegistry.entries()) {
@@ -428,8 +469,24 @@ async function callMcpTool(toolKey, args) {
   return typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
 }
 
+// 标准网络搜索工具声明（作为标准工具无缝并入工具池）
+const WEB_SEARCH_TOOL = {
+  type: "function",
+  function: {
+    name: "web_search",
+    description: "实时互联网搜索引擎。当需要检索最新事实、技术文档、新闻资讯或外部公开内容时按需调用。基础问答与闲聊无需调用。",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "搜索关键词" }
+      },
+      required: ["query"]
+    }
+  }
+};
+
 function getAllTools() {
-  const tools = [];
+  const tools = [WEB_SEARCH_TOOL];
   for (const s of mcpServers.values()) {
     if (s.status === "active") {
       for (const t of s.tools) tools.push(t.openAiTool);
@@ -503,47 +560,6 @@ async function passThrough(requestBody, clientResponse) {
   clientResponse.end();
 }
 
-/**
- * 智能判断请求是否涉及已激活的 MCP 服务。
- * 只有在用户意图明确需要已连接的 MCP 时才注入 tools 走 Agent 模式；
- * 通用问答、实时资讯、新闻、闲聊等直接 passThrough，完整保留上游网关的 Raw 网络搜索规则。
- */
-function shouldRouteToMcpAgent(requestBody) {
-  if (mcpToolRegistry.size === 0) return false;
-  if (Array.isArray(requestBody.tools) && requestBody.tools.length > 0) return true;
-
-  const messages = requestBody.messages;
-  if (!Array.isArray(messages) || messages.length === 0) return false;
-
-  const activeServers = Array.from(mcpServers.values()).filter((s) => s.status === "active");
-  if (activeServers.length === 0) return false;
-
-  const textContent = messages
-    .map((m) => {
-      if (typeof m.content === "string") return m.content;
-      if (Array.isArray(m.content)) {
-        return m.content.map((c) => (typeof c === "string" ? c : c?.text || "")).join(" ");
-      }
-      return "";
-    })
-    .join("\n")
-    .toLowerCase();
-
-  // 1. 匹配用户配置的 MCP 服务器名称
-  for (const s of activeServers) {
-    const serverName = (s.name || "").toLowerCase().trim();
-    if (serverName && textContent.includes(serverName)) return true;
-  }
-
-  // 2. 匹配常见已接入服务的核心领域关键词
-  const keywords = [
-    "github", "repo", "仓库", "commit", "分支", "branch", "pr", "pull request",
-    "issue", "cloudflare", "worker", "workers", "dns", "kv", "d1", "r2", "mcp"
-  ];
-
-  return keywords.some((kw) => textContent.includes(kw));
-}
-
 async function runAgent(requestBody, clientResponse) {
   if (!Array.isArray(requestBody.messages) || requestBody.messages.length === 0) {
     throw new Error("messages 必须是非空数组");
@@ -552,6 +568,7 @@ async function runAgent(requestBody, clientResponse) {
   const isStream = requestBody.stream === true;
   const messages = [...requestBody.messages];
 
+  // 全量标准工具：聚合网络搜索工具 + 所有激活的 MCP 工具（如 GitHub、Cloudflare 等）
   const clientTools = Array.isArray(requestBody.tools)
     ? requestBody.tools.filter((t) => t && t.type === "function")
     : [];
@@ -568,6 +585,7 @@ async function runAgent(requestBody, clientResponse) {
     });
   }
 
+  // 10 轮循环支持多步链式调用（例如：第1步搜索最新资料 -> 第2步写入GitHub -> 第3步输出结果）
   for (let round = 0; round < 10; round += 1) {
     const payload = {
       ...requestBody,
@@ -666,8 +684,9 @@ async function runAgent(requestBody, clientResponse) {
       }
     }
 
-    const mcpCalls = accumulatedToolCalls.filter((tc) => {
+    const validCalls = accumulatedToolCalls.filter((tc) => {
       if (!tc || !tc.name) return false;
+      if (tc.name === "web_search") return true;
       if (mcpToolRegistry.has(tc.name)) return true;
       for (const [k, v] of mcpToolRegistry.entries()) {
         if (k.endsWith(tc.name) || tc.name.endsWith(v.rawName)) return true;
@@ -675,7 +694,8 @@ async function runAgent(requestBody, clientResponse) {
       return false;
     });
 
-    if (mcpCalls.length === 0) {
+    // 模型未调用任何工具（普通问答或链式调用的最终总结），直接完整输出
+    if (validCalls.length === 0) {
       if (isStream) {
         for (const line of streamedDeltas) {
           clientResponse.write(`${line}\n\n`);
@@ -701,19 +721,21 @@ async function runAgent(requestBody, clientResponse) {
       return;
     }
 
+    // 记录模型本轮的 tool_calls
     messages.push({
       role: "assistant",
       content: assistantContent || null,
-      tool_calls: mcpCalls.map((tc) => ({
+      tool_calls: validCalls.map((tc) => ({
         id: tc.id || `call_${crypto.randomUUID()}`,
         type: "function",
         function: { name: tc.name, arguments: tc.arguments }
       }))
     });
 
-    for (const tc of mcpCalls) {
-      let toolInfo = mcpToolRegistry.get(tc.name);
-      if (!toolInfo) {
+    // 依次真实执行（无论是 web_search 还是 GitHub、Cloudflare）
+    for (const tc of validCalls) {
+      let toolInfo = tc.name === "web_search" ? null : mcpToolRegistry.get(tc.name);
+      if (!toolInfo && tc.name !== "web_search") {
         for (const [k, v] of mcpToolRegistry.entries()) {
           if (k.endsWith(tc.name) || tc.name.endsWith(v.rawName)) {
             toolInfo = v;
@@ -722,8 +744,8 @@ async function runAgent(requestBody, clientResponse) {
         }
       }
 
-      const displayName = toolInfo?.serverName || "MCP";
-      const rawAction = toolInfo?.rawName || tc.name;
+      const displayName = tc.name === "web_search" ? "网络搜索" : (toolInfo?.serverName || "MCP");
+      const rawAction = tc.name === "web_search" ? "执行网页检索" : (toolInfo?.rawName || tc.name);
       const args = toolArguments({ function: { arguments: tc.arguments } });
 
       if (isStream) {
@@ -739,7 +761,7 @@ async function runAgent(requestBody, clientResponse) {
         result = JSON.stringify({ error: "Invalid tool arguments" });
       } else {
         try {
-          result = await callMcpTool(tc.name, args);
+          result = await callTool(tc.name, args);
         } catch (err) {
           result = JSON.stringify({ error: err instanceof Error ? err.message : "Tool call failed" });
         }
@@ -748,11 +770,12 @@ async function runAgent(requestBody, clientResponse) {
       if (isStream) {
         sendReasoningChunk(
           clientResponse,
-          `> ${displayName} (${rawAction}) 调用完成\n\n`,
+          `> ${displayName} (${rawAction}) 执行完成\n\n`,
           requestBody.model
         );
       }
 
+      // 将执行结果作为 tool 角色消息回填进对话上下文，供模型下一步继续使用
       messages.push({
         role: "tool",
         tool_call_id: tc.id || `call_${crypto.randomUUID()}`,
@@ -1032,11 +1055,7 @@ const server = http.createServer(async (request, response) => {
       }
 
       const body = await readRequestBody(request);
-      if (shouldRouteToMcpAgent(body)) {
-        await runAgent(body, response);
-      } else {
-        await passThrough(body, response);
-      }
+      await runAgent(body, response);
       return;
     }
 
