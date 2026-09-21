@@ -18,6 +18,9 @@
       margin: 0 auto;
     }
     .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
       margin-bottom: 24px;
     }
     .header h1 {
@@ -30,6 +33,19 @@
       font-size: 14px;
       color: #64748b;
       margin-top: 4px;
+    }
+    .btn-logout {
+      background: #f1f5f9;
+      color: #475569;
+      border: 1px solid #cbd5e1;
+      padding: 6px 12px;
+      font-size: 13px;
+      font-weight: 500;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    .btn-logout:hover {
+      background: #e2e8f0;
     }
     .card {
       background: #ffffff;
@@ -177,13 +193,58 @@
       color: #94a3b8;
       font-size: 14px;
     }
+
+    #auth-overlay {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(15, 23, 42, 0.6);
+      backdrop-filter: blur(4px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 999;
+      padding: 16px;
+    }
+    .auth-card {
+      background: #ffffff;
+      border-radius: 12px;
+      padding: 28px;
+      width: 100%;
+      max-width: 380px;
+      box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+      text-align: center;
+    }
+    .auth-card h2 {
+      font-size: 18px;
+      font-weight: 700;
+      color: #0f172a;
+      margin-bottom: 8px;
+    }
+    .auth-card p {
+      font-size: 13px;
+      color: #64748b;
+      margin-bottom: 20px;
+    }
   </style>
 </head>
 <body>
-  <div class="container">
+  <div id="auth-overlay">
+    <div class="auth-card">
+      <h2>控制台访问认证</h2>
+      <p>请输入后台管理密码以进入面板</p>
+      <input id="panel-pwd" type="password" placeholder="输入管理密码" style="margin-bottom: 14px;" onkeydown="if(event.key==='Enter')handleLogin()">
+      <button class="btn" style="width: 100%;" onclick="handleLogin()">验证并进入</button>
+      <div id="auth-msg" style="margin-top: 10px; font-size: 13px; color: #dc2626;"></div>
+    </div>
+  </div>
+
+  <div class="container" id="main-content">
     <div class="header">
-      <h1>MCP 代理控制台</h1>
-      <p>为 Chatbox 和 OpenAI 生态客户端提供全自动 MCP 工具接入</p>
+      <div>
+        <h1>MCP 代理控制台</h1>
+        <p>为 Chatbox 和 OpenAI 生态客户端提供全自动多 MCP 工具接入与持久化存储</p>
+      </div>
+      <button id="logout-btn" class="btn-logout" style="display: none;" onclick="handleLogout()">退出管理</button>
     </div>
 
     <div class="card">
@@ -202,29 +263,31 @@
     </div>
 
     <div class="card">
-      <div class="card-title">挂载远程 MCP 服务</div>
+      <div class="card-title">手动挂载 MCP 服务（支持添加多个）</div>
       <div class="group">
-        <label>服务前缀名称</label>
-        <input id="mcp-name" value="Github" placeholder="例如 Github、Gitlab、Notion">
+        <label>服务前缀名称（如 Github、Gitlab、Notion、Bilibili 等）</label>
+        <input id="mcp-name" value="Github" placeholder="输入唯一标识名称">
       </div>
       <div class="group">
-        <label>MCP 服务地址</label>
+        <label>MCP 服务地址 (HTTP / SSE 端点)</label>
         <input id="mcp-url" value="https://api.githubcopilot.com/mcp/" placeholder="https://...">
       </div>
       <div class="group">
         <label>认证令牌 (Token，可选)</label>
-        <input id="mcp-token" type="password" placeholder="如需认证请粘贴 Token（如 ghu_、ghp_）">
+        <input id="mcp-token" type="password" placeholder="如需认证请粘贴 Token（如 ghu_、ghp_、Bearer）">
       </div>
       <div style="display: flex; align-items: center; margin-top: 18px;">
-        <button id="btn-conn" class="btn" onclick="handleConnect()">连接并提取工具</button>
+        <button id="btn-conn" class="btn" onclick="handleConnect()">添加并挂载此服务</button>
         <span id="conn-msg"></span>
       </div>
     </div>
 
     <div class="card">
-      <div class="card-title">已挂载 MCP 服务列表</div>
+      <div class="card-title">
+        <span>已挂载 MCP 服务列表</span>
+      </div>
       <div id="mcp-list">
-        <div class="empty-state">正在加载配置...</div>
+        <div class="empty-state">正在加载服务列表...</div>
       </div>
     </div>
   </div>
@@ -232,13 +295,84 @@
   <script>
     document.getElementById("proxy-url").innerText = window.location.origin + "/v1";
 
+    function getAuthHeader() {
+      const pwd = localStorage.getItem("panelPassword") || "";
+      return pwd ? { "x-panel-password": pwd } : {};
+    }
+
+    async function checkAuth() {
+      try {
+        const res = await fetch("/api/panel/status");
+        const data = await res.json();
+        if (data.requiresPassword) {
+          document.getElementById("logout-btn").style.display = "block";
+          const savedPwd = localStorage.getItem("panelPassword");
+          if (!savedPwd) {
+            document.getElementById("auth-overlay").style.display = "flex";
+            return false;
+          }
+          const verifyRes = await fetch("/api/panel/verify", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ password: savedPwd })
+          });
+          if (!verifyRes.ok) {
+            localStorage.removeItem("panelPassword");
+            document.getElementById("auth-overlay").style.display = "flex";
+            return false;
+          }
+        }
+        document.getElementById("auth-overlay").style.display = "none";
+        return true;
+      } catch {
+        return true;
+      }
+    }
+
+    async function handleLogin() {
+      const pwd = document.getElementById("panel-pwd").value.trim();
+      const msg = document.getElementById("auth-msg");
+      if (!pwd) {
+        msg.innerText = "请输入管理密码";
+        return;
+      }
+      try {
+        const res = await fetch("/api/panel/verify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password: pwd })
+        });
+        if (!res.ok) {
+          msg.innerText = "密码错误，请重新输入";
+          return;
+        }
+        localStorage.setItem("panelPassword", pwd);
+        document.getElementById("auth-overlay").style.display = "none";
+        document.getElementById("panel-pwd").value = "";
+        msg.innerText = "";
+        loadServers();
+      } catch (e) {
+        msg.innerText = e.message;
+      }
+    }
+
+    function handleLogout() {
+      localStorage.removeItem("panelPassword");
+      location.reload();
+    }
+
     async function loadServers() {
       try {
-        const res = await fetch("/api/mcp/servers");
+        const res = await fetch("/api/mcp/servers", { headers: getAuthHeader() });
+        if (res.status === 401) {
+          localStorage.removeItem("panelPassword");
+          document.getElementById("auth-overlay").style.display = "flex";
+          return;
+        }
         const data = await res.json();
         const el = document.getElementById("mcp-list");
         if (!data.servers || data.servers.length === 0) {
-          el.innerHTML = '<div class="empty-state">尚未挂载任何远程 MCP 服务。直接透传上游配置与内置搜索。</div>';
+          el.innerHTML = '<div class="empty-state">尚未挂载任何远程 MCP 服务。直接透传上游模型配置与联网搜索。</div>';
           return;
         }
         let html = "";
@@ -277,7 +411,10 @@
       try {
         const res = await fetch("/api/mcp/connect", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            ...getAuthHeader()
+          },
           body: JSON.stringify({ name, url, token })
         });
         const data = await res.json();
@@ -293,12 +430,18 @@
     }
 
     async function handleDelete(id) {
-      if (!confirm("确认断开该 MCP？")) return;
-      await fetch('/api/mcp/servers/' + id, { method: "DELETE" });
+      if (!confirm("确认断开该 MCP 服务？")) return;
+      await fetch('/api/mcp/servers/' + id, {
+        method: "DELETE",
+        headers: getAuthHeader()
+      });
       loadServers();
     }
 
-    loadServers();
+    (async () => {
+      const ok = await checkAuth();
+      if (ok) loadServers();
+    })();
   </script>
 </body>
 </html>
