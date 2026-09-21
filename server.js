@@ -22,11 +22,21 @@ const SESSION_SECRET = process.env.SESSION_SECRET || (PANEL_PASSWORD ? crypto.cr
 
 function getToolAction(toolName) {
   const name = (toolName || "").toLowerCase();
-  if (name.includes("delete") || name.includes("remove")) return "删除";
-  if (name.includes("update") || name.includes("merge") || name.includes("resolve") || name.includes("patch") || name.includes("edit")) return "更新/修改";
-  if (name.includes("create") || name.includes("add") || name.includes("push") || name.includes("fork")) return "创建";
-  if (name.includes("get") || name.includes("list") || name.includes("search") || name.includes("read") || name.includes("docs")) return "查询";
-  if (name.includes("execute") || name.includes("run")) return "执行";
+  if (name.includes("delete") || name.includes("remove")) {
+    return "删除";
+  }
+  if (name.includes("update") || name.includes("merge") || name.includes("resolve") || name.includes("patch") || name.includes("edit")) {
+    return "更新/修改";
+  }
+  if (name.includes("create") || name.includes("add") || name.includes("push") || name.includes("fork")) {
+    return "创建";
+  }
+  if (name.includes("get") || name.includes("list") || name.includes("search") || name.includes("read") || name.includes("docs")) {
+    return "查询";
+  }
+  if (name.includes("execute") || name.includes("run")) {
+    return "执行";
+  }
   return "处理";
 }
 
@@ -82,18 +92,7 @@ async function initDatabase() {
       ssl: { rejectUnauthorized: false }
     });
     await pgPool.query(`
-      CREATE TABLE IF NOT EXISTS mcp_servers (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        url TEXT NOT NULL,
-        raw_token TEXT,
-        status TEXT DEFAULT 'active',
-        post_endpoint TEXT,
-        headers JSONB,
-        tool_count INT,
-        tools JSONB,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
+      CREATE TABLE IF NOT EXISTS mcp_servers (\n        id TEXT PRIMARY KEY,\n        name TEXT NOT NULL,\n        url TEXT NOT NULL,\n        raw_token TEXT,\n        status TEXT DEFAULT 'active',\n        post_endpoint TEXT,\n        headers JSONB,\n        tool_count INT,\n        tools JSONB,\n        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n      );
     `);
     try {
       await pgPool.query("ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active';");
@@ -107,18 +106,7 @@ async function saveServerToStorage(serverItem) {
   if (pgPool) {
     try {
       await pgPool.query(
-        `INSERT INTO mcp_servers (id, name, url, raw_token, status, post_endpoint, headers, tool_count, tools, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)
-         ON CONFLICT (id) DO UPDATE SET
-           name = EXCLUDED.name,
-           url = EXCLUDED.url,
-           raw_token = EXCLUDED.raw_token,
-           status = EXCLUDED.status,
-           post_endpoint = EXCLUDED.post_endpoint,
-           headers = EXCLUDED.headers,
-           tool_count = EXCLUDED.tool_count,
-           tools = EXCLUDED.tools,
-           updated_at = CURRENT_TIMESTAMP`,
+        `INSERT INTO mcp_servers (id, name, url, raw_token, status, post_endpoint, headers, tool_count, tools, updated_at)\n         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)\n         ON CONFLICT (id) DO UPDATE SET\n           name = EXCLUDED.name,\n           url = EXCLUDED.url,\n           raw_token = EXCLUDED.raw_token,\n           status = EXCLUDED.status,\n           post_endpoint = EXCLUDED.post_endpoint,\n           headers = EXCLUDED.headers,\n           tool_count = EXCLUDED.tool_count,\n           tools = EXCLUDED.tools,\n           updated_at = CURRENT_TIMESTAMP`,
         [
           serverItem.id,
           serverItem.name,
@@ -278,24 +266,8 @@ function readRequestBody(request) {
 
 function isMcpContext(requestBody) {
   if (mcpToolRegistry.size === 0) return false;
-  const rawMessages = requestBody.messages;
-  if (!Array.isArray(rawMessages) || rawMessages.length === 0) return false;
-
-  const lastUserMsg = [...rawMessages].reverse().find((m) => m.role === "user");
-  const content = typeof lastUserMsg?.content === "string" ? lastUserMsg.content.toLowerCase() : "";
-
-  const activeNames = Array.from(mcpServers.values())
-    .filter((s) => s.status === "active")
-    .map((s) => s.name.toLowerCase());
-
-  const genericKeywords = [
-    "mcp", "工具", "查询", "获取", "列出", "创建", "修改", "删除",
-    "github", "cloudflare", "cf", "gh", "worker", "repo", "commit",
-    "pr", "issue", "branch", "分支", "仓库"
-  ];
-  const allKeywords = [...genericKeywords, ...activeNames];
-
-  return allKeywords.some((k) => content.includes(k));
+  const rawMessages = requestBody.messages || [];
+  return Array.isArray(rawMessages) && rawMessages.length > 0;
 }
 
 async function parseMcpResponse(res) {
@@ -378,8 +350,7 @@ async function connectToMcpServer({ name, url, token }) {
 
   if (!listRes.ok) {
     const err = await listRes.text();
-    throw new Error(`MCP 响应错误 (${listRes.status}): ${err.slice(0, 300)}`);
-  }
+    throw new Error(`MCP 响应错误 (${listRes.status}): ${err.slice(0, 300)}`);\n  }
 
   const listData = await parseMcpResponse(listRes);
   if (listData.error) {
@@ -408,26 +379,11 @@ async function connectToMcpServer({ name, url, token }) {
       }
     });
 
-    mcpToolRegistry.set(toolKey, {
-      serverId,
-      serverName: name,
-      rawName: t.name,
-      postEndpoint: cleanUrl,
-      headers
-    });
+    mcpToolRegistry.set(toolKey, {\n      serverId,\n      serverName: name,\n      rawName: t.name,\n      postEndpoint: cleanUrl,\n      headers\n    });
   }
 
   const serverInfo = {
-    id: serverId,
-    name,
-    url: cleanUrl,
-    rawToken: token,
-    status: "active",
-    postEndpoint: cleanUrl,
-    headers,
-    toolCount: registeredTools.length,
-    tools: registeredTools
-  };
+    id: serverId,\n    name,\n    url: cleanUrl,\n    rawToken: token,\n    status: "active",\n    postEndpoint: cleanUrl,\n    headers,\n    toolCount: registeredTools.length,\n    tools: registeredTools\n  };
 
   mcpServers.set(serverId, serverInfo);
   await saveServerToStorage(serverInfo);
@@ -595,8 +551,8 @@ async function runAgent(requestBody, clientResponse) {
     const payload = {
       ...requestBody,
       messages,
-      tools: tools.length > 0 ? tools : undefined,
-      tool_choice: tools.length > 0 ? (requestBody.tool_choice || "auto") : undefined,
+      tools,
+      tool_choice: "auto",
       stream: true
     };
 
