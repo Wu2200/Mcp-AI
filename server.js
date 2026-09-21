@@ -546,7 +546,21 @@ async function runAgent(requestBody, clientResponse) {
   const rawMessages = requestBody.messages;
   const toolPrompt = buildToolPrompt();
 
-  const clientTools = Array.isArray(requestBody.tools) ? requestBody.tools : [];
+  const clientTools = Array.isArray(requestBody.tools) ? [...requestBody.tools] : [];
+  const modelName = (requestBody.model || "").toLowerCase();
+
+  // 兼容网关网络搜索配置（如 NewAPI / OneAPI / CLIProxy Payload 规则）
+  const hasWebSearch = clientTools.some(
+    (t) => t.type === "web_search" || t.google_search || t.function?.name === "web_search"
+  );
+  if (!hasWebSearch) {
+    if (modelName.startsWith("gpt") || modelName.includes("openai") || modelName.startsWith("o1") || modelName.startsWith("o3")) {
+      clientTools.push({ type: "web_search" });
+    } else if (modelName.includes("gemini")) {
+      clientTools.push({ google_search: {} });
+    }
+  }
+
   const mcpTools = getAllTools();
   const tools = [...clientTools, ...mcpTools];
 
