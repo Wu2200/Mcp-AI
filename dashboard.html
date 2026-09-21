@@ -142,6 +142,17 @@
     .btn:hover {
       background: #1d4ed8;
     }
+    .btn-secondary {
+      background: #f1f5f9;
+      color: #334155;
+      border: 1px solid #cbd5e1;
+      padding: 8px 16px;
+      font-size: 13px;
+    }
+    .btn-secondary:hover {
+      background: #e2e8f0;
+      color: #0f172a;
+    }
     .action-group {
       display: flex;
       gap: 6px;
@@ -271,7 +282,51 @@
       margin: 2px 4px 4px 0;
       word-break: break-all;
     }
-    #conn-msg {
+    .model-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: #fee2e2;
+      color: #991b1b;
+      border: 1px solid #fecaca;
+      font-size: 12px;
+      font-family: monospace;
+      padding: 4px 10px;
+      border-radius: 6px;
+      margin: 4px 6px 4px 0;
+    }
+    .model-tag-del {
+      cursor: pointer;
+      font-weight: 700;
+      color: #dc2626;
+      border: none;
+      background: none;
+      padding: 0;
+      line-height: 1;
+    }
+    .model-tag-del:hover {
+      color: #7f1d1d;
+    }
+    .candidate-tag {
+      display: inline-block;
+      background: #f1f5f9;
+      color: #475569;
+      border: 1px solid #cbd5e1;
+      font-size: 12px;
+      font-family: monospace;
+      padding: 4px 8px;
+      border-radius: 6px;
+      margin: 3px 4px;
+      cursor: pointer;
+      user-select: none;
+      transition: all 0.15s;
+    }
+    .candidate-tag:hover {
+      background: #e0f2fe;
+      color: #0369a1;
+      border-color: #7dd3fc;
+    }
+    #conn-msg, #exclude-msg {
       margin-left: 12px;
       font-size: 13px;
       font-weight: 500;
@@ -309,6 +364,43 @@
       </div>
     </div>
 
+    <!-- 排除模型配置卡片 -->
+    <div class="card">
+      <div class="card-title">
+        <span>排除模型设置（跳过 MCP，保留上游网络搜索与原生直通）</span>
+      </div>
+      <p style="font-size: 13px; color: #64748b; margin-bottom: 14px;">
+        加入此列表的模型在请求时<strong>绝不注入任何 MCP 工具</strong>，直接原样透传给上游。这样上游网关的“无工具时自动注入网络搜索”规则会 100% 满血生效，永不产生冲突。
+      </p>
+
+      <div class="group">
+        <label>已排除的模型列表（支持通配符如 gemini*、gpt-4o-mini 等）：</label>
+        <div id="excluded-tags" style="min-height: 38px; padding: 6px 0;">
+          <span style="font-size: 13px; color: #94a3b8;">暂无排除模型，所有模型均正常挂载 MCP。</span>
+        </div>
+      </div>
+
+      <div class="group" style="display: flex; gap: 8px; margin-top: 10px;">
+        <input id="custom-model-input" placeholder="手动输入模型名称或通配符（如 gemini*，回车添加）" onkeydown="if(event.key==='Enter')addCustomModel()">
+        <button class="btn btn-secondary" onclick="addCustomModel()">添加</button>
+      </div>
+
+      <div class="group" style="margin-top: 14px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+          <label style="margin: 0;">从上游快速选择模型（点击即加入排除）：</label>
+          <button class="btn-action btn-start" onclick="fetchUpstreamModels()">刷新上游模型列表</button>
+        </div>
+        <div id="upstream-candidates" style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px; max-height: 140px; overflow-y: auto;">
+          <span style="font-size: 12px; color: #94a3b8;">点击上方“刷新上游模型列表”按钮获取上游所有可用模型</span>
+        </div>
+      </div>
+
+      <div style="display: flex; align-items: center; margin-top: 16px;">
+        <button class="btn" onclick="saveExcludedModels()">保存排除配置</button>
+        <span id="exclude-msg"></span>
+      </div>
+    </div>
+
     <div class="card">
       <div class="card-title">手动挂载 MCP 服务（支持添加多个）</div>
       <div class="group">
@@ -342,9 +434,100 @@
   <script>
     document.getElementById("proxy-url").innerText = window.location.origin + "/v1";
 
+    let currentExcludedList = [];
+
     async function handleLogout() {
       await fetch("/api/panel/logout", { method: "POST" });
       location.reload();
+    }
+
+    function renderExcludedTags() {
+      const container = document.getElementById("excluded-tags");
+      if (!currentExcludedList || currentExcludedList.length === 0) {
+        container.innerHTML = '<span style="font-size: 13px; color: #94a3b8;">暂无排除模型，所有模型均正常挂载 MCP。</span>';
+        return;
+      }
+      container.innerHTML = currentExcludedList.map((m, idx) => `
+        <span class="model-tag">
+          <span>${m}</span>
+          <button class="model-tag-del" onclick="removeExcludedModel(${idx})">×</button>
+        </span>
+      `).join("");
+    }
+
+    function addCustomModel() {
+      const input = document.getElementById("custom-model-input");
+      const val = input.value.trim();
+      if (!val) return;
+      if (!currentExcludedList.includes(val)) {
+        currentExcludedList.push(val);
+        renderExcludedTags();
+      }
+      input.value = "";
+    }
+
+    function removeExcludedModel(idx) {
+      currentExcludedList.splice(idx, 1);
+      renderExcludedTags();
+    }
+
+    async function loadExcludedSettings() {
+      try {
+        const res = await fetch("/api/settings/excluded-models");
+        if (res.ok) {
+          const data = await res.json();
+          currentExcludedList = data.excludedModels || [];
+          renderExcludedTags();
+        }
+      } catch {}
+    }
+
+    async function saveExcludedModels() {
+      const msg = document.getElementById("exclude-msg");
+      msg.innerText = "正在保存...";
+      msg.style.color = "#2563eb";
+      try {
+        const res = await fetch("/api/settings/excluded-models", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ models: currentExcludedList })
+        });
+        if (res.ok) {
+          msg.innerText = "排除模型配置已保存并生效！";
+          msg.style.color = "#16a34a";
+        } else {
+          throw new Error("保存失败");
+        }
+      } catch (e) {
+        msg.innerText = e.message;
+        msg.style.color = "#dc2626";
+      }
+    }
+
+    async function fetchUpstreamModels() {
+      const container = document.getElementById("upstream-candidates");
+      container.innerHTML = '<span style="font-size: 12px; color: #64748b;">正在拉取上游所有模型...</span>';
+      try {
+        const res = await fetch("/api/upstream/models");
+        const data = await res.json();
+        const list = data.models || [];
+        if (list.length === 0) {
+          container.innerHTML = '<span style="font-size: 12px; color: #94a3b8;">未获取到模型，请检查上游 UPSTREAM_BASE_URL 与 API KEY 配置。</span>';
+          return;
+        }
+        container.innerHTML = list.map(m => `
+          <span class="candidate-tag" onclick="selectCandidate('${m}')">+ ${m}</span>
+        `).join("");
+      } catch (e) {
+        container.innerHTML = `<span style="font-size: 12px; color: #dc2626;">拉取失败: ${e.message}</span>`;
+      }
+    }
+
+    function selectCandidate(name) {
+      if (!currentExcludedList.includes(name)) {
+        currentExcludedList.push(name);
+        renderExcludedTags();
+      }
     }
 
     function toggleTools(id) {
@@ -464,6 +647,7 @@
       loadServers();
     }
 
+    loadExcludedSettings();
     loadServers();
   </script>
 </body>
