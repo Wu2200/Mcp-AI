@@ -1,0 +1,15 @@
+{
+  "name": "mcp-agent-proxy",
+  "version": "1.0.0",
+  "description": "Universal MCP Agent Proxy for Chatbox and OpenAI compatible clients",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["mcp", "agent", "proxy", "chatbox", "openai"],
+  "license": "MIT"
+}
