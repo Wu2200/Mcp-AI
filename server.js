@@ -1,12 +1,24 @@
+import crypto from "node:crypto";
+import fs from "node:fs";
 import http from "node:http";
-import https from "node:https";
-import { URL } from "node:url";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-const PORT = process.env.PORT || 3000;
-const OPENAI_API_BASE = process.env.OPENAI_API_BASE || "https://api.openai.com/v1";
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "gpt-4o";
-const MCP_SERVERS = (process.env.MCP_SERVERS || "").split(",").filter(Boolean);
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const PORT = Number(process.env.PORT || 10000);
+const UPSTREAM_BASE_URL = (process.env.UPSTREAM_BASE_URL || "").trim().replace(/\/+$/, "");
+const UPSTREAM_API_KEY = (process.env.UPSTREAM_API_KEY || "").trim();
+const PROXY_API_KEY = (process.env.PROXY_API_KEY || "").trim();
+const PANEL_PASSWORD = (process.env.PANEL_PASSWORD || "").trim();
+const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
+
+const DATA_FILE = path.join(__dirname, "mcp-config.json");
+const mcpServers = new Map();
+const mcpToolRegistry = new Map();
+
+const SESSION_SECRET = crypto.randomBytes(32).toString("hex");
 
 function getToolAction(toolName) {
   const name = (toolName || "").toLowerCase();
@@ -28,307 +40,1006 @@ function getToolAction(toolName) {
   return "处理";
 }
 
-function getServiceDisplayName(toolName) {
-  const name = (toolName || "").toLowerCase();
-  if (name.includes("github")) {
-    return "GitHub";
-  }
-  if (name.includes("cloudflare")) {
-    return "Cloudflare";
-  }
-  return "外部";
+function generateSessionToken() {
+  const payload = `auth:${PANEL_PASSWORD}:${Date.now()}`;
+  const sig = crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("hex");
+  return Buffer.from(`${payload}:${sig}`).toString("base64url");
 }
 
-async function fetchMcpTools() {
-  const tools = [];
-  for (const serverUrl of MCP_SERVERS) {
+function verifySessionToken(token) {
+  if (!PANEL_PASSWORD) return true;
+  if (!token) return false;
+  try {
+    const raw = Buffer.from(token, "base64url").toString("utf8");
+    const parts = raw.split(":");
+    if (parts.length !== 4 || parts[0] !== "auth" || parts[1] !== PANEL_PASSWORD) return false;
+    const payload = `${parts[0]}:${parts[1]}:${parts[2]}`;
+    const sig = crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("hex");
+    return sig === parts[3];
+  } catch {
+    return false;
+  }
+}
+
+function parseCookies(request) {
+  const list = {};
+  const rc = request.headers.cookie;
+  if (rc) {
+    rc.split(";").forEach((cookie) => {
+      const parts = cookie.split("=");
+      list[parts.shift().trim()] = decodeURI(parts.join("="));
+    });
+  }
+  return list;
+}
+
+let pgPool = null;
+
+async function initDatabase() {
+  if (!DATABASE_URL) return;
+  try {
+    const { default: pg } = await import("pg");
+    pgPool = new pg.Pool({
+      connectionString: DATABASE_URL,
+      ssl: { rejectUnauthorized: false }
+    });
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS mcp_servers (\n        id TEXT PRIMARY KEY,\n        name TEXT NOT NULL,\n        url TEXT NOT NULL,\n        raw_token TEXT,\n        status TEXT DEFAULT 'active',\n        post_endpoint TEXT,\n        headers JSONB,\n        tool_count INT,\n        tools JSONB,\n        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n      );\n    `);
     try {
-      const response = await fetch(serverUrl.trim(), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          method: "tools/list",
-          params: {},
-          id: 1,
-        }),
-      });
-      if (response.ok) {
-        const data = await response.json();
-        if (data.result && Array.isArray(data.result.tools)) {
-          for (const tool of data.result.tools) {
-            tools.push({
-              type: "function",
-              function: {
-                name: tool.name,
-                description: tool.description || "",
-                parameters: tool.inputSchema || { type: "object", properties: {} },
-              },
-              serverUrl: serverUrl.trim(),
-            });
+      await pgPool.query("ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active';");
+    } catch {}
+  } catch {
+    pgPool = null;
+  }
+}
+
+async function saveServerToStorage(serverItem) {
+  if (pgPool) {
+    try {
+      await pgPool.query(
+        `INSERT INTO mcp_servers (id, name, url, raw_token, status, post_endpoint, headers, tool_count, tools, updated_at)\n         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)\n         ON CONFLICT (id) DO UPDATE SET\n           name = EXCLUDED.name,\n           url = EXCLUDED.url,\n           raw_token = EXCLUDED.raw_token,\n           status = EXCLUDED.status,\n           post_endpoint = EXCLUDED.post_endpoint,\n           headers = EXCLUDED.headers,\n           tool_count = EXCLUDED.tool_count,\n           tools = EXCLUDED.tools,\n           updated_at = CURRENT_TIMESTAMP`,
+        [
+          serverItem.id,
+          serverItem.name,
+          serverItem.url,
+          serverItem.rawToken,
+          serverItem.status || "active",
+          serverItem.postEndpoint,
+          JSON.stringify(serverItem.headers || {}),
+          serverItem.toolCount,
+          JSON.stringify(serverItem.tools || [])
+        ]
+      );
+    } catch {}
+  }
+
+  try {
+    const data = Array.from(mcpServers.values());
+    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf8");
+  } catch {}
+}
+
+async function deleteServerFromStorage(id) {
+  if (pgPool) {
+    try {
+      await pgPool.query("DELETE FROM mcp_servers WHERE id = $1", [id]);
+    } catch {}
+  }
+  try {
+    const data = Array.from(mcpServers.values());
+    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf8");
+  } catch {}
+}
+
+async function loadConfigFromStorage() {
+  if (pgPool) {
+    try {
+      const res = await pgPool.query("SELECT * FROM mcp_servers ORDER BY updated_at ASC");
+      if (res.rows && res.rows.length > 0) {
+        for (const row of res.rows) {
+          const tools = typeof row.tools === "string" ? JSON.parse(row.tools) : (row.tools || []);
+          const headers = typeof row.headers === "string" ? JSON.parse(row.headers) : (row.headers || {});
+          const status = row.status || "active";
+          const serverInfo = {
+            id: row.id,
+            name: row.name,
+            url: row.url,
+            rawToken: row.raw_token,
+            status,
+            postEndpoint: row.post_endpoint,
+            headers,
+            toolCount: tools.length,
+            tools
+          };
+          mcpServers.set(row.id, serverInfo);
+
+          if (status === "active") {
+            for (const t of tools) {
+              mcpToolRegistry.set(t.key, {
+                serverId: row.id,
+                serverName: row.name,
+                rawName: t.rawName,
+                postEndpoint: row.post_endpoint,
+                headers
+              });
+            }
           }
         }
+        return;
       }
-    } catch (err) {}
+    } catch {}
+  }
+
+  if (!fs.existsSync(DATA_FILE)) return;
+  try {
+    const raw = fs.readFileSync(DATA_FILE, "utf8");
+    const list = JSON.parse(raw);
+    for (const item of list) {
+      const status = item.status || "active";
+      item.status = status;
+      mcpServers.set(item.id, item);
+
+      if (status === "active") {
+        for (const t of item.tools) {
+          mcpToolRegistry.set(t.key, {
+            serverId: item.id,
+            serverName: item.name,
+            rawName: t.rawName,
+            postEndpoint: item.postEndpoint,
+            headers: item.headers
+          });
+        }
+      }
+    }
+  } catch {}
+}
+
+function setCorsHeaders(response) {
+  response.setHeader("Access-Control-Allow-Origin", "*");
+  response.setHeader("Access-Control-Allow-Headers", "*");
+  response.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+}
+
+function sendJson(response, statusCode, body) {
+  setCorsHeaders(response);
+  response.writeHead(statusCode, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store"
+  });
+  response.end(JSON.stringify(body));
+}
+
+function sendOpenAIError(response, statusCode, message, type = "invalid_request_error") {
+  sendJson(response, statusCode, { error: { message, type, code: null } });
+}
+
+function isProxyAuthorized(request) {
+  if (!PROXY_API_KEY) return true;
+  const authorization = request.headers.authorization || "";
+  const token = authorization.startsWith("Bearer ")
+    ? authorization.slice(7).trim()
+    : authorization.trim();
+  return token === PROXY_API_KEY;
+}
+
+function isPanelAuthorized(request) {
+  if (!PANEL_PASSWORD) return true;
+  const cookies = parseCookies(request);
+  if (verifySessionToken(cookies.panel_auth)) return true;
+  const headerToken = (request.headers["x-panel-password"] || "").trim();
+  return headerToken === PANEL_PASSWORD;
+}
+
+function readRequestBody(request) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    request.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > 10 * 1024 * 1024) {
+        reject(new Error("请求过大"));
+        request.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    request.on("end", () => {
+      try {
+        const text = Buffer.concat(chunks).toString("utf8");
+        resolve(text ? JSON.parse(text) : {});
+      } catch {
+        reject(new Error("无效 JSON"));
+      }
+    });
+    request.on("error", reject);
+  });
+}
+
+function isMcpContext(requestBody) {
+  if (mcpToolRegistry.size === 0) return false;
+  const rawMessages = requestBody.messages || [];
+  if (!Array.isArray(rawMessages) || rawMessages.length === 0) return false;
+
+  const combinedText = rawMessages
+    .map((m) => {
+      if (typeof m.content === "string") return m.content;
+      if (Array.isArray(m.content)) {
+        return m.content
+          .map((c) => (typeof c === "string" ? c : c?.text || ""))
+          .join(" ");
+      }
+      return "";
+    })
+    .join("\n");
+
+  const serverNames = Array.from(mcpServers.values())
+    .filter((s) => s.status === "active")
+    .map((s) => s.name.replace(/[^a-zA-Z0-9_\u4e00-\u9fa5]/g, ""))
+    .filter(Boolean);
+
+  const keywords = [
+    "mcp", "github", "git\\b", "repo", "代码库", "仓库", "commit", "pr\\b", "pull request",
+    "分支", "branch", "提取代码", "读取文件", "查看文件", "修改文件", "创建文件", "新建文件", "删除文件",
+    "cloudflare", "cf\\b", "worker", "workers", "kv\\b", "d1\\b", "r2\\b", "dns", "domain", "域名",
+    ...serverNames
+  ];
+
+  const pattern = new RegExp(`(${keywords.join("|")})`, "i");
+  return pattern.test(combinedText);
+}
+
+async function parseMcpResponse(res) {
+  const contentType = res.headers.get("Content-Type") || "";
+  if (contentType.includes("text/event-stream")) {
+    const text = await res.text();
+    for (const line of text.split("\n")) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith("data:")) {
+        try {
+          return JSON.parse(trimmed.slice(5).trim());
+        } catch {}
+      }
+    }
+  }
+  return await res.json();
+}
+
+async function connectToMcpServer({ name, url, token }) {
+  const serverId = crypto.randomUUID();
+  const cleanUrl = url.trim().replace(/\/+$/, "");
+  const headers = {
+    Accept: "application/json, text/event-stream",
+    "Content-Type": "application/json",
+    "User-Agent": "mcp-agent-proxy/1.0.0"
+  };
+
+  if (token) headers["Authorization"] = `Bearer ${token.trim()}`;
+
+  const initPayload = {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "mcp-agent-proxy", version: "1.0.0" }
+    }
+  };
+
+  try {
+    await fetch(cleanUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(initPayload),
+      signal: AbortSignal.timeout(8000)
+    });
+
+    await fetch(cleanUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "notifications/initialized"
+      }),
+      signal: AbortSignal.timeout(5000)
+    }).catch(() => {});
+  } catch {}
+
+  const listPayload = { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} };
+  const listRes = await fetch(cleanUrl, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(listPayload),
+    signal: AbortSignal.timeout(10000)
+  });
+
+  if (!listRes.ok) {
+    const err = await listRes.text();
+    throw new Error(`MCP 响应错误 (${listRes.status}): ${err.slice(0, 300)}`);
+  }
+
+  const listData = await parseMcpResponse(listRes);
+  if (listData.error) {
+    throw new Error(listData.error.message || JSON.stringify(listData.error));
+  }
+  const rawTools = listData.result?.tools || [];
+
+  if (rawTools.length === 0) {
+    throw new Error("该 MCP 未返回任何工具，请检查 Token 权限或服务地址。");
+  }
+
+  const registeredTools = [];
+  for (const t of rawTools) {
+    const safePrefix = name.toLowerCase().replace(/[^a-z0-9_]/g, "_");
+    const toolKey = `mcp_${safePrefix}_${t.name.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+    registeredTools.push({
+      key: toolKey,
+      rawName: t.name,
+      openAiTool: {
+        type: "function",
+        function: {
+          name: toolKey,
+          description: `[${name}] ${t.description || t.name}`,
+          parameters: t.inputSchema || { type: "object", properties: {} }
+        }
+      }
+    });
+
+    mcpToolRegistry.set(toolKey, {
+      serverId,
+      serverName: name,
+      rawName: t.name,
+      postEndpoint: cleanUrl,
+      headers
+    });
+  }
+
+  const serverInfo = {
+    id: serverId,
+    name,
+    url: cleanUrl,
+    rawToken: token,
+    status: "active",
+    postEndpoint: cleanUrl,
+    headers,
+    toolCount: registeredTools.length,
+    tools: registeredTools
+  };
+
+  mcpServers.set(serverId, serverInfo);
+  await saveServerToStorage(serverInfo);
+  return serverInfo;
+}
+
+async function callMcpTool(toolKey, args) {
+  const info = mcpToolRegistry.get(toolKey);
+  if (!info) throw new Error(`未找到工具：${toolKey}`);
+
+  const res = await fetch(info.postEndpoint, {
+    method: "POST",
+    headers: info.headers,
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: Date.now(),
+      method: "tools/call",
+      params: { name: info.rawName, arguments: args }
+    }),
+    signal: AbortSignal.timeout(60000)
+  });
+
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`执行失败 (${res.status}): ${txt.slice(0, 300)}`);
+  }
+
+  const data = await parseMcpResponse(res);
+  if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
+  return data.result ?? data;
+}
+
+function getAllTools() {
+  const tools = [];
+  for (const s of mcpServers.values()) {
+    if (s.status === "active") {
+      for (const t of s.tools) tools.push(t.openAiTool);
+    }
   }
   return tools;
 }
 
-async function callMcpTool(serverUrl, toolName, args) {
-  const response = await fetch(serverUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      method: "tools/call",
-      params: {
-        name: toolName,
-        arguments: args,
-      },
-      id: 2,
-    }),
-  });
-  if (!response.ok) {
-    throw new Error(`MCP 调用失败: ${response.status}`);
-  }
-  const data = await response.json();
-  if (data.error) {
-    throw new Error(data.error.message || "MCP 执行出错");
-  }
-  return data.result;
+function buildToolPrompt() {
+  const activeServers = Array.from(mcpServers.values()).filter((s) => s.status === "active");
+  if (activeServers.length === 0) return "";
+  const serverNames = activeServers.map((s) => `${s.name} (${s.toolCount} 个工具)`).join("、");
+  return [
+    `# 远程 MCP 工具环境`,
+    `当前已连接的 MCP 服务：${serverNames}。`,
+    `系统已将外部工具列表挂载至本次对话中。`,
+    `【强制执行规则】`,
+    `1. 当用户提出的任何请求需要查询账号、数据、配置、仓库、服务信息或执行变更操作时，你必须主动判断并自主发起工具调用（tool_calls），绝不可在未调用工具的情况下直接拒绝用户或回答“我无法直接访问您的账号”。`,
+    `2. 识别用户的意图时必须包容各种简写、代称（例如：cf = Cloudflare、gh = GitHub、k8s = Kubernetes 等）。`,
+    `3. 只要存在与用户请求意图相关的工具，第一步必须调用该工具获取真实数据，严禁凭空臆造结果。`
+  ].join("\n");
 }
 
-function sendReasoningChunk(res, text, model) {
-  const chunk = {
-    id: `chatcmpl-${Date.now()}`,
-    object: "chat.completion.chunk",
-    created: Math.floor(Date.now() / 1000),
-    model: model || DEFAULT_MODEL,
-    choices: [
-      {
-        index: 0,
-        delta: {
-          role: "assistant",
-          reasoning_content: text,
-        },
-        finish_reason: null,
-      },
-    ],
-  };
-  res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+function upstreamChatCompletionsUrl() {
+  if (!UPSTREAM_BASE_URL) throw new Error("未配置 UPSTREAM_BASE_URL 环境变量");
+  if (UPSTREAM_BASE_URL.endsWith("/chat/completions")) return UPSTREAM_BASE_URL;
+  if (UPSTREAM_BASE_URL.endsWith("/v1")) return `${UPSTREAM_BASE_URL}/chat/completions`;
+  return `${UPSTREAM_BASE_URL}/v1/chat/completions`;
 }
 
-function sendContentChunk(res, text, model) {
-  const chunk = {
-    id: `chatcmpl-${Date.now()}`,
-    object: "chat.completion.chunk",
-    created: Math.floor(Date.now() / 1000),
-    model: model || DEFAULT_MODEL,
-    choices: [
-      {
-        index: 0,
-        delta: {
-          content: text,
-        },
-        finish_reason: null,
-      },
-    ],
-  };
-  res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-}
-
-function sendDoneChunk(res) {
-  res.write("data: [DONE]\n\n");
-}
-
-async function handleChatCompletions(req, res, body) {
-  let requestData;
+function toolArguments(toolCall) {
   try {
-    requestData = JSON.parse(body);
-  } catch (e) {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: { message: "Invalid JSON body" } }));
-    return;
+    const value = JSON.parse(toolCall.function?.arguments || "{}");
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error();
+    }
+    return value;
+  } catch {
+    return null;
+  }
+}
+
+function sendReasoningChunk(clientResponse, text, model = "default") {
+  const chunk = {
+    id: `chatcmpl-${Date.now()}`,
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [
+      {
+        index: 0,
+        delta: { reasoning_content: text },
+        finish_reason: null
+      }
+    ]
+  };
+  clientResponse.write(`data: ${JSON.stringify(chunk)}\n\n`);
+}
+
+async function passThrough(requestBody, clientResponse) {
+  setCorsHeaders(clientResponse);
+  const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${UPSTREAM_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(requestBody),
+    signal: AbortSignal.timeout(120000)
+  });
+
+  clientResponse.writeHead(upstreamResponse.status, {
+    "Content-Type": upstreamResponse.headers.get("Content-Type") || "application/json",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive"
+  });
+
+  if (upstreamResponse.body) {
+    const reader = upstreamResponse.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      clientResponse.write(value);
+    }
+  }
+  clientResponse.end();
+}
+
+async function runAgent(requestBody, clientResponse) {
+  if (!Array.isArray(requestBody.messages) || requestBody.messages.length === 0) {
+    throw new Error("messages 必须是非空数组");
   }
 
-  const isStream = Boolean(requestData.stream);
-  const model = requestData.model || DEFAULT_MODEL;
-  const messages = requestData.messages || [];
+  const isStream = requestBody.stream === true;
+  const rawMessages = requestBody.messages;
+  const toolPrompt = buildToolPrompt();
 
-  const mcpTools = await fetchMcpTools();
-  const toolsPayload = mcpTools.map((t) => ({
-    type: t.type,
-    function: t.function,
-  }));
+  const clientTools = Array.isArray(requestBody.tools) ? requestBody.tools : [];
+  const mcpTools = getAllTools();
+  const tools = [...clientTools, ...mcpTools];
+
+  const existingSystemIndex = rawMessages.findIndex((m) => m.role === "system");
+  let messages;
+  if (existingSystemIndex >= 0) {
+    messages = rawMessages.map((m, idx) => {
+      if (idx === existingSystemIndex) {
+        return {
+          role: "system",
+          content: `${m.content || ""}\n\n${toolPrompt}`
+        };
+      }
+      return m;
+    });
+  } else {
+    messages = [{ role: "system", content: toolPrompt }, ...rawMessages];
+  }
 
   if (isStream) {
-    res.writeHead(200, {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
+    setCorsHeaders(clientResponse);
+    clientResponse.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
+      "X-Accel-Buffering": "no"
     });
   }
 
-  let currentMessages = [...messages];
-  let isLooping = true;
-  let maxRounds = 10;
-
-  while (isLooping && maxRounds > 0) {
-    maxRounds--;
-
-    const upstreamPayload = {
-      ...requestData,
-      model,
-      messages: currentMessages,
-      stream: false,
+  for (let round = 0; round < 10; round += 1) {
+    const payload = {
+      ...requestBody,
+      messages,
+      tools,
+      tool_choice: "auto",
+      stream: true
     };
 
-    if (toolsPayload.length > 0) {
-      upstreamPayload.tools = toolsPayload;
-      upstreamPayload.tool_choice = "auto";
-    }
-
-    const authHeader = req.headers["authorization"] || (OPENAI_API_KEY ? `Bearer ${OPENAI_API_KEY}` : "");
-
-    const upstreamRes = await fetch(`${OPENAI_API_BASE.replace(/\/+$/, "")}/chat/completions`, {
+    const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
       method: "POST",
       headers: {
-        "Content-Type": "application/json",
-        ...(authHeader ? { Authorization: authHeader } : {}),
+        Authorization: `Bearer ${UPSTREAM_API_KEY}`,
+        "Content-Type": "application/json"
       },
-      body: JSON.stringify(upstreamPayload),
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(120000)
     });
 
-    if (!upstreamRes.ok) {
-      const errText = await upstreamRes.text();
+    if (!upstreamResponse.ok) {
+      const err = await upstreamResponse.text();
       if (isStream) {
-        sendContentChunk(res, `\n\n上游请求错误: ${errText}`, model);
-        sendDoneChunk(res);
-        res.end();
+        const errorChunk = {
+          id: `chatcmpl-${Date.now()}`,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: requestBody.model || "default",
+          choices: [
+            {
+              index: 0,
+              delta: { content: `\n\n上游返回错误 (${upstreamResponse.status})：${err.slice(0, 500)}` },
+              finish_reason: "stop"
+            }
+          ]
+        };
+        clientResponse.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
+        clientResponse.write("data: [DONE]\n\n");
+        clientResponse.end();
+        return;
+      }
+      throw new Error(`上游接口返回错误 (${upstreamResponse.status})：${err.slice(0, 500)}`);
+    }
+
+    const reader = upstreamResponse.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let accumulatedToolCalls = [];
+    let assistantContent = "";
+    let isCallingTool = false;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith("data:")) continue;
+        const dataStr = trimmed.slice(5).trim();
+        if (dataStr === "[DONE]") continue;
+
+        try {
+          const parsed = JSON.parse(dataStr);
+          const delta = parsed.choices?.[0]?.delta;
+
+          if (delta?.reasoning_content && isStream) {
+            clientResponse.write(`${line}\n\n`);
+          }
+
+          if (delta?.tool_calls) {
+            isCallingTool = true;
+            for (const tc of delta.tool_calls) {
+              const index = tc.index ?? 0;
+              if (!accumulatedToolCalls[index]) {
+                accumulatedToolCalls[index] = {
+                  id: tc.id || "",
+                  name: tc.function?.name || "",
+                  arguments: ""
+                };
+              }
+              if (tc.id) accumulatedToolCalls[index].id = tc.id;
+              if (tc.function?.name) accumulatedToolCalls[index].name = tc.function.name;
+              if (tc.function?.arguments) accumulatedToolCalls[index].arguments += tc.function.arguments;
+            }
+          } else if (!isCallingTool && delta?.content) {
+            assistantContent += delta.content;
+            if (isStream) {
+              clientResponse.write(`${line}\n\n`);
+            }
+          }
+        } catch {}
+      }
+    }
+
+    const mcpCalls = accumulatedToolCalls.filter((tc) =>
+      mcpToolRegistry.has(tc.name)
+    );
+
+    if (mcpCalls.length === 0) {
+      if (isStream) {
+        clientResponse.write("data: [DONE]\n\n");
+        clientResponse.end();
+        return;
+      }
+
+      sendJson(clientResponse, 200, {
+        id: `chatcmpl-${crypto.randomUUID()}`,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: requestBody.model || "default",
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: assistantContent },
+            finish_reason: "stop"
+          }
+        ]
+      });
+      return;
+    }
+
+    messages.push({
+      role: "assistant",
+      content: assistantContent || null,
+      tool_calls: mcpCalls.map((tc) => ({
+        id: tc.id,
+        type: "function",
+        function: { name: tc.name, arguments: tc.arguments }
+      }))
+    });
+
+    for (const tc of mcpCalls) {
+      const toolInfo = mcpToolRegistry.get(tc.name);
+      const serverDisplayName = toolInfo?.serverName || "MCP";
+      const actionName = getToolAction(toolInfo?.rawName || tc.name);
+      const args = toolArguments({ function: { arguments: tc.arguments } });
+
+      if (isStream) {
+        sendReasoningChunk(
+          clientResponse,
+          `\n> 正在调用 ${serverDisplayName} ${actionName}工具\n`,
+          requestBody.model
+        );
+      }
+
+      let result;
+      if (!args) {
+        result = { error: "工具参数不是有效 JSON" };
       } else {
-        res.writeHead(upstreamRes.status, { "Content-Type": "application/json" });
-        res.end(errText);
+        try {
+          result = await callMcpTool(tc.name, args);
+        } catch (err) {
+          result = { error: err instanceof Error ? err.message : "执行工具失败" };
+        }
+      }
+
+      if (isStream) {
+        sendReasoningChunk(
+          clientResponse,
+          `> ${serverDisplayName} ${actionName}完成\n\n`,
+          requestBody.model
+        );
+      }
+
+      messages.push({
+        role: "tool",
+        tool_call_id: tc.id,
+        content: JSON.stringify(result)
+      });
+    }
+  }
+
+  throw new Error("工具调用轮数达到上限");
+}
+
+function getLoginHtml() {
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MCP 控制台 - 登录认证</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: #f8fafc;
+      color: #0f172a;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+    }
+    .card {
+      background: #ffffff;
+      border: 1px solid #e2e8f0;
+      border-radius: 12px;
+      padding: 32px 24px;
+      width: 100%;
+      max-width: 360px;
+      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+      text-align: center;
+    }
+    h1 { font-size: 18px; font-weight: 700; margin-bottom: 8px; }
+    p { font-size: 13px; color: #64748b; margin-bottom: 20px; }
+    input {
+      width: 100%;
+      background: #ffffff;
+      border: 1px solid #cbd5e1;
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 14px;
+      outline: none;
+      margin-bottom: 14px;
+    }
+    input:focus { border-color: #2563eb; }
+    button {
+      width: 100%;
+      background: #2563eb;
+      color: #ffffff;
+      border: none;
+      font-weight: 600;
+      font-size: 14px;
+      padding: 10px;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    button:hover { background: #1d4ed8; }
+    #err-msg { color: #dc2626; font-size: 13px; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>MCP 控制台认证</h1>
+    <p>请输入后台管理密码以进入面板</p>
+    <input id="pwd" type="password" placeholder="输入管理密码" onkeydown="if(event.key==='Enter')login()">
+    <button onclick="login()">验证并进入</button>
+    <div id="err-msg"></div>
+  </div>
+  <script>
+    async function login() {
+      const pwd = document.getElementById("pwd").value.trim();
+      const err = document.getElementById("err-msg");
+      if (!pwd) { err.innerText = "请输入管理密码"; return; }
+      try {
+        const res = await fetch("/api/panel/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password: pwd })
+        });
+        if (res.ok) {
+          location.reload();
+        } else {
+          err.innerText = "密码错误，请重新输入";
+        }
+      } catch (e) {
+        err.innerText = e.message;
+      }
+    }
+  </script>
+</body>
+</html>`;
+}
+
+await initDatabase();
+await loadConfigFromStorage();
+
+const server = http.createServer(async (request, response) => {
+  try {
+    if (request.method === "OPTIONS") {
+      setCorsHeaders(response);
+      response.writeHead(204);
+      response.end();
+      return;
+    }
+
+    if (request.method === "GET" && (request.url === "/" || request.url.startsWith("/?"))) {
+      setCorsHeaders(response);
+      if (PANEL_PASSWORD) {
+        const cookies = parseCookies(request);
+        if (!verifySessionToken(cookies.panel_auth)) {
+          response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+          response.end(getLoginHtml());
+          return;
+        }
+      }
+      const htmlPath = path.join(__dirname, "dashboard.html");
+      const htmlContent = fs.readFileSync(htmlPath, "utf8");
+      response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      response.end(htmlContent);
+      return;
+    }
+
+    if (request.method === "GET" && request.url === "/health") {
+      sendJson(response, 200, { status: "ok" });
+      return;
+    }
+
+    if (request.method === "POST" && request.url === "/api/panel/login") {
+      const body = await readRequestBody(request);
+      if (!PANEL_PASSWORD || body.password === PANEL_PASSWORD) {
+        const token = generateSessionToken();
+        setCorsHeaders(response);
+        response.writeHead(200, {
+          "Content-Type": "application/json",
+          "Set-Cookie": `panel_auth=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`
+        });
+        response.end(JSON.stringify({ success: true }));
+      } else {
+        sendJson(response, 401, { error: "密码错误" });
       }
       return;
     }
 
-    const upstreamData = await upstreamRes.json();
-    const choice = upstreamData.choices && upstreamData.choices[0];
-    if (!choice) {
-      break;
+    if (request.method === "POST" && request.url === "/api/panel/logout") {
+      setCorsHeaders(response);
+      response.writeHead(200, {
+        "Content-Type": "application/json",
+        "Set-Cookie": `panel_auth=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`
+      });
+      response.end(JSON.stringify({ success: true }));
+      return;
     }
 
-    const assistantMsg = choice.message || {};
-    currentMessages.push(assistantMsg);
+    if (request.url.startsWith("/api/mcp/")) {
+      if (!isPanelAuthorized(request)) {
+        sendJson(response, 401, { error: "控制台未授权，请输入管理密码" });
+        return;
+      }
 
-    const toolCalls = assistantMsg.tool_calls;
-    if (toolCalls && Array.isArray(toolCalls) && toolCalls.length > 0) {
-      for (const tc of toolCalls) {
-        const fnName = tc.function.name;
-        let fnArgs = {};
-        try {
-          fnArgs = JSON.parse(tc.function.arguments || "{}");
-        } catch (e) {
-          fnArgs = {};
+      if (request.method === "GET" && request.url === "/api/mcp/servers") {
+        sendJson(response, 200, { servers: Array.from(mcpServers.values()) });
+        return;
+      }
+
+      if (request.method === "POST" && request.url === "/api/mcp/connect") {
+        const body = await readRequestBody(request);
+        const serverInfo = await connectToMcpServer(body);
+        sendJson(response, 200, { toolCount: serverInfo.toolCount });
+        return;
+      }
+
+      if (request.method === "POST" && request.url.includes("/start")) {
+        const id = request.url.replace("/api/mcp/servers/", "").replace("/start", "");
+        const s = mcpServers.get(id);
+        if (!s) {
+          sendJson(response, 404, { error: "未找到该服务" });
+          return;
         }
-
-        const matchedTool = mcpTools.find((t) => t.function.name === fnName);
-        const serviceName = getServiceDisplayName(fnName);
-        const actionName = getToolAction(fnName);
-
-        if (isStream) {
-          sendReasoningChunk(res, `> 正在调用 ${serviceName} ${actionName}工具\n`, model);
+        s.status = "active";
+        for (const t of s.tools) {
+          mcpToolRegistry.set(t.key, {
+            serverId: s.id,
+            serverName: s.name,
+            rawName: t.rawName,
+            postEndpoint: s.postEndpoint,
+            headers: s.headers
+          });
         }
+        await saveServerToStorage(s);
+        sendJson(response, 200, { success: true, status: "active" });
+        return;
+      }
 
-        let toolResultStr = "";
-        let isError = false;
-        try {
-          if (!matchedTool) {
-            throw new Error(`未找到工具: ${fnName}`);
+      if (request.method === "POST" && request.url.includes("/stop")) {
+        const id = request.url.replace("/api/mcp/servers/", "").replace("/stop", "");
+        const s = mcpServers.get(id);
+        if (!s) {
+          sendJson(response, 404, { error: "未找到该服务" });
+          return;
+        }
+        s.status = "disabled";
+        for (const [key, val] of mcpToolRegistry.entries()) {
+          if (val.serverId === id) {
+            mcpToolRegistry.delete(key);
           }
-          const result = await callMcpTool(matchedTool.serverUrl, fnName, fnArgs);
-          toolResultStr = typeof result === "string" ? result : JSON.stringify(result);
-        } catch (callErr) {
-          isError = true;
-          toolResultStr = `工具调用失败: ${callErr.message}`;
         }
+        await saveServerToStorage(s);
+        sendJson(response, 200, { success: true, status: "disabled" });
+        return;
+      }
 
-        if (isStream) {
-          if (isError) {
-            sendReasoningChunk(res, `> ${serviceName} ${actionName}失败\n\n`, model);
-          } else {
-            sendReasoningChunk(res, `> ${serviceName} ${actionName}完成\n\n`, model);
+      if (request.method === "DELETE" && request.url.startsWith("/api/mcp/servers/")) {
+        const id = request.url.replace("/api/mcp/servers/", "");
+        mcpServers.delete(id);
+        for (const [key, val] of mcpToolRegistry.entries()) {
+          if (val.serverId === id) {
+            mcpToolRegistry.delete(key);
           }
         }
+        await deleteServerFromStorage(id);
+        sendJson(response, 200, { success: true });
+        return;
+      }
+    }
 
-        currentMessages.push({
-          role: "tool",
-          tool_call_id: tc.id,
-          content: toolResultStr,
+    if (!isProxyAuthorized(request)) {
+      sendOpenAIError(response, 401, "API Key 错误", "authentication_error");
+      return;
+    }
+
+    if (request.method === "GET" && request.url === "/v1/models") {
+      if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
+        sendJson(response, 200, {
+          object: "list",
+          data: [{ id: "default", object: "model", created: 0, owned_by: "proxy" }]
+        });
+        return;
+      }
+
+      const modelsUrl = UPSTREAM_BASE_URL.endsWith("/v1")
+        ? `${UPSTREAM_BASE_URL}/models`
+        : `${UPSTREAM_BASE_URL}/v1/models`;
+
+      try {
+        const upstreamResponse = await fetch(modelsUrl, {
+          headers: { Authorization: `Bearer ${UPSTREAM_API_KEY}` },
+          signal: AbortSignal.timeout(10000)
+        });
+        const data = await upstreamResponse.json();
+        sendJson(response, 200, data);
+      } catch {
+        sendJson(response, 200, {
+          object: "list",
+          data: [{ id: "default", object: "model", created: 0, owned_by: "proxy" }]
         });
       }
-    } else {
-      isLooping = false;
-      if (isStream) {
-        if (assistantMsg.content) {
-          sendContentChunk(res, assistantMsg.content, model);
-        }
-        sendDoneChunk(res);
-        res.end();
-        return;
-      } else {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(upstreamData));
+      return;
+    }
+
+    if (request.method === "POST" && request.url === "/v1/chat/completions") {
+      if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
+        sendOpenAIError(response, 500, "服务端未配置环境变量：UPSTREAM_BASE_URL 或 UPSTREAM_API_KEY");
         return;
       }
+
+      const body = await readRequestBody(request);
+      if (isMcpContext(body)) {
+        await runAgent(body, response);
+      } else {
+        await passThrough(body, response);
+      }
+      return;
     }
+
+    sendOpenAIError(response, 404, "接口不存在");
+  } catch (err) {
+    if (response.headersSent) {
+      try {
+        const errChunk = {
+          id: `chatcmpl-${Date.now()}`,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          choices: [
+            {
+              index: 0,
+              delta: { content: `\n\n[代理服务错误]: ${err instanceof Error ? err.message : "未知错误"}` },
+              finish_reason: "stop"
+            }
+          ]
+        };
+        response.write(`data: ${JSON.stringify(errChunk)}\n\n`);
+        response.write("data: [DONE]\n\n");
+        response.end();
+      } catch {}
+      return;
+    }
+
+    sendJson(response, 500, { error: err.message });
   }
-
-  if (isStream && !res.writableEnded) {
-    sendDoneChunk(res);
-    res.end();
-  }
-}
-
-const server = http.createServer((req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-
-  if (req.method === "OPTIONS") {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
-
-  const reqUrl = new URL(req.url, `http://${req.headers.host}`);
-
-  if (reqUrl.pathname === "/v1/models" && req.method === "GET") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        object: "list",
-        data: [
-          { id: DEFAULT_MODEL, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "custom" },
-        ],
-      })
-    );
-    return;
-  }
-
-  if ((reqUrl.pathname === "/v1/chat/completions" || reqUrl.pathname === "/chat/completions") && req.method === "POST") {
-    let body = "";
-    req.on("data", (chunk) => {
-      body += chunk;
-    });
-    req.on("end", () => {
-      handleChatCompletions(req, res, body);
-    });
-    return;
-  }
-
-  res.writeHead(404, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ error: { message: "Not Found" } }));
 });
 
-server.listen(PORT, () => {});
+server.listen(PORT, "0.0.0.0");
