@@ -18,7 +18,9 @@ const DATA_FILE = path.join(__dirname, "mcp-config.json");
 const mcpServers = new Map();
 const mcpToolRegistry = new Map();
 
-const SESSION_SECRET = crypto.randomBytes(32).toString("hex");
+const SESSION_SECRET = PANEL_PASSWORD
+  ? crypto.createHash("sha256").update(`mcp-proxy-session:${PANEL_PASSWORD}`).digest("hex")
+  : crypto.randomBytes(32).toString("hex");
 
 function getToolAction(toolName) {
   const name = (toolName || "").toLowerCase();
@@ -287,10 +289,12 @@ function readRequestBody(request) {
   });
 }
 
-function extractCombinedUserText(requestBody) {
+function isMcpContext(requestBody) {
+  if (mcpToolRegistry.size === 0) return false;
   const rawMessages = requestBody.messages || [];
-  if (!Array.isArray(rawMessages) || rawMessages.length === 0) return "";
-  return rawMessages
+  if (!Array.isArray(rawMessages) || rawMessages.length === 0) return false;
+
+  const combinedText = rawMessages
     .map((m) => {
       if (typeof m.content === "string") return m.content;
       if (Array.isArray(m.content)) {
@@ -301,12 +305,6 @@ function extractCombinedUserText(requestBody) {
       return "";
     })
     .join("\n");
-}
-
-function isMcpContext(requestBody) {
-  if (mcpToolRegistry.size === 0) return false;
-  const text = extractCombinedUserText(requestBody);
-  if (!text) return false;
 
   const serverNames = Array.from(mcpServers.values())
     .filter((s) => s.status === "active")
@@ -316,30 +314,12 @@ function isMcpContext(requestBody) {
   const keywords = [
     "mcp", "github", "git\\b", "repo", "代码库", "仓库", "commit", "pr\\b", "pull request",
     "分支", "branch", "提取代码", "读取文件", "查看文件", "修改文件", "创建文件", "新建文件", "删除文件",
-    "提交", "推送", "push", "写入", "更新", "修改", "替换", "帮我修改", "帮我提交",
-    "项目", "当前项目", "检测", "排查", "检查代码", "报错", "部署失败", "日志", "线上问题",
     "cloudflare", "cf\\b", "worker", "workers", "kv\\b", "d1\\b", "r2\\b", "dns", "domain", "域名",
     ...serverNames
   ];
 
   const pattern = new RegExp(`(${keywords.join("|")})`, "i");
-  return pattern.test(text);
-}
-
-function createEvidenceTracker(userText) {
-  const isRepoInspection = /(检测|检查|排查|是否存在问题|有什么问题|查看代码|当前项目|项目结构|最新提交)/i.test(userText);
-  const isRepoWrite = /(提交|推送|push|修改文件|创建文件|删除文件|更新文件|帮我修改|帮我提交|写入)/i.test(userText);
-
-  return {
-    requiresRepositoryEvidence: isRepoInspection || isRepoWrite,
-    requiresWriteEvidence: isRepoWrite,
-    hasRepositoryRead: false,
-    hasWriteOperation: false,
-    hasCommitVerification: false,
-    verifiedCommitSha: null,
-    readToolsCalled: [],
-    writeToolsCalled: []
-  };
+  return pattern.test(combinedText);
 }
 
 async function parseMcpResponse(res) {
@@ -367,7 +347,10 @@ async function connectToMcpServer({ name, url, token }) {
     "User-Agent": "mcp-agent-proxy/1.0.0"
   };
 
-  if (token) headers["Authorization"] = `Bearer ${token.trim()}`;
+  if (token) {
+    const rawToken = token.trim();
+    headers["Authorization"] = rawToken.startsWith("Bearer ") ? rawToken : `Bearer ${rawToken}`;
+  }
 
   const initPayload = {
     jsonrpc: "2.0",
@@ -514,8 +497,7 @@ function buildToolPrompt() {
     `2. 识别用户的意图时必须包容各种简写、代称（例如：cf = Cloudflare、gh = GitHub、k8s = Kubernetes 等）。`,
     `3. 只要存在与用户请求意图相关的工具，第一步必须调用该工具获取真实数据，严禁凭空臆造结果。`,
     `4. 严禁假操作、假提交与虚构结果：凡涉及文件修改、创建、删除、代码提交（commit）、分支或PR操作等写入类请求，必须发起真实的工具调用。在未调用工具或工具未返回成功结果前，严禁编造 Commit SHA、链接或声称“已提交/已修改”。`,
-    `5. 工具执行若返回错误或失败，必须如实向用户说明失败详情，严禁隐瞒错误或将失败伪造成成功。`,
-    `6. 严格禁止凭空编造不存在的文件（如 worker.js、index.js 等）或虚构项目架构，必须严格以工具查询到的真实文件和代码为准。`
+    `5. 工具执行若返回错误或失败，必须如实向用户说明失败详情，严禁隐瞒错误或将失败伪造成成功。`
   ].join("\n");
 }
 
@@ -548,23 +530,6 @@ function sendReasoningChunk(clientResponse, text, model = "default") {
       {
         index: 0,
         delta: { reasoning_content: text },
-        finish_reason: null
-      }
-    ]
-  };
-  clientResponse.write(`data: ${JSON.stringify(chunk)}\n\n`);
-}
-
-function sendContentChunk(clientResponse, text, model = "default") {
-  const chunk = {
-    id: `chatcmpl-${Date.now()}`,
-    object: "chat.completion.chunk",
-    created: Math.floor(Date.now() / 1000),
-    model,
-    choices: [
-      {
-        index: 0,
-        delta: { content: text },
         finish_reason: null
       }
     ]
@@ -608,8 +573,6 @@ async function runAgent(requestBody, clientResponse) {
 
   const isStream = requestBody.stream === true;
   const rawMessages = requestBody.messages;
-  const userText = extractCombinedUserText(requestBody);
-  const evidenceTracker = createEvidenceTracker(userText);
   const toolPrompt = buildToolPrompt();
 
   const clientTools = Array.isArray(requestBody.tools) ? requestBody.tools : [];
@@ -642,16 +605,17 @@ async function runAgent(requestBody, clientResponse) {
     });
   }
 
-  let enforcementInjected = false;
-
   for (let round = 0; round < 10; round += 1) {
     const payload = {
       ...requestBody,
       messages,
-      tools,
-      tool_choice: "auto",
       stream: true
     };
+
+    if (tools.length > 0) {
+      payload.tools = tools;
+      payload.tool_choice = "auto";
+    }
 
     const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
       method: "POST",
@@ -722,7 +686,7 @@ async function runAgent(requestBody, clientResponse) {
               const index = tc.index ?? 0;
               if (!accumulatedToolCalls[index]) {
                 accumulatedToolCalls[index] = {
-                  id: tc.id || "",
+                  id: tc.id || `call_${crypto.randomUUID()}`,
                   name: tc.function?.name || "",
                   arguments: ""
                 };
@@ -733,6 +697,9 @@ async function runAgent(requestBody, clientResponse) {
             }
           } else if (!isCallingTool && delta?.content) {
             assistantContent += delta.content;
+            if (isStream) {
+              clientResponse.write(`${line}\n\n`);
+            }
           }
         } catch {}
       }
@@ -743,51 +710,7 @@ async function runAgent(requestBody, clientResponse) {
     );
 
     if (mcpCalls.length === 0) {
-      if (evidenceTracker.requiresRepositoryEvidence && !evidenceTracker.hasRepositoryRead && !evidenceTracker.hasWriteOperation) {
-        if (!enforcementInjected) {
-          enforcementInjected = true;
-          messages.push({
-            role: "assistant",
-            content: assistantContent || null
-          });
-          messages.push({
-            role: "user",
-            content: "【系统拦截】：你正在回答针对当前仓库或代码的分析/操作请求，但本轮尚未调用任何仓库查询工具读取真实数据。严禁凭空臆想或根据猜想回答，严禁捏造文件或结构。请立即调用可用的查询工具（如读取文件、获取提交、列出目录等）获取真实数据后再作答。"
-          });
-          continue;
-        }
-
-        const refusalMsg = "无法完成仓库核验：未获得 GitHub 工具返回的真实数据，系统拒绝输出猜测性结论。";
-        if (isStream) {
-          sendContentChunk(clientResponse, refusalMsg, requestBody.model);
-          clientResponse.write("data: [DONE]\n\n");
-          clientResponse.end();
-          return;
-        }
-        sendJson(clientResponse, 200, {
-          id: `chatcmpl-${crypto.randomUUID()}`,
-          object: "chat.completion",
-          created: Math.floor(Date.now() / 1000),
-          model: requestBody.model || "default",
-          choices: [
-            {
-              index: 0,
-              message: { role: "assistant", content: refusalMsg },
-              finish_reason: "stop"
-            }
-          ]
-        });
-        return;
-      }
-
-      if (evidenceTracker.hasWriteOperation && !evidenceTracker.hasCommitVerification) {
-        assistantContent = assistantContent.replace(/(已提交|提交成功|已推送|push完成)/g, "已执行写入请求（等待二次确认）");
-      }
-
       if (isStream) {
-        if (assistantContent) {
-          sendContentChunk(clientResponse, assistantContent, requestBody.model);
-        }
         clientResponse.write("data: [DONE]\n\n");
         clientResponse.end();
         return;
@@ -813,7 +736,7 @@ async function runAgent(requestBody, clientResponse) {
       role: "assistant",
       content: assistantContent || null,
       tool_calls: mcpCalls.map((tc) => ({
-        id: tc.id,
+        id: tc.id || `call_${crypto.randomUUID()}`,
         type: "function",
         function: { name: tc.name, arguments: tc.arguments }
       }))
@@ -822,12 +745,8 @@ async function runAgent(requestBody, clientResponse) {
     for (const tc of mcpCalls) {
       const toolInfo = mcpToolRegistry.get(tc.name);
       const serverDisplayName = getServiceDisplayName(toolInfo, tc.name);
-      const rawFnName = toolInfo?.rawName || tc.name;
-      const actionName = getToolAction(rawFnName);
+      const actionName = getToolAction(toolInfo?.rawName || tc.name);
       const args = toolArguments({ function: { arguments: tc.arguments } });
-
-      const isReadTool = actionName === "查询";
-      const isWriteTool = actionName === "创建" || actionName === "更新/修改" || actionName === "删除";
 
       if (isStream) {
         sendReasoningChunk(
@@ -854,27 +773,6 @@ async function runAgent(requestBody, clientResponse) {
         }
       }
 
-      if (!isError) {
-        if (isReadTool) {
-          evidenceTracker.hasRepositoryRead = true;
-          evidenceTracker.readToolsCalled.push(rawFnName);
-          if (rawFnName.includes("commit")) {
-            evidenceTracker.hasCommitVerification = true;
-            try {
-              const resStr = JSON.stringify(result);
-              const shaMatch = resStr.match(/"sha":\s*"([a-f0-9]{40})"/i);
-              if (shaMatch) {
-                evidenceTracker.verifiedCommitSha = shaMatch[1];
-              }
-            } catch {}
-          }
-        }
-        if (isWriteTool) {
-          evidenceTracker.hasWriteOperation = true;
-          evidenceTracker.writeToolsCalled.push(rawFnName);
-        }
-      }
-
       if (isStream) {
         if (isError) {
           sendReasoningChunk(
@@ -893,7 +791,7 @@ async function runAgent(requestBody, clientResponse) {
 
       messages.push({
         role: "tool",
-        tool_call_id: tc.id,
+        tool_call_id: tc.id || `call_${crypto.randomUUID()}`,
         content: JSON.stringify(result)
       });
     }
@@ -1004,7 +902,9 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    if (request.method === "GET" && (request.url === "/" || request.url.startsWith("/?"))) {
+    const reqUrl = new URL(request.url, `http://${request.headers.host || "localhost"}`);
+
+    if (request.method === "GET" && (reqUrl.pathname === "/" || reqUrl.pathname === "")) {
       setCorsHeaders(response);
       if (PANEL_PASSWORD) {
         const cookies = parseCookies(request);
@@ -1021,12 +921,12 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    if (request.method === "GET" && request.url === "/health") {
+    if (request.method === "GET" && reqUrl.pathname === "/health") {
       sendJson(response, 200, { status: "ok" });
       return;
     }
 
-    if (request.method === "POST" && request.url === "/api/panel/login") {
+    if (request.method === "POST" && reqUrl.pathname === "/api/panel/login") {
       const body = await readRequestBody(request);
       if (!PANEL_PASSWORD || body.password === PANEL_PASSWORD) {
         const token = generateSessionToken();
@@ -1042,7 +942,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    if (request.method === "POST" && request.url === "/api/panel/logout") {
+    if (request.method === "POST" && reqUrl.pathname === "/api/panel/logout") {
       setCorsHeaders(response);
       response.writeHead(200, {
         "Content-Type": "application/json",
@@ -1052,26 +952,27 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    if (request.url.startsWith("/api/mcp/")) {
+    if (reqUrl.pathname.startsWith("/api/mcp/")) {
       if (!isPanelAuthorized(request)) {
         sendJson(response, 401, { error: "控制台未授权，请输入管理密码" });
         return;
       }
 
-      if (request.method === "GET" && request.url === "/api/mcp/servers") {
+      if (request.method === "GET" && reqUrl.pathname === "/api/mcp/servers") {
         sendJson(response, 200, { servers: Array.from(mcpServers.values()) });
         return;
       }
 
-      if (request.method === "POST" && request.url === "/api/mcp/connect") {
+      if (request.method === "POST" && reqUrl.pathname === "/api/mcp/connect") {
         const body = await readRequestBody(request);
         const serverInfo = await connectToMcpServer(body);
         sendJson(response, 200, { toolCount: serverInfo.toolCount });
         return;
       }
 
-      if (request.method === "POST" && request.url.includes("/start")) {
-        const id = request.url.replace("/api/mcp/servers/", "").replace("/start", "");
+      const matchStart = reqUrl.pathname.match(/^\/api\/mcp\/servers\/([^/]+)\/start$/);
+      if (request.method === "POST" && matchStart) {
+        const id = decodeURIComponent(matchStart[1]);
         const s = mcpServers.get(id);
         if (!s) {
           sendJson(response, 404, { error: "未找到该服务" });
@@ -1092,8 +993,9 @@ const server = http.createServer(async (request, response) => {
         return;
       }
 
-      if (request.method === "POST" && request.url.includes("/stop")) {
-        const id = request.url.replace("/api/mcp/servers/", "").replace("/stop", "");
+      const matchStop = reqUrl.pathname.match(/^\/api\/mcp\/servers\/([^/]+)\/stop$/);
+      if (request.method === "POST" && matchStop) {
+        const id = decodeURIComponent(matchStop[1]);
         const s = mcpServers.get(id);
         if (!s) {
           sendJson(response, 404, { error: "未找到该服务" });
@@ -1110,8 +1012,9 @@ const server = http.createServer(async (request, response) => {
         return;
       }
 
-      if (request.method === "DELETE" && request.url.startsWith("/api/mcp/servers/")) {
-        const id = request.url.replace("/api/mcp/servers/", "");
+      const matchDelete = reqUrl.pathname.match(/^\/api\/mcp\/servers\/([^/]+)$/);
+      if (request.method === "DELETE" && matchDelete) {
+        const id = decodeURIComponent(matchDelete[1]);
         mcpServers.delete(id);
         for (const [key, val] of mcpToolRegistry.entries()) {
           if (val.serverId === id) {
@@ -1129,7 +1032,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    if (request.method === "GET" && request.url === "/v1/models") {
+    if (request.method === "GET" && reqUrl.pathname === "/v1/models") {
       if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
         sendJson(response, 200, {
           object: "list",
@@ -1158,7 +1061,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    if (request.method === "POST" && request.url === "/v1/chat/completions") {
+    if (request.method === "POST" && reqUrl.pathname === "/v1/chat/completions") {
       if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
         sendOpenAIError(response, 500, "服务端未配置环境变量：UPSTREAM_BASE_URL 或 UPSTREAM_API_KEY");
         return;
