@@ -10,7 +10,7 @@
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
       background-color: #f8fafc;
       color: #1e293b;
-      padding: 32px 16px;
+      padding: 24px 14px;
       line-height: 1.5;
     }
     .container {
@@ -20,29 +20,32 @@
     .header {
       display: flex;
       justify-content: space-between;
-      align-items: flex-start;
-      margin-bottom: 24px;
+      align-items: center;
+      margin-bottom: 20px;
+      gap: 12px;
     }
     .header h1 {
-      font-size: 22px;
+      font-size: 20px;
       font-weight: 700;
       color: #0f172a;
       letter-spacing: -0.02em;
     }
     .header p {
-      font-size: 14px;
+      font-size: 13px;
       color: #64748b;
-      margin-top: 4px;
+      margin-top: 2px;
     }
     .btn-logout {
       background: #ffffff;
       color: #64748b;
       border: 1px solid #cbd5e1;
-      padding: 6px 14px;
+      padding: 6px 12px;
       font-size: 13px;
       font-weight: 500;
       border-radius: 6px;
       cursor: pointer;
+      white-space: nowrap;
+      flex-shrink: 0;
       transition: all 0.15s;
     }
     .btn-logout:hover {
@@ -54,32 +57,35 @@
       background: #ffffff;
       border: 1px solid #e2e8f0;
       border-radius: 12px;
-      padding: 24px;
-      margin-bottom: 20px;
+      padding: 20px;
+      margin-bottom: 16px;
       box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05);
     }
     .card-title {
-      font-size: 16px;
+      font-size: 15px;
       font-weight: 600;
       color: #0f172a;
-      margin-bottom: 16px;
+      margin-bottom: 14px;
       display: flex;
       align-items: center;
       gap: 8px;
     }
     .badge {
-      display: inline-block;
-      font-size: 11px;
-      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      font-size: 12px;
+      font-weight: 500;
       padding: 2px 8px;
       border-radius: 9999px;
+      white-space: nowrap;
+      flex-shrink: 0;
     }
     .badge-blue { background: #e0f2fe; color: #0369a1; }
     .badge-green { background: #dcfce7; color: #15803d; }
     .badge-gray { background: #f1f5f9; color: #64748b; border: 1px solid #e2e8f0; }
 
     .group {
-      margin-bottom: 16px;
+      margin-bottom: 14px;
     }
     .group:last-child {
       margin-bottom: 0;
@@ -94,7 +100,7 @@
     .box {
       background: #f1f5f9;
       border: 1px solid #e2e8f0;
-      padding: 10px 14px;
+      padding: 10px 12px;
       border-radius: 8px;
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       font-size: 13px;
@@ -106,7 +112,7 @@
       width: 100%;
       background: #ffffff;
       border: 1px solid #cbd5e1;
-      padding: 10px 14px;
+      padding: 10px 12px;
       border-radius: 8px;
       color: #0f172a;
       font-size: 14px;
@@ -129,6 +135,8 @@
       padding: 10px 24px;
       border-radius: 8px;
       cursor: pointer;
+      white-space: nowrap;
+      flex-shrink: 0;
       transition: background-color 0.15s;
     }
     .btn:hover {
@@ -138,14 +146,17 @@
       display: flex;
       gap: 6px;
       align-items: center;
+      flex-shrink: 0;
     }
     .btn-action {
       border: none;
-      padding: 4px 10px;
+      padding: 5px 12px;
       font-size: 12px;
       font-weight: 600;
       border-radius: 6px;
       cursor: pointer;
+      white-space: nowrap;
+      flex-shrink: 0;
       transition: all 0.15s;
     }
     .btn-start {
@@ -182,60 +193,70 @@
     .server-item {
       background: #f8fafc;
       border: 1px solid #e2e8f0;
-      padding: 16px;
-      border-radius: 8px;
+      padding: 14px;
+      border-radius: 10px;
       margin-bottom: 12px;
     }
     .server-item:last-child {
       margin-bottom: 0;
     }
     .server-item.disabled {
-      opacity: 0.65;
+      opacity: 0.7;
       background: #f1f5f9;
     }
     .server-item-head {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      margin-bottom: 6px;
+      margin-bottom: 8px;
+      gap: 8px;
     }
     .server-item-title {
-      font-size: 14px;
+      font-size: 15px;
       font-weight: 600;
       color: #0f172a;
       display: flex;
       align-items: center;
       gap: 8px;
+      min-width: 0;
+      overflow: hidden;
+    }
+    .server-name-text {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     .server-item-url {
       font-size: 12px;
       color: #64748b;
       margin-bottom: 8px;
       font-family: monospace;
+      word-break: break-all;
     }
     .tool-toggle-bar {
-      font-size: 12px;
+      font-size: 13px;
       color: #475569;
       display: flex;
       align-items: center;
-      gap: 8px;
-      margin-top: 6px;
+      gap: 6px;
+      margin-top: 4px;
     }
     .tool-toggle-btn {
       background: none;
       border: none;
       color: #2563eb;
-      font-size: 12px;
+      font-size: 13px;
       cursor: pointer;
       padding: 0;
       font-weight: 500;
+      white-space: nowrap;
     }
     .tool-toggle-btn:hover {
       text-decoration: underline;
     }
     .tools-container {
-      margin-top: 8px;
-      padding-top: 8px;
+      margin-top: 10px;
+      padding-top: 10px;
       border-top: 1px dashed #cbd5e1;
       display: none;
     }
@@ -245,9 +266,10 @@
       color: #334155;
       font-size: 11px;
       font-family: monospace;
-      padding: 2px 8px;
+      padding: 3px 8px;
       border-radius: 4px;
-      margin: 2px 4px 2px 0;
+      margin: 2px 4px 4px 0;
+      word-break: break-all;
     }
     #conn-msg {
       margin-left: 12px;
@@ -256,9 +278,9 @@
     }
     .empty-state {
       text-align: center;
-      padding: 32px 16px;
+      padding: 28px 14px;
       color: #94a3b8;
-      font-size: 14px;
+      font-size: 13px;
     }
   </style>
 </head>
@@ -267,7 +289,7 @@
     <div class="header">
       <div>
         <h1>MCP 代理控制台</h1>
-        <p>为 Chatbox 和 OpenAI 生态客户端提供全自动多 MCP 工具接入与持久化存储</p>
+        <p>为客户端提供多 MCP 工具接入与持久化存储</p>
       </div>
       <button class="btn-logout" onclick="handleLogout()">退出登录</button>
     </div>
@@ -290,7 +312,7 @@
     <div class="card">
       <div class="card-title">手动挂载 MCP 服务（支持添加多个）</div>
       <div class="group">
-        <label>服务前缀名称（如 Github、Gitlab、Notion、Bilibili 等）</label>
+        <label>服务前缀名称（如 Github、Gitlab、Notion 等）</label>
         <input id="mcp-name" value="Github" placeholder="输入唯一标识名称">
       </div>
       <div class="group">
@@ -299,9 +321,9 @@
       </div>
       <div class="group">
         <label>认证令牌 (Token，可选)</label>
-        <input id="mcp-token" type="password" placeholder="如需认证请粘贴 Token（如 ghu_、ghp_、Bearer）">
+        <input id="mcp-token" type="password" placeholder="如需认证请粘贴 Token（如 ghu_、ghp_）">
       </div>
-      <div style="display: flex; align-items: center; margin-top: 18px;">
+      <div style="display: flex; align-items: center; margin-top: 16px;">
         <button id="btn-conn" class="btn" onclick="handleConnect()">添加</button>
         <span id="conn-msg"></span>
       </div>
@@ -368,9 +390,8 @@
             <div class="server-item ${isActive ? '' : 'disabled'}">
               <div class="server-item-head">
                 <div class="server-item-title">
-                  <span>${s.name}</span>
+                  <span class="server-name-text">${s.name}</span>
                   ${statusBadge}
-                  <span class="badge badge-blue">${s.toolCount} 个工具</span>
                 </div>
                 <div class="action-group">
                   ${toggleActionBtn}
