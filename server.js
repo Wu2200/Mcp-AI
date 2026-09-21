@@ -287,7 +287,7 @@ function readRequestBody(request) {
     let size = 0;
     request.on("data", (chunk) => {
       size += chunk.length;
-      if (size > 15 * 1024 * 1024) {
+      if (size > 20 * 1024 * 1024) {
         reject(new Error("请求过大"));
         request.destroy();
         return;
@@ -467,7 +467,7 @@ async function callMcpTool(toolKey, args) {
       method: "tools/call",
       params: { name: info.rawName, arguments: args }
     }),
-    signal: AbortSignal.timeout(45000)
+    signal: AbortSignal.timeout(60000)
   });
 
   if (!res.ok) {
@@ -549,7 +549,7 @@ async function passThrough(requestBody, clientResponse) {
       "Content-Type": "application/json"
     },
     body: JSON.stringify(requestBody),
-    signal: AbortSignal.timeout(180000)
+    signal: AbortSignal.timeout(300000)
   });
 
   clientResponse.writeHead(upstreamResponse.status, {
@@ -629,217 +629,200 @@ async function runAgent(requestBody, clientResponse) {
     });
   }
 
-  // 保持 SSE TCP 连接活跃的心跳计时器（防止反向代理如 Cloudflare / Render 在长时间调用时 504 掐断）
-  let pingTimer = null;
-  if (isStream) {
-    pingTimer = setInterval(() => {
-      try {
-        clientResponse.write(": ping\n\n");
-      } catch {}
-    }, 5000);
-  }
+  for (let round = 0; round < 15; round += 1) {
+    const payload = {
+      ...requestBody,
+      messages,
+      stream: true
+    };
 
-  try {
-    // 增加上限至 15 轮，稳定支持复杂的多步连续调用
-    for (let round = 0; round < 15; round += 1) {
-      const payload = {
-        ...requestBody,
-        messages,
-        stream: true
-      };
+    if (tools.length > 0) {
+      payload.tools = tools;
+      payload.tool_choice = "auto";
+    }
 
-      if (tools.length > 0) {
-        payload.tools = tools;
-        payload.tool_choice = "auto";
-      }
+    const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${UPSTREAM_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(300000)
+    });
 
-      const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${UPSTREAM_API_KEY}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(120000)
-      });
-
-      if (!upstreamResponse.ok) {
-        const err = await upstreamResponse.text();
-        if (isStream) {
-          const errorChunk = {
-            id: `chatcmpl-${Date.now()}`,
-            object: "chat.completion.chunk",
-            created: Math.floor(Date.now() / 1000),
-            model: requestBody.model || "default",
-            choices: [
-              {
-                index: 0,
-                delta: { content: `\n\n上游返回错误 (${upstreamResponse.status})：${err.slice(0, 500)}` },
-                finish_reason: "stop"
-              }
-            ]
-          };
-          clientResponse.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
-          clientResponse.write("data: [DONE]\n\n");
-          clientResponse.end();
-          return;
-        }
-        throw new Error(`上游接口返回错误 (${upstreamResponse.status})：${err.slice(0, 500)}`);
-      }
-
-      const reader = upstreamResponse.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let accumulatedToolCalls = [];
-      let assistantContent = "";
-      let streamedDeltas = [];
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || !trimmed.startsWith("data:")) continue;
-          const dataStr = trimmed.slice(5).trim();
-          if (dataStr === "[DONE]") continue;
-
-          try {
-            const parsed = JSON.parse(dataStr);
-            const delta = parsed.choices?.[0]?.delta;
-            if (delta?.reasoning_content && isStream) {
-              clientResponse.write(`${line}\n\n`);
-            }
-
-            if (delta?.tool_calls) {
-              for (const tc of delta.tool_calls) {
-                const index = tc.index ?? 0;
-                if (!accumulatedToolCalls[index]) {
-                  accumulatedToolCalls[index] = {
-                    id: tc.id || `call_${crypto.randomUUID()}`,
-                    name: tc.function?.name || "",
-                    arguments: ""
-                  };
-                }
-                if (tc.id) accumulatedToolCalls[index].id = tc.id;
-                if (tc.function?.name) accumulatedToolCalls[index].name = tc.function.name;
-                if (tc.function?.arguments) accumulatedToolCalls[index].arguments += tc.function.arguments;
-              }
-            }
-
-            if (delta?.content) {
-              assistantContent += delta.content;
-              streamedDeltas.push(line);
-            }
-          } catch {}
-        }
-      }
-
-      const mcpCalls = accumulatedToolCalls.filter((tc) => {
-        if (!tc || !tc.name) return false;
-        if (mcpToolRegistry.has(tc.name)) return true;
-        for (const [k, v] of mcpToolRegistry.entries()) {
-          if (k.endsWith(tc.name) || tc.name.endsWith(v.rawName)) return true;
-        }
-        return false;
-      });
-
-      // 模型完成最终思考与执行，不再触发工具，直接输出最终文本答案
-      if (mcpCalls.length === 0) {
-        if (isStream) {
-          for (const line of streamedDeltas) {
-            clientResponse.write(`${line}\n\n`);
-          }
-          clientResponse.write("data: [DONE]\n\n");
-          clientResponse.end();
-          return;
-        }
-
-        sendJson(clientResponse, 200, {
-          id: `chatcmpl-${crypto.randomUUID()}`,
-          object: "chat.completion",
+    if (!upstreamResponse.ok) {
+      const err = await upstreamResponse.text();
+      if (isStream) {
+        const errorChunk = {
+          id: `chatcmpl-${Date.now()}`,
+          object: "chat.completion.chunk",
           created: Math.floor(Date.now() / 1000),
           model: requestBody.model || "default",
           choices: [
             {
               index: 0,
-              message: { role: "assistant", content: assistantContent },
+              delta: { content: `\n\n上游返回错误 (${upstreamResponse.status})：${err.slice(0, 500)}` },
               finish_reason: "stop"
             }
           ]
-        });
+        };
+        clientResponse.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
+        clientResponse.write("data: [DONE]\n\n");
+        clientResponse.end();
         return;
       }
+      throw new Error(`上游接口返回错误 (${upstreamResponse.status})：${err.slice(0, 500)}`);
+    }
 
-      // 记录助手产生的 tool_calls
-      messages.push({
-        role: "assistant",
-        content: assistantContent || null,
-        tool_calls: mcpCalls.map((tc) => ({
-          id: tc.id || `call_${crypto.randomUUID()}`,
-          type: "function",
-          function: { name: tc.name, arguments: tc.arguments }
-        }))
-      });
+    const reader = upstreamResponse.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let accumulatedToolCalls = [];
+    let assistantContent = "";
 
-      for (const tc of mcpCalls) {
-        let toolInfo = mcpToolRegistry.get(tc.name);
-        if (!toolInfo) {
-          for (const [k, v] of mcpToolRegistry.entries()) {
-            if (k.endsWith(tc.name) || tc.name.endsWith(v.rawName)) {
-              toolInfo = v;
-              break;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith("data:")) continue;
+        const dataStr = trimmed.slice(5).trim();
+        if (dataStr === "[DONE]") continue;
+
+        try {
+          const parsed = JSON.parse(dataStr);
+          const delta = parsed.choices?.[0]?.delta;
+
+          if (delta?.tool_calls) {
+            for (const tc of delta.tool_calls) {
+              const index = tc.index ?? 0;
+              if (!accumulatedToolCalls[index]) {
+                accumulatedToolCalls[index] = {
+                  id: tc.id || `call_${crypto.randomUUID()}`,
+                  name: tc.function?.name || "",
+                  arguments: ""
+                };
+              }
+              if (tc.id) accumulatedToolCalls[index].id = tc.id;
+              if (tc.function?.name) accumulatedToolCalls[index].name = tc.function.name;
+              if (tc.function?.arguments) accumulatedToolCalls[index].arguments += tc.function.arguments;
             }
           }
-        }
 
-        const displayName = toolInfo?.serverName || "MCP";
-        const rawAction = toolInfo?.rawName || tc.name;
-        const args = toolArguments({ function: { arguments: tc.arguments } });
-
-        if (isStream) {
-          sendReasoningChunk(
-            clientResponse,
-            `\n> [第 ${round + 1} 步] 正在执行 ${displayName} [${rawAction}]...\n`,
-            requestBody.model
-          );
-        }
-
-        let result;
-        if (args === null) {
-          result = JSON.stringify({ error: "Invalid tool arguments" });
-        } else {
-          try {
-            result = await callMcpTool(tc.name, args);
-          } catch (err) {
-            result = JSON.stringify({ error: err instanceof Error ? err.message : "Tool execution failed" });
+          // 核心修复：普通文本/长代码输出必须实时写入客户端，绝不在内存憋着，彻底避免 Chatbox 超时截断！
+          if (delta?.content) {
+            assistantContent += delta.content;
+            if (isStream) {
+              clientResponse.write(`${line}\n\n`);
+            }
+          } else if (delta?.reasoning_content && isStream) {
+            clientResponse.write(`${line}\n\n`);
           }
-        }
-
-        if (isStream) {
-          sendReasoningChunk(
-            clientResponse,
-            `> [第 ${round + 1} 步] ${displayName} [${rawAction}] 执行完成\n\n`,
-            requestBody.model
-          );
-        }
-
-        messages.push({
-          role: "tool",
-          tool_call_id: tc.id || `call_${crypto.randomUUID()}`,
-          content: typeof result === "string" ? result : JSON.stringify(result)
-        });
+        } catch {}
       }
     }
 
-    throw new Error("工具调用轮数达到上限 (15轮)");
-  } finally {
-    if (pingTimer) clearInterval(pingTimer);
+    const mcpCalls = accumulatedToolCalls.filter((tc) => {
+      if (!tc || !tc.name) return false;
+      if (mcpToolRegistry.has(tc.name)) return true;
+      for (const [k, v] of mcpToolRegistry.entries()) {
+        if (k.endsWith(tc.name) || tc.name.endsWith(v.rawName)) return true;
+      }
+      return false;
+    });
+
+    // 模型输出完毕且没有发起任何工具调用，直接优雅结束流式传输，零截断
+    if (mcpCalls.length === 0) {
+      if (isStream) {
+        clientResponse.write("data: [DONE]\n\n");
+        clientResponse.end();
+        return;
+      }
+
+      sendJson(clientResponse, 200, {
+        id: `chatcmpl-${crypto.randomUUID()}`,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: requestBody.model || "default",
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: assistantContent },
+            finish_reason: "stop"
+          }
+        ]
+      });
+      return;
+    }
+
+    // 只有在命中真实工具调用时，才记录助手消息并执行工具
+    messages.push({
+      role: "assistant",
+      content: assistantContent || null,
+      tool_calls: mcpCalls.map((tc) => ({
+        id: tc.id || `call_${crypto.randomUUID()}`,
+        type: "function",
+        function: { name: tc.name, arguments: tc.arguments }
+      }))
+    });
+
+    for (const tc of mcpCalls) {
+      let toolInfo = mcpToolRegistry.get(tc.name);
+      if (!toolInfo) {
+        for (const [k, v] of mcpToolRegistry.entries()) {
+          if (k.endsWith(tc.name) || tc.name.endsWith(v.rawName)) {
+            toolInfo = v;
+            break;
+          }
+        }
+      }
+
+      const displayName = toolInfo?.serverName || "MCP";
+      const rawAction = toolInfo?.rawName || tc.name;
+      const args = toolArguments({ function: { arguments: tc.arguments } });
+
+      if (isStream) {
+        sendReasoningChunk(
+          clientResponse,
+          `\n> 正在执行 ${displayName} [${rawAction}]...\n`,
+          requestBody.model
+        );
+      }
+
+      let result;
+      if (args === null) {
+        result = JSON.stringify({ error: "Invalid tool arguments" });
+      } else {
+        try {
+          result = await callMcpTool(tc.name, args);
+        } catch (err) {
+          result = JSON.stringify({ error: err instanceof Error ? err.message : "Tool execution failed" });
+        }
+      }
+
+      if (isStream) {
+        sendReasoningChunk(
+          clientResponse,
+          `> ${displayName} [${rawAction}] 完成\n\n`,
+          requestBody.model
+        );
+      }
+
+      messages.push({
+        role: "tool",
+        tool_call_id: tc.id || `call_${crypto.randomUUID()}`,
+        content: typeof result === "string" ? result : JSON.stringify(result)
+      });
+    }
   }
+
+  throw new Error("工具调用轮数达到上限");
 }
 
 function getLoginHtml() {
@@ -995,20 +978,17 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 面板 API
     if (reqUrl.pathname.startsWith("/api/")) {
       if (!isPanelAuthorized(request)) {
         sendJson(response, 401, { error: "控制台未授权，请输入管理密码" });
         return;
       }
 
-      // 获取白名单模型列表
       if (request.method === "GET" && reqUrl.pathname === "/api/settings/enabled-models") {
         sendJson(response, 200, { enabledModels: Array.from(enabledModels) });
         return;
       }
 
-      // 更新白名单模型列表
       if (request.method === "POST" && reqUrl.pathname === "/api/settings/enabled-models") {
         const body = await readRequestBody(request);
         const models = Array.isArray(body.models) ? body.models : [];
@@ -1017,7 +997,6 @@ const server = http.createServer(async (request, response) => {
         return;
       }
 
-      // 获取上游所有模型列表
       if (request.method === "GET" && reqUrl.pathname === "/api/upstream/models") {
         if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
           sendJson(response, 200, { models: [] });
@@ -1152,11 +1131,9 @@ const server = http.createServer(async (request, response) => {
 
       const body = await readRequestBody(request);
 
-      // 白名单模式：仅当模型被选中，且存在激活的 MCP 服务时才挂载 MCP 工具
       if (isModelEnabledForMcp(body.model) && mcpToolRegistry.size > 0) {
         await runAgent(body, response);
       } else {
-        // 未选中的模型全部纯净直通上游，绝不注入任何 tools，100% 保留网关网络搜索
         await passThrough(body, response);
       }
       return;
