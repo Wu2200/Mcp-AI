@@ -22,21 +22,11 @@ const SESSION_SECRET = process.env.SESSION_SECRET || (PANEL_PASSWORD ? crypto.cr
 
 function getToolAction(toolName) {
   const name = (toolName || "").toLowerCase();
-  if (name.includes("delete") || name.includes("remove")) {
-    return "删除";
-  }
-  if (name.includes("update") || name.includes("merge") || name.includes("resolve") || name.includes("patch") || name.includes("edit")) {
-    return "更新/修改";
-  }
-  if (name.includes("create") || name.includes("add") || name.includes("push") || name.includes("fork")) {
-    return "创建";
-  }
-  if (name.includes("get") || name.includes("list") || name.includes("search") || name.includes("read") || name.includes("docs")) {
-    return "查询";
-  }
-  if (name.includes("execute") || name.includes("run")) {
-    return "执行";
-  }
+  if (name.includes("delete") || name.includes("remove")) return "删除";
+  if (name.includes("update") || name.includes("merge") || name.includes("resolve") || name.includes("patch") || name.includes("edit")) return "更新/修改";
+  if (name.includes("create") || name.includes("add") || name.includes("push") || name.includes("fork")) return "创建";
+  if (name.includes("get") || name.includes("list") || name.includes("search") || name.includes("read") || name.includes("docs")) return "查询";
+  if (name.includes("execute") || name.includes("run")) return "执行";
   return "处理";
 }
 
@@ -288,8 +278,24 @@ function readRequestBody(request) {
 
 function isMcpContext(requestBody) {
   if (mcpToolRegistry.size === 0) return false;
-  const rawMessages = requestBody.messages || [];
-  return Array.isArray(rawMessages) && rawMessages.length > 0;
+  const rawMessages = requestBody.messages;
+  if (!Array.isArray(rawMessages) || rawMessages.length === 0) return false;
+
+  const lastUserMsg = [...rawMessages].reverse().find((m) => m.role === "user");
+  const content = typeof lastUserMsg?.content === "string" ? lastUserMsg.content.toLowerCase() : "";
+
+  const activeNames = Array.from(mcpServers.values())
+    .filter((s) => s.status === "active")
+    .map((s) => s.name.toLowerCase());
+
+  const genericKeywords = [
+    "mcp", "工具", "查询", "获取", "列出", "创建", "修改", "删除",
+    "github", "cloudflare", "cf", "gh", "worker", "repo", "commit",
+    "pr", "issue", "branch", "分支", "仓库"
+  ];
+  const allKeywords = [...genericKeywords, ...activeNames];
+
+  return allKeywords.some((k) => content.includes(k));
 }
 
 async function parseMcpResponse(res) {
@@ -589,8 +595,8 @@ async function runAgent(requestBody, clientResponse) {
     const payload = {
       ...requestBody,
       messages,
-      tools,
-      tool_choice: "auto",
+      tools: tools.length > 0 ? tools : undefined,
+      tool_choice: tools.length > 0 ? (requestBody.tool_choice || "auto") : undefined,
       stream: true
     };
 
