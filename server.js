@@ -19,7 +19,7 @@ const SETTINGS_FILE = path.join(__dirname, "mcp-settings.json");
 
 const mcpServers = new Map();
 const mcpToolRegistry = new Map();
-let excludedModels = new Set();
+let enabledModels = new Set();
 
 const SESSION_SECRET = PANEL_PASSWORD
   ? crypto.createHash("sha256").update(`mcp-proxy-session:${PANEL_PASSWORD}`).digest("hex")
@@ -93,13 +93,13 @@ async function initDatabase() {
   }
 }
 
-async function saveExcludedModelsToStorage(modelsArray) {
-  excludedModels = new Set(modelsArray);
+async function saveEnabledModelsToStorage(modelsArray) {
+  enabledModels = new Set(modelsArray);
   if (pgPool) {
     try {
       await pgPool.query(
         `INSERT INTO mcp_settings (key, value, updated_at)
-         VALUES ('excluded_models', $1, CURRENT_TIMESTAMP)
+         VALUES ('enabled_models', $1, CURRENT_TIMESTAMP)
          ON CONFLICT (key) DO UPDATE SET
            value = EXCLUDED.value,
            updated_at = CURRENT_TIMESTAMP`,
@@ -108,18 +108,18 @@ async function saveExcludedModelsToStorage(modelsArray) {
     } catch {}
   }
   try {
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify({ excludedModels: modelsArray }, null, 2), "utf8");
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify({ enabledModels: modelsArray }, null, 2), "utf8");
   } catch {}
 }
 
-async function loadExcludedModelsFromStorage() {
+async function loadEnabledModelsFromStorage() {
   if (pgPool) {
     try {
-      const res = await pgPool.query("SELECT value FROM mcp_settings WHERE key = 'excluded_models' LIMIT 1");
+      const res = await pgPool.query("SELECT value FROM mcp_settings WHERE key = 'enabled_models' LIMIT 1");
       if (res.rows && res.rows.length > 0) {
         const val = res.rows[0].value;
         const list = Array.isArray(val) ? val : (typeof val === "string" ? JSON.parse(val) : []);
-        excludedModels = new Set(list);
+        enabledModels = new Set(list);
         return;
       }
     } catch {}
@@ -129,8 +129,8 @@ async function loadExcludedModelsFromStorage() {
     try {
       const raw = fs.readFileSync(SETTINGS_FILE, "utf8");
       const data = JSON.parse(raw);
-      if (Array.isArray(data.excludedModels)) {
-        excludedModels = new Set(data.excludedModels);
+      if (Array.isArray(data.enabledModels)) {
+        enabledModels = new Set(data.enabledModels);
       }
     } catch {}
   }
@@ -554,10 +554,13 @@ async function passThrough(requestBody, clientResponse) {
   clientResponse.end();
 }
 
-function isModelExcluded(modelName) {
-  if (!modelName) return false;
+/**
+ * 白名单判断：只有在“启用模型列表”中被选中的模型才挂载 MCP 工具
+ */
+function isModelEnabledForMcp(modelName) {
+  if (!modelName || enabledModels.size === 0) return false;
   const target = modelName.trim().toLowerCase();
-  for (const m of excludedModels) {
+  for (const m of enabledModels) {
     const pattern = m.trim().toLowerCase();
     if (!pattern) continue;
     if (pattern === target) return true;
@@ -902,7 +905,7 @@ function getLoginHtml() {
 
 await initDatabase();
 await loadConfigFromStorage();
-await loadExcludedModelsFromStorage();
+await loadEnabledModelsFromStorage();
 
 const server = http.createServer(async (request, response) => {
   try {
@@ -970,18 +973,18 @@ const server = http.createServer(async (request, response) => {
         return;
       }
 
-      // 获取排除模型列表
-      if (request.method === "GET" && reqUrl.pathname === "/api/settings/excluded-models") {
-        sendJson(response, 200, { excludedModels: Array.from(excludedModels) });
+      // 获取白名单模型列表
+      if (request.method === "GET" && reqUrl.pathname === "/api/settings/enabled-models") {
+        sendJson(response, 200, { enabledModels: Array.from(enabledModels) });
         return;
       }
 
-      // 更新排除模型列表
-      if (request.method === "POST" && reqUrl.pathname === "/api/settings/excluded-models") {
+      // 更新白名单模型列表
+      if (request.method === "POST" && reqUrl.pathname === "/api/settings/enabled-models") {
         const body = await readRequestBody(request);
         const models = Array.isArray(body.models) ? body.models : [];
-        await saveExcludedModelsToStorage(models);
-        sendJson(response, 200, { success: true, excludedModels: Array.from(excludedModels) });
+        await saveEnabledModelsToStorage(models);
+        sendJson(response, 200, { success: true, enabledModels: Array.from(enabledModels) });
         return;
       }
 
@@ -1120,11 +1123,12 @@ const server = http.createServer(async (request, response) => {
 
       const body = await readRequestBody(request);
 
-      // 如果模型在排除列表中，或者没有激活任何 MCP 服务，直接纯净直通上游，绝不注入任何 tools
-      if (isModelExcluded(body.model) || mcpToolRegistry.size === 0) {
-        await passThrough(body, response);
-      } else {
+      // 白名单模式：仅当模型被选中，且存在激活的 MCP 服务时才挂载 MCP 工具
+      if (isModelEnabledForMcp(body.model) && mcpToolRegistry.size > 0) {
         await runAgent(body, response);
+      } else {
+        // 未选中的模型全部纯净直通上游，绝不注入任何 tools，100% 保留网关网络搜索
+        await passThrough(body, response);
       }
       return;
     }
