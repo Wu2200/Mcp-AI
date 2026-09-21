@@ -35,17 +35,20 @@
       margin-top: 4px;
     }
     .btn-logout {
-      background: #f1f5f9;
-      color: #475569;
+      background: #ffffff;
+      color: #64748b;
       border: 1px solid #cbd5e1;
-      padding: 6px 12px;
+      padding: 6px 14px;
       font-size: 13px;
       font-weight: 500;
       border-radius: 6px;
       cursor: pointer;
+      transition: all 0.15s;
     }
     .btn-logout:hover {
-      background: #e2e8f0;
+      background: #fee2e2;
+      color: #dc2626;
+      border-color: #fca5a5;
     }
     .card {
       background: #ffffff;
@@ -70,9 +73,11 @@
       font-weight: 600;
       padding: 2px 8px;
       border-radius: 9999px;
-      background: #e0f2fe;
-      color: #0369a1;
     }
+    .badge-blue { background: #e0f2fe; color: #0369a1; }
+    .badge-green { background: #dcfce7; color: #15803d; }
+    .badge-gray { background: #f1f5f9; color: #64748b; border: 1px solid #e2e8f0; }
+
     .group {
       margin-bottom: 16px;
     }
@@ -121,7 +126,7 @@
       border: none;
       font-weight: 600;
       font-size: 14px;
-      padding: 10px 20px;
+      padding: 10px 24px;
       border-radius: 8px;
       cursor: pointer;
       transition: background-color 0.15s;
@@ -129,10 +134,13 @@
     .btn:hover {
       background: #1d4ed8;
     }
-    .btn-danger {
-      background: #fee2e2;
-      color: #dc2626;
-      border: 1px solid #fecaca;
+    .action-group {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+    }
+    .btn-action {
+      border: none;
       padding: 4px 10px;
       font-size: 12px;
       font-weight: 600;
@@ -140,11 +148,37 @@
       cursor: pointer;
       transition: all 0.15s;
     }
-    .btn-danger:hover {
-      background: #ef4444;
-      color: #ffffff;
-      border-color: #ef4444;
+    .btn-start {
+      background: #dcfce7;
+      color: #166534;
+      border: 1px solid #bbf7d0;
     }
+    .btn-start:hover {
+      background: #16a34a;
+      color: #ffffff;
+      border-color: #16a34a;
+    }
+    .btn-stop {
+      background: #fef3c7;
+      color: #92400e;
+      border: 1px solid #fde68a;
+    }
+    .btn-stop:hover {
+      background: #d97706;
+      color: #ffffff;
+      border-color: #d97706;
+    }
+    .btn-del {
+      background: #fee2e2;
+      color: #991b1b;
+      border: 1px solid #fecaca;
+    }
+    .btn-del:hover {
+      background: #dc2626;
+      color: #ffffff;
+      border-color: #dc2626;
+    }
+
     .server-item {
       background: #f8fafc;
       border: 1px solid #e2e8f0;
@@ -154,6 +188,10 @@
     }
     .server-item:last-child {
       margin-bottom: 0;
+    }
+    .server-item.disabled {
+      opacity: 0.65;
+      background: #f1f5f9;
     }
     .server-item-head {
       display: flex;
@@ -165,12 +203,41 @@
       font-size: 14px;
       font-weight: 600;
       color: #0f172a;
+      display: flex;
+      align-items: center;
+      gap: 8px;
     }
     .server-item-url {
       font-size: 12px;
       color: #64748b;
-      margin-bottom: 10px;
+      margin-bottom: 8px;
       font-family: monospace;
+    }
+    .tool-toggle-bar {
+      font-size: 12px;
+      color: #475569;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 6px;
+    }
+    .tool-toggle-btn {
+      background: none;
+      border: none;
+      color: #2563eb;
+      font-size: 12px;
+      cursor: pointer;
+      padding: 0;
+      font-weight: 500;
+    }
+    .tool-toggle-btn:hover {
+      text-decoration: underline;
+    }
+    .tools-container {
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px dashed #cbd5e1;
+      display: none;
     }
     .tag {
       display: inline-block;
@@ -193,64 +260,22 @@
       color: #94a3b8;
       font-size: 14px;
     }
-
-    #auth-overlay {
-      position: fixed;
-      top: 0; left: 0; right: 0; bottom: 0;
-      background: rgba(15, 23, 42, 0.6);
-      backdrop-filter: blur(4px);
-      display: none;
-      align-items: center;
-      justify-content: center;
-      z-index: 999;
-      padding: 16px;
-    }
-    .auth-card {
-      background: #ffffff;
-      border-radius: 12px;
-      padding: 28px;
-      width: 100%;
-      max-width: 380px;
-      box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
-      text-align: center;
-    }
-    .auth-card h2 {
-      font-size: 18px;
-      font-weight: 700;
-      color: #0f172a;
-      margin-bottom: 8px;
-    }
-    .auth-card p {
-      font-size: 13px;
-      color: #64748b;
-      margin-bottom: 20px;
-    }
   </style>
 </head>
 <body>
-  <div id="auth-overlay">
-    <div class="auth-card">
-      <h2>控制台访问认证</h2>
-      <p>请输入后台管理密码以进入面板</p>
-      <input id="panel-pwd" type="password" placeholder="输入管理密码" style="margin-bottom: 14px;" onkeydown="if(event.key==='Enter')handleLogin()">
-      <button class="btn" style="width: 100%;" onclick="handleLogin()">验证并进入</button>
-      <div id="auth-msg" style="margin-top: 10px; font-size: 13px; color: #dc2626;"></div>
-    </div>
-  </div>
-
-  <div class="container" id="main-content">
+  <div class="container">
     <div class="header">
       <div>
         <h1>MCP 代理控制台</h1>
         <p>为 Chatbox 和 OpenAI 生态客户端提供全自动多 MCP 工具接入与持久化存储</p>
       </div>
-      <button id="logout-btn" class="btn-logout" style="display: none;" onclick="handleLogout()">退出管理</button>
+      <button class="btn-logout" onclick="handleLogout()">退出登录</button>
     </div>
 
     <div class="card">
       <div class="card-title">
         <span>客户端连接配置</span>
-        <span class="badge">Chatbox 专用</span>
+        <span class="badge badge-blue">Chatbox 专用</span>
       </div>
       <div class="group">
         <label>API 域名 (Base URL)</label>
@@ -277,7 +302,7 @@
         <input id="mcp-token" type="password" placeholder="如需认证请粘贴 Token（如 ghu_、ghp_、Bearer）">
       </div>
       <div style="display: flex; align-items: center; margin-top: 18px;">
-        <button id="btn-conn" class="btn" onclick="handleConnect()">添加并挂载此服务</button>
+        <button id="btn-conn" class="btn" onclick="handleConnect()">添加</button>
         <span id="conn-msg"></span>
       </div>
     </div>
@@ -295,78 +320,29 @@
   <script>
     document.getElementById("proxy-url").innerText = window.location.origin + "/v1";
 
-    function getAuthHeader() {
-      const pwd = localStorage.getItem("panelPassword") || "";
-      return pwd ? { "x-panel-password": pwd } : {};
-    }
-
-    async function checkAuth() {
-      try {
-        const res = await fetch("/api/panel/status");
-        const data = await res.json();
-        if (data.requiresPassword) {
-          document.getElementById("logout-btn").style.display = "block";
-          const savedPwd = localStorage.getItem("panelPassword");
-          if (!savedPwd) {
-            document.getElementById("auth-overlay").style.display = "flex";
-            return false;
-          }
-          const verifyRes = await fetch("/api/panel/verify", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ password: savedPwd })
-          });
-          if (!verifyRes.ok) {
-            localStorage.removeItem("panelPassword");
-            document.getElementById("auth-overlay").style.display = "flex";
-            return false;
-          }
-        }
-        document.getElementById("auth-overlay").style.display = "none";
-        return true;
-      } catch {
-        return true;
-      }
-    }
-
-    async function handleLogin() {
-      const pwd = document.getElementById("panel-pwd").value.trim();
-      const msg = document.getElementById("auth-msg");
-      if (!pwd) {
-        msg.innerText = "请输入管理密码";
-        return;
-      }
-      try {
-        const res = await fetch("/api/panel/verify", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ password: pwd })
-        });
-        if (!res.ok) {
-          msg.innerText = "密码错误，请重新输入";
-          return;
-        }
-        localStorage.setItem("panelPassword", pwd);
-        document.getElementById("auth-overlay").style.display = "none";
-        document.getElementById("panel-pwd").value = "";
-        msg.innerText = "";
-        loadServers();
-      } catch (e) {
-        msg.innerText = e.message;
-      }
-    }
-
-    function handleLogout() {
-      localStorage.removeItem("panelPassword");
+    async function handleLogout() {
+      await fetch("/api/panel/logout", { method: "POST" });
       location.reload();
+    }
+
+    function toggleTools(id) {
+      const el = document.getElementById("tools-" + id);
+      const btn = document.getElementById("toggle-btn-" + id);
+      if (!el || !btn) return;
+      if (el.style.display === "block") {
+        el.style.display = "none";
+        btn.innerText = "[展开查看]";
+      } else {
+        el.style.display = "block";
+        btn.innerText = "[点击收起]";
+      }
     }
 
     async function loadServers() {
       try {
-        const res = await fetch("/api/mcp/servers", { headers: getAuthHeader() });
+        const res = await fetch("/api/mcp/servers");
         if (res.status === 401) {
-          localStorage.removeItem("panelPassword");
-          document.getElementById("auth-overlay").style.display = "flex";
+          location.reload();
           return;
         }
         const data = await res.json();
@@ -377,15 +353,40 @@
         }
         let html = "";
         for (let s of data.servers) {
+          const isActive = s.status !== "disabled";
+          const statusBadge = isActive
+            ? '<span class="badge badge-green">运行中</span>'
+            : '<span class="badge badge-gray">已断开</span>';
+
+          const toggleActionBtn = isActive
+            ? `<button class="btn-action btn-stop" onclick="handleStop('${s.id}')">断开</button>`
+            : `<button class="btn-action btn-start" onclick="handleStart('${s.id}')">启动</button>`;
+
           let tags = s.tools.map(t => '<span class="tag">' + t.key + '</span>').join("");
-          html += '<div class="server-item">' +
-            '<div class="server-item-head">' +
-              '<span class="server-item-title">' + s.name + ' <span class="badge">' + s.toolCount + ' 个工具</span></span>' +
-              '<button class="btn-danger" onclick="handleDelete(\'' + s.id + '\')">断开连接</button>' +
-            '</div>' +
-            '<div class="server-item-url">' + s.url + '</div>' +
-            '<div>' + tags + '</div>' +
-          '</div>';
+
+          html += `
+            <div class="server-item ${isActive ? '' : 'disabled'}">
+              <div class="server-item-head">
+                <div class="server-item-title">
+                  <span>${s.name}</span>
+                  ${statusBadge}
+                  <span class="badge badge-blue">${s.toolCount} 个工具</span>
+                </div>
+                <div class="action-group">
+                  ${toggleActionBtn}
+                  <button class="btn-action btn-del" onclick="handleDelete('${s.id}')">删除</button>
+                </div>
+              </div>
+              <div class="server-item-url">${s.url}</div>
+              <div class="tool-toggle-bar">
+                <span>工具清单 (${s.toolCount})</span>
+                <button id="toggle-btn-${s.id}" class="tool-toggle-btn" onclick="toggleTools('${s.id}')">[展开查看]</button>
+              </div>
+              <div id="tools-${s.id}" class="tools-container">
+                ${tags}
+              </div>
+            </div>
+          `;
         }
         el.innerHTML = html;
       } catch (e) {
@@ -411,10 +412,7 @@
       try {
         const res = await fetch("/api/mcp/connect", {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            ...getAuthHeader()
-          },
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ name, url, token })
         });
         const data = await res.json();
@@ -429,19 +427,23 @@
       }
     }
 
-    async function handleDelete(id) {
-      if (!confirm("确认断开该 MCP 服务？")) return;
-      await fetch('/api/mcp/servers/' + id, {
-        method: "DELETE",
-        headers: getAuthHeader()
-      });
+    async function handleStart(id) {
+      await fetch('/api/mcp/servers/' + id + '/start', { method: "POST" });
       loadServers();
     }
 
-    (async () => {
-      const ok = await checkAuth();
-      if (ok) loadServers();
-    })();
+    async function handleStop(id) {
+      await fetch('/api/mcp/servers/' + id + '/stop', { method: "POST" });
+      loadServers();
+    }
+
+    async function handleDelete(id) {
+      if (!confirm("确认彻底删除该 MCP 服务？")) return;
+      await fetch('/api/mcp/servers/' + id, { method: "DELETE" });
+      loadServers();
+    }
+
+    loadServers();
   </script>
 </body>
 </html>
