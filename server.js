@@ -13,6 +13,8 @@ const UPSTREAM_API_KEY = requiredEnv("UPSTREAM_API_KEY");
 const PROXY_API_KEY = (process.env.PROXY_API_KEY || "").trim();
 const PANEL_PASSWORD = (process.env.PANEL_PASSWORD || "").trim();
 
+const DATA_FILE = path.join(__dirname, "mcp-config.json");
+
 const mcpServers = new Map();
 const mcpToolRegistry = new Map();
 
@@ -83,332 +85,96 @@ function readRequestBody(request) {
   });
 }
 
-async function githubApi(token, endpoint, options = {}) {
-  const res = await fetch(`https://api.github.com${endpoint}`, {
-    method: options.method || "GET",
-    headers: {
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-      "User-Agent": "mcp-agent-proxy",
-      Authorization: `Bearer ${token}`,
-      ...(options.body ? { "Content-Type": "application/json" } : {})
-    },
-    body: options.body ? JSON.stringify(options.body) : undefined,
-    signal: AbortSignal.timeout(30000)
-  });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`GitHub 接口报错 (${res.status}): ${err.slice(0, 300)}`);
-  }
-  return res.json();
+function saveConfigToDisk() {
+  try {
+    const data = Array.from(mcpServers.values()).map((s) => ({
+      id: s.id,
+      name: s.name,
+      url: s.url,
+      token: s.rawToken,
+      postEndpoint: s.postEndpoint,
+      headers: s.headers,
+      tools: s.tools
+    }));
+    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf8");
+  } catch {}
 }
 
-async function cloudflareApi(token, endpoint, options = {}) {
-  const res = await fetch(`https://api.cloudflare.com/client/v4${endpoint}`, {
-    method: options.method || "GET",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "User-Agent": "mcp-agent-proxy",
-      ...(options.contentType ? { "Content-Type": options.contentType } : options.body ? { "Content-Type": "application/json" } : {})
-    },
-    body: options.rawBody ? options.rawBody : options.body ? JSON.stringify(options.body) : undefined,
-    signal: AbortSignal.timeout(30000)
-  });
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    const msg = data.errors?.map((e) => e.message).join("; ") || res.statusText;
-    throw new Error(`Cloudflare 接口报错: ${msg}`);
-  }
-  return data.result;
-}
+function loadConfigFromDisk() {
+  if (!fs.existsSync(DATA_FILE)) return;
+  try {
+    const raw = fs.readFileSync(DATA_FILE, "utf8");
+    const list = JSON.parse(raw);
+    for (const item of list) {
+      mcpServers.set(item.id, {
+        id: item.id,
+        name: item.name,
+        url: item.url,
+        rawToken: item.token,
+        postEndpoint: item.postEndpoint,
+        headers: item.headers,
+        token: item.token ? `${item.token.slice(0, 4)}...${item.token.slice(-4)}` : "",
+        connectedAt: new Date().toISOString(),
+        toolCount: item.tools.length,
+        tools: item.tools
+      });
 
-function registerBuiltinGithub(token) {
-  const serverId = crypto.randomUUID();
-  const serverName = "GitHub";
-
-  const toolsDef = [
-    {
-      name: "github_list_repositories",
-      description: "列出当前用户的 GitHub 代码仓库列表",
-      inputSchema: { type: "object", properties: {} },
-      handler: async () => {
-        const repos = await githubApi(token, "/user/repos?per_page=100&sort=updated");
-        return repos.map((r) => ({ name: r.full_name, private: r.private, default_branch: r.default_branch, url: r.html_url }));
-      }
-    },
-    {
-      name: "github_get_file_contents",
-      description: "获取指定仓库中指定文件或目录的内容",
-      inputSchema: {
-        type: "object",
-        properties: {
-          owner: { type: "string", description: "仓库所有者用户名" },
-          repo: { type: "string", description: "仓库名称" },
-          path: { type: "string", description: "文件路径（根目录传空字符串）" }
-        },
-        required: ["owner", "repo", "path"]
-      },
-      handler: async (args) => {
-        const cleanPath = (args.path || "").replace(/^\/+/, "");
-        const res = await githubApi(token, `/repos/${args.owner}/${args.repo}/contents/${cleanPath}`);
-        if (Array.isArray(res)) {
-          return res.map((item) => ({ name: item.name, path: item.path, type: item.type, size: item.size }));
-        }
-        let content = "";
-        if (res.content) content = Buffer.from(res.content, res.encoding || "base64").toString("utf8");
-        return { path: res.path, sha: res.sha, size: res.size, content: content.slice(0, 100000) };
-      }
-    },
-    {
-      name: "github_create_or_update_file",
-      description: "在指定 GitHub 仓库中创建新文件或覆盖更新已有文件",
-      inputSchema: {
-        type: "object",
-        properties: {
-          owner: { type: "string", description: "仓库所有者用户名" },
-          repo: { type: "string", description: "仓库名称" },
-          path: { type: "string", description: "文件路径" },
-          content: { type: "string", description: "完整的新文件文本内容" },
-          message: { type: "string", description: "提交信息 (commit message)" },
-          sha: { type: "string", description: "可选。更新已有文件时提供的原文件 sha" }
-        },
-        required: ["owner", "repo", "path", "content", "message"]
-      },
-      handler: async (args) => {
-        const cleanPath = (args.path || "").replace(/^\/+/, "");
-        let fileSha = args.sha;
-        if (!fileSha) {
-          try {
-            const cur = await githubApi(token, `/repos/${args.owner}/${args.repo}/contents/${cleanPath}`);
-            fileSha = cur.sha;
-          } catch {}
-        }
-        const body = {
-          message: args.message,
-          content: Buffer.from(args.content || "", "utf8").toString("base64")
-        };
-        if (fileSha) body.sha = fileSha;
-        const res = await githubApi(token, `/repos/${args.owner}/${args.repo}/contents/${cleanPath}`, { method: "PUT", body });
-        return { success: true, path: cleanPath, commit_sha: res.commit?.sha };
-      }
-    },
-    {
-      name: "github_create_repository",
-      description: "在当前 GitHub 账号下创建一个新的代码仓库",
-      inputSchema: {
-        type: "object",
-        properties: {
-          name: { type: "string", description: "新仓库名称" },
-          description: { type: "string", description: "仓库描述" },
-          private: { type: "boolean", description: "是否为私有仓库，默认为 false" }
-        },
-        required: ["name"]
-      },
-      handler: async (args) => {
-        const res = await githubApi(token, "/user/repos", {
-          method: "POST",
-          body: { name: args.name, description: args.description || "", private: Boolean(args.private), auto_init: true }
+      for (const t of item.tools) {
+        mcpToolRegistry.set(t.key, {
+          serverId: item.id,
+          serverName: item.name,
+          rawName: t.rawName,
+          postEndpoint: item.postEndpoint,
+          headers: item.headers
         });
-        return { success: true, name: res.full_name, html_url: res.html_url };
       }
     }
-  ];
-
-  const registeredTools = [];
-  for (const t of toolsDef) {
-    const toolKey = `mcp_github_${t.name.replace(/^github_/, "")}`;
-    const openAiTool = {
-      type: "function",
-      function: {
-        name: toolKey,
-        description: `[GitHub 官方驱动] ${t.description}`,
-        parameters: t.inputSchema
-      }
-    };
-    registeredTools.push({
-      key: toolKey,
-      rawName: t.name,
-      description: t.description,
-      inputSchema: t.inputSchema,
-      openAiTool
-    });
-
-    mcpToolRegistry.set(toolKey, {
-      serverId,
-      serverName,
-      type: "builtin",
-      handler: t.handler
-    });
-  }
-
-  const serverInfo = {
-    id: serverId,
-    name: serverName,
-    type: "GitHub 官方直连",
-    connectedAt: new Date().toISOString(),
-    toolCount: registeredTools.length,
-    tools: registeredTools
-  };
-
-  mcpServers.set(serverId, serverInfo);
-  return serverInfo;
+  } catch {}
 }
 
-function registerBuiltinCloudflare(token, accountId) {
+async function connectToMcpServer({ name, url, token }) {
   const serverId = crypto.randomUUID();
-  const serverName = "Cloudflare";
-
-  const toolsDef = [
-    {
-      name: "cf_list_workers",
-      description: "列出当前 Cloudflare 账号下的所有 Worker 脚本项目",
-      inputSchema: { type: "object", properties: {} },
-      handler: async () => {
-        const list = await cloudflareApi(token, `/accounts/${accountId}/workers/scripts`);
-        return (list || []).map((w) => ({ id: w.id, created_on: w.created_on, modified_on: w.modified_on }));
-      }
-    },
-    {
-      name: "cf_deploy_worker",
-      description: "在 Cloudflare 上新建或更新一个 Worker 项目并部署其 JavaScript 代码",
-      inputSchema: {
-        type: "object",
-        properties: {
-          name: { type: "string", description: "Worker 项目名称" },
-          script: { type: "string", description: "Worker 的完整 JavaScript 脚本代码" }
-        },
-        required: ["name", "script"]
-      },
-      handler: async (args) => {
-        const res = await cloudflareApi(token, `/accounts/${accountId}/workers/scripts/${encodeURIComponent(args.name)}`, {
-          method: "PUT",
-          contentType: "application/javascript",
-          rawBody: args.script
-        });
-        return { success: true, id: res?.id || args.name, modified_on: res?.modified_on };
-      }
-    },
-    {
-      name: "cf_list_pages_projects",
-      description: "列出当前 Cloudflare 账号下的所有 Pages 项目",
-      inputSchema: { type: "object", properties: {} },
-      handler: async () => {
-        const list = await cloudflareApi(token, `/accounts/${accountId}/pages/projects`);
-        return (list || []).map((p) => ({ name: p.name, subdomain: p.subdomain, production_branch: p.production_branch }));
-      }
-    },
-    {
-      name: "cf_create_pages_project",
-      description: "在 Cloudflare 上创建一个新的 Pages 项目",
-      inputSchema: {
-        type: "object",
-        properties: {
-          name: { type: "string", description: "Pages 项目名称" },
-          production_branch: { type: "string", description: "生产分支名称，默认为 main" }
-        },
-        required: ["name"]
-      },
-      handler: async (args) => {
-        const res = await cloudflareApi(token, `/accounts/${accountId}/pages/projects`, {
-          method: "POST",
-          body: { name: args.name, production_branch: args.production_branch || "main" }
-        });
-        return { success: true, name: res?.name || args.name, subdomain: res?.subdomain };
-      }
-    },
-    {
-      name: "cf_create_dns_record",
-      description: "在 Cloudflare 上为指定域名添加一条 DNS 解析记录",
-      inputSchema: {
-        type: "object",
-        properties: {
-          zone_id: { type: "string", description: "Cloudflare Zone ID" },
-          type: { type: "string", description: "记录类型，如 A、CNAME、TXT" },
-          name: { type: "string", description: "子域名或主机名" },
-          content: { type: "string", description: "IP 或目标地址" },
-          proxied: { type: "boolean", description: "是否开启代理（小黄云）" }
-        },
-        required: ["zone_id", "type", "name", "content"]
-      },
-      handler: async (args) => {
-        const res = await cloudflareApi(token, `/zones/${encodeURIComponent(args.zone_id)}/dns_records`, {
-          method: "POST",
-          body: { type: args.type.toUpperCase(), name: args.name, content: args.content, proxied: Boolean(args.proxied), ttl: 1 }
-        });
-        return { success: true, id: res?.id, name: res?.name, type: res?.type, content: res?.content };
-      }
-    }
-  ];
-
-  const registeredTools = [];
-  for (const t of toolsDef) {
-    const toolKey = `mcp_cf_${t.name.replace(/^cf_/, "")}`;
-    const openAiTool = {
-      type: "function",
-      function: {
-        name: toolKey,
-        description: `[Cloudflare 官方驱动] ${t.description}`,
-        parameters: t.inputSchema
-      }
-    };
-    registeredTools.push({
-      key: toolKey,
-      rawName: t.name,
-      description: t.description,
-      inputSchema: t.inputSchema,
-      openAiTool
-    });
-
-    mcpToolRegistry.set(toolKey, {
-      serverId,
-      serverName,
-      type: "builtin",
-      handler: t.handler
-    });
-  }
-
-  const serverInfo = {
-    id: serverId,
-    name: serverName,
-    type: "Cloudflare 官方直连",
-    connectedAt: new Date().toISOString(),
-    toolCount: registeredTools.length,
-    tools: registeredTools
-  };
-
-  mcpServers.set(serverId, serverInfo);
-  return serverInfo;
-}
-
-async function connectToMcpUrl({ name, url, token }) {
-  const serverId = crypto.randomUUID();
-  const cleanUrl = url.trim();
+  const cleanUrl = url.trim().replace(/\/+$/, "");
   const headers = {
     Accept: "application/json, text/event-stream",
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
+    "User-Agent": "GitHubCopilotChat/0.24.1",
+    "Editor-Version": "vscode/1.97.0"
   };
-  if (token) headers["Authorization"] = `Bearer ${token.trim()}`;
+
+  if (token) {
+    headers["Authorization"] = `Bearer ${token.trim()}`;
+  }
 
   let postEndpoint = cleanUrl;
+
   try {
-    const testResponse = await fetch(cleanUrl, { method: "GET", headers, signal: AbortSignal.timeout(10000) });
+    const testResponse = await fetch(cleanUrl, {
+      method: "GET",
+      headers,
+      signal: AbortSignal.timeout(10000)
+    });
+
     const contentType = testResponse.headers.get("content-type") || "";
     if (contentType.includes("text/event-stream")) {
       const reader = testResponse.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
       const startTime = Date.now();
+
       while (Date.now() - startTime < 8000) {
         const { done, value } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split("\n");
         buffer = lines.pop() || "";
+
         for (const line of lines) {
           if (line.startsWith("event: endpoint")) {
             const nextLine = lines[lines.indexOf(line) + 1] || "";
             if (nextLine.startsWith("data:")) {
-              postEndpoint = new URL(nextLine.replace(/^data:\s*/, "").trim(), cleanUrl).toString();
+              const rel = nextLine.replace(/^data:\s*/, "").trim();
+              postEndpoint = new URL(rel, cleanUrl).toString();
               break;
             }
           }
@@ -418,20 +184,51 @@ async function connectToMcpUrl({ name, url, token }) {
     }
   } catch {}
 
+  const initPayload = {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "mcp-agent-proxy", version: "1.0.0" }
+    }
+  };
+
+  try {
+    await fetch(postEndpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(initPayload),
+      signal: AbortSignal.timeout(10000)
+    });
+  } catch {}
+
+  const listPayload = {
+    jsonrpc: "2.0",
+    id: 2,
+    method: "tools/list",
+    params: {}
+  };
+
   const listRes = await fetch(postEndpoint, {
     method: "POST",
     headers,
-    body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
+    body: JSON.stringify(listPayload),
     signal: AbortSignal.timeout(15000)
   });
 
   if (!listRes.ok) {
     const err = await listRes.text();
-    throw new Error(`MCP 服务读取工具失败 (${listRes.status}): ${err.slice(0, 300)}`);
+    throw new Error(`获取工具列表失败 (${listRes.status}): ${err.slice(0, 400)}`);
   }
 
   const listData = await listRes.json();
   const rawTools = listData.result?.tools || [];
+
+  if (rawTools.length === 0) {
+    throw new Error("该 MCP 接口未返回任何可用工具，请检查 Token 权限是否有效。");
+  }
 
   const registeredTools = [];
   for (const t of rawTools) {
@@ -457,7 +254,6 @@ async function connectToMcpUrl({ name, url, token }) {
       serverId,
       serverName: name,
       rawName: t.name,
-      type: "http",
       postEndpoint,
       headers
     });
@@ -466,13 +262,18 @@ async function connectToMcpUrl({ name, url, token }) {
   const serverInfo = {
     id: serverId,
     name,
-    type: `远程 HTTP (${cleanUrl})`,
+    url: cleanUrl,
+    rawToken: token,
+    postEndpoint,
+    headers,
+    token: token ? `${token.slice(0, 4)}...${token.slice(-4)}` : "",
     connectedAt: new Date().toISOString(),
     toolCount: registeredTools.length,
     tools: registeredTools
   };
 
   mcpServers.set(serverId, serverInfo);
+  saveConfigToDisk();
   return serverInfo;
 }
 
@@ -483,6 +284,7 @@ function removeMcpServer(serverId) {
     mcpToolRegistry.delete(t.key);
   }
   mcpServers.delete(serverId);
+  saveConfigToDisk();
   return true;
 }
 
@@ -490,37 +292,43 @@ async function callMcpTool(toolKey, args) {
   const info = mcpToolRegistry.get(toolKey);
   if (!info) throw new Error(`未找到 MCP 工具：${toolKey}`);
 
-  if (info.type === "builtin") {
-    return info.handler(args);
-  }
+  const callPayload = {
+    jsonrpc: "2.0",
+    id: Date.now(),
+    method: "tools/call",
+    params: {
+      name: info.rawName,
+      arguments: args
+    }
+  };
 
   const res = await fetch(info.postEndpoint, {
     method: "POST",
     headers: info.headers,
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: Date.now(),
-      method: "tools/call",
-      params: { name: info.rawName, arguments: args }
-    }),
+    body: JSON.stringify(callPayload),
     signal: AbortSignal.timeout(60000)
   });
 
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`MCP 服务响应错误 (${res.status}): ${errText.slice(0, 500)}`);
+    throw new Error(`MCP 服务执行报错 (${res.status}): ${errText.slice(0, 500)}`);
   }
 
   const data = await res.json();
-  if (data.error) throw new Error(`MCP 调用报错：${data.error.message || JSON.stringify(data.error)}`);
+  if (data.error) {
+    throw new Error(`MCP 报错：${data.error.message || JSON.stringify(data.error)}`);
+  }
+
   return data.result ?? data;
 }
 
 function getAllTools() {
   const tools = [];
-  for (const s of mcpServers.values()) {
-    for (const t of s.tools) {
-      tools.push(t.openAiTool);
+  for (const info of mcpToolRegistry.values()) {
+    const s = mcpServers.get(info.serverId);
+    if (s) {
+      const match = s.tools.find((t) => t.key === info.rawName || t.rawName === info.rawName);
+      if (match) tools.push(match.openAiTool);
     }
   }
   return tools;
@@ -528,7 +336,7 @@ function getAllTools() {
 
 function buildToolPrompt() {
   const mcpList = Array.from(mcpServers.values());
-  if (mcpList.length === 0) return "当前未挂载任何外部 MCP 工具服务。";
+  if (mcpList.length === 0) return "当前未挂载任何外部 MCP 工具。";
 
   const serverDetails = mcpList.map((s) => {
     const toolsStr = s.tools.map((t) => `\`${t.key}\``).join(", ");
@@ -798,6 +606,8 @@ async function runAgent(requestBody, clientResponse) {
   throw new Error("工具调用轮数达到上限。");
 }
 
+loadConfigFromDisk();
+
 const server = http.createServer(async (request, response) => {
   try {
     if (request.method === "OPTIONS") {
@@ -838,7 +648,7 @@ const server = http.createServer(async (request, response) => {
           servers: Array.from(mcpServers.values()).map((s) => ({
             id: s.id,
             name: s.name,
-            type: s.type,
+            url: s.url,
             toolCount: s.toolCount,
             tools: s.tools
           })),
@@ -847,32 +657,12 @@ const server = http.createServer(async (request, response) => {
         return;
       }
 
-      if (request.method === "POST" && request.url === "/api/mcp/connect-builtin") {
+      if (request.method === "POST" && request.url === "/api/mcp/connect") {
         const body = await readRequestBody(request);
-        let serverInfo;
-        if (body.type === "github") {
-          serverInfo = registerBuiltinGithub(body.token);
-        } else if (body.type === "cloudflare") {
-          serverInfo = registerBuiltinCloudflare(body.token, body.accountId);
-        } else {
-          throw new Error("不支持的内置服务。");
-        }
+        const serverInfo = await connectToMcpServer(body);
         sendJson(response, 200, {
           id: serverInfo.id,
           name: serverInfo.name,
-          type: serverInfo.type,
-          toolCount: serverInfo.toolCount
-        });
-        return;
-      }
-
-      if (request.method === "POST" && request.url === "/api/mcp/connect-url") {
-        const body = await readRequestBody(request);
-        const serverInfo = await connectToMcpUrl(body);
-        sendJson(response, 200, {
-          id: serverInfo.id,
-          name: serverInfo.name,
-          type: serverInfo.type,
           toolCount: serverInfo.toolCount
         });
         return;
