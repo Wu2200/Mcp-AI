@@ -22,25 +22,6 @@ const SESSION_SECRET = PANEL_PASSWORD
   ? crypto.createHash("sha256").update(`mcp-proxy-session:${PANEL_PASSWORD}`).digest("hex")
   : crypto.randomBytes(32).toString("hex");
 
-function getToolAction(toolName) {
-  const name = (toolName || "").toLowerCase();
-  if (name.includes("delete") || name.includes("remove")) return "删除";
-  if (name.includes("update") || name.includes("merge") || name.includes("resolve") || name.includes("patch") || name.includes("edit")) return "更新";
-  if (name.includes("create") || name.includes("add") || name.includes("push") || name.includes("fork")) return "创建";
-  if (name.includes("get") || name.includes("list") || name.includes("search") || name.includes("read") || name.includes("docs")) return "查询";
-  if (name.includes("execute") || name.includes("run")) return "执行";
-  return "处理";
-}
-
-function getServiceDisplayName(toolInfo, toolName) {
-  if (toolName === "web_search") return "网络搜索";
-  if (toolInfo?.serverName) return toolInfo.serverName;
-  const name = (toolName || "").toLowerCase();
-  if (name.includes("github")) return "GitHub";
-  if (name.includes("cloudflare")) return "Cloudflare";
-  return "MCP";
-}
-
 function generateSessionToken() {
   const payload = `auth:${PANEL_PASSWORD}:${Date.now()}`;
   const sig = crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("hex");
@@ -274,35 +255,6 @@ function readRequestBody(request) {
   });
 }
 
-async function executeWebSearch(query) {
-  try {
-    const res = await fetch("https://html.duckduckgo.com/html/", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-      },
-      body: `q=${encodeURIComponent(query)}`,
-      signal: AbortSignal.timeout(10000)
-    });
-    if (!res.ok) throw new Error(`搜索引擎状态异常 (${res.status})`);
-    const html = await res.text();
-    const snippets = [];
-    const re = /<a class="result__snippet[^>]*>(.*?)<\/a>/g;
-    let match;
-    while ((match = re.exec(html)) !== null && snippets.length < 5) {
-      const clean = match[1].replace(/<[^>]+>/g, "").trim();
-      if (clean) snippets.push(clean);
-    }
-    if (snippets.length === 0) {
-      return `搜索 "${query}" 未获取到最新结果。`;
-    }
-    return `关于 "${query}" 的最新网络搜索结果：\n\n` + snippets.map((s, idx) => `[${idx + 1}] ${s}`).join("\n\n");
-  } catch (err) {
-    return `网络搜索接口响应：${err instanceof Error ? err.message : "请求失败"}`;
-  }
-}
-
 async function parseMcpResponse(res) {
   const contentType = res.headers.get("Content-Type") || "";
   if (contentType.includes("text/event-stream")) {
@@ -434,10 +386,6 @@ async function connectToMcpServer({ name, url, token }) {
 }
 
 async function callMcpTool(toolKey, args) {
-  if (toolKey === "web_search") {
-    return await executeWebSearch(args?.query || "");
-  }
-
   let info = mcpToolRegistry.get(toolKey);
   if (!info) {
     for (const [k, v] of mcpToolRegistry.entries()) {
@@ -480,51 +428,14 @@ async function callMcpTool(toolKey, args) {
   return typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
 }
 
-const BUILTIN_SEARCH_TOOL = {
-  type: "function",
-  function: {
-    name: "web_search",
-    description: "联网搜索引擎。仅在用户明确需要获取实时最新新闻、天气或特定外部公开资讯时调用。常规常识问答和当前时间绝不调用。",
-    parameters: {
-      type: "object",
-      properties: {
-        query: { type: "string", description: "搜索关键词" }
-      },
-      required: ["query"]
-    }
-  }
-};
-
 function getAllTools() {
-  const tools = [BUILTIN_SEARCH_TOOL];
+  const tools = [];
   for (const s of mcpServers.values()) {
     if (s.status === "active") {
       for (const t of s.tools) tools.push(t.openAiTool);
     }
   }
   return tools;
-}
-
-function buildToolPrompt() {
-  const now = new Date();
-  const bjTime = now.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
-  const utcTime = now.toISOString().replace("T", " ").replace(/\..+/, " UTC");
-
-  return [
-    `# 运行环境与时间信息`,
-    `- 当前北京时间 (UTC+8): ${bjTime}`,
-    `- 当前全球标准时间 (UTC): ${utcTime}`,
-    `- 用户询问当前时间、日期或今天星期几时，直接使用上述时间回答，严禁调用任何工具！`,
-    ``,
-    `# 工具调用规范`,
-    `1. 【精准按需调用，严禁盲目乱调】：只有当用户指令明确针对某个服务时才调用对应工具。`,
-    `   - 用户询问 GitHub 仓库、代码、分支、提交时：只能调用 GitHub 相关工具。`,
-    `   - 用户询问 Cloudflare、Workers、DNS、域名时：只能调用 Cloudflare 相关工具。`,
-    `   - 用户明确需要查询最新互联网新闻、外部网页时：只能调用 web_search 工具。`,
-    `   - 用户进行普通聊天、问答、数学计算、常识解释或询问当前时间时：直接给出文字回答，绝对不得调用任何工具！`,
-    `2. 【严禁全量轮询】：严禁在一次请求中无脑将无关工具全部执行一遍。`,
-    `3. 【真实性要求】：严禁口头伪造 Commit SHA 或虚构操作结果。涉及修改/提交必须真实调用对应接口。`
-  ].join("\n");
 }
 
 function upstreamChatCompletionsUrl() {
@@ -598,30 +509,14 @@ async function runAgent(requestBody, clientResponse) {
   }
 
   const isStream = requestBody.stream === true;
-  const rawMessages = requestBody.messages;
-  const toolPrompt = buildToolPrompt();
+  const messages = [...requestBody.messages];
 
+  // 纯净协议：只合并客户端传入的 function 工具与用户在面板真实注册的 MCP 工具
   const clientTools = Array.isArray(requestBody.tools)
     ? requestBody.tools.filter((t) => t && t.type === "function")
     : [];
   const mcpTools = getAllTools();
   const tools = [...clientTools, ...mcpTools];
-
-  const existingSystemIndex = rawMessages.findIndex((m) => m.role === "system");
-  let messages;
-  if (existingSystemIndex >= 0) {
-    messages = rawMessages.map((m, idx) => {
-      if (idx === existingSystemIndex) {
-        return {
-          role: "system",
-          content: `${toolPrompt}\n\n${m.content || ""}`
-        };
-      }
-      return m;
-    });
-  } else {
-    messages = [{ role: "system", content: toolPrompt }, ...rawMessages];
-  }
 
   if (isStream) {
     setCorsHeaders(clientResponse);
@@ -731,9 +626,8 @@ async function runAgent(requestBody, clientResponse) {
       }
     }
 
-    const availableCalls = accumulatedToolCalls.filter((tc) => {
+    const mcpCalls = accumulatedToolCalls.filter((tc) => {
       if (!tc || !tc.name) return false;
-      if (tc.name === "web_search") return true;
       if (mcpToolRegistry.has(tc.name)) return true;
       for (const [k, v] of mcpToolRegistry.entries()) {
         if (k.endsWith(tc.name) || tc.name.endsWith(v.rawName)) return true;
@@ -741,7 +635,8 @@ async function runAgent(requestBody, clientResponse) {
       return false;
     });
 
-    if (availableCalls.length === 0) {
+    // 如果模型没有调用任何 MCP 工具（例如正常回答问题、普通闲聊），直接输出模型生成的原版回答并结束
+    if (mcpCalls.length === 0) {
       if (isStream) {
         for (const line of streamedDeltas) {
           clientResponse.write(`${line}\n\n`);
@@ -767,19 +662,20 @@ async function runAgent(requestBody, clientResponse) {
       return;
     }
 
+    // 只有在模型自主决定需要调用工具时，才进行标准化 ReAct 交互
     messages.push({
       role: "assistant",
       content: assistantContent || null,
-      tool_calls: availableCalls.map((tc) => ({
+      tool_calls: mcpCalls.map((tc) => ({
         id: tc.id || `call_${crypto.randomUUID()}`,
         type: "function",
         function: { name: tc.name, arguments: tc.arguments }
       }))
     });
 
-    for (const tc of availableCalls) {
-      let toolInfo = tc.name === "web_search" ? null : mcpToolRegistry.get(tc.name);
-      if (!toolInfo && tc.name !== "web_search") {
+    for (const tc of mcpCalls) {
+      let toolInfo = mcpToolRegistry.get(tc.name);
+      if (!toolInfo) {
         for (const [k, v] of mcpToolRegistry.entries()) {
           if (k.endsWith(tc.name) || tc.name.endsWith(v.rawName)) {
             toolInfo = v;
@@ -788,36 +684,33 @@ async function runAgent(requestBody, clientResponse) {
         }
       }
 
-      const serverDisplayName = getServiceDisplayName(toolInfo, tc.name);
-      const actionName = tc.name === "web_search" ? "实时搜索" : getToolAction(toolInfo?.rawName || tc.name);
+      const displayName = toolInfo?.serverName || "MCP";
+      const rawAction = toolInfo?.rawName || tc.name;
       const args = toolArguments({ function: { arguments: tc.arguments } });
 
       if (isStream) {
         sendReasoningChunk(
           clientResponse,
-          `\n> 正在调用 ${serverDisplayName} ${actionName}接口\n`,
+          `\n> 正在调用 ${displayName} (${rawAction})...\n`,
           requestBody.model
         );
       }
 
       let result;
-      let isError = false;
       if (args === null) {
-        result = JSON.stringify({ error: "工具参数格式错误" });
-        isError = true;
+        result = JSON.stringify({ error: "Invalid tool arguments" });
       } else {
         try {
           result = await callMcpTool(tc.name, args);
         } catch (err) {
-          isError = true;
-          result = JSON.stringify({ error: err instanceof Error ? err.message : "执行工具失败" });
+          result = JSON.stringify({ error: err instanceof Error ? err.message : "Tool call failed" });
         }
       }
 
       if (isStream) {
         sendReasoningChunk(
           clientResponse,
-          `> ${serverDisplayName} ${actionName}${isError ? "失败" : "成功"}\n\n`,
+          `> ${displayName} (${rawAction}) 调用完成\n\n`,
           requestBody.model
         );
       }
@@ -1101,7 +994,11 @@ const server = http.createServer(async (request, response) => {
       }
 
       const body = await readRequestBody(request);
-      await runAgent(body, response);
+      if (mcpToolRegistry.size > 0) {
+        await runAgent(body, response);
+      } else {
+        await passThrough(body, response);
+      }
       return;
     }
 
