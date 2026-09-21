@@ -92,7 +92,18 @@ async function initDatabase() {
       ssl: { rejectUnauthorized: false }
     });
     await pgPool.query(`
-      CREATE TABLE IF NOT EXISTS mcp_servers (\n        id TEXT PRIMARY KEY,\n        name TEXT NOT NULL,\n        url TEXT NOT NULL,\n        raw_token TEXT,\n        status TEXT DEFAULT 'active',\n        post_endpoint TEXT,\n        headers JSONB,\n        tool_count INT,\n        tools JSONB,\n        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n      );
+      CREATE TABLE IF NOT EXISTS mcp_servers (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        url TEXT NOT NULL,
+        raw_token TEXT,
+        status TEXT DEFAULT 'active',
+        post_endpoint TEXT,
+        headers JSONB,
+        tool_count INT,
+        tools JSONB,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
     `);
     try {
       await pgPool.query("ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active';");
@@ -106,7 +117,18 @@ async function saveServerToStorage(serverItem) {
   if (pgPool) {
     try {
       await pgPool.query(
-        `INSERT INTO mcp_servers (id, name, url, raw_token, status, post_endpoint, headers, tool_count, tools, updated_at)\n         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)\n         ON CONFLICT (id) DO UPDATE SET\n           name = EXCLUDED.name,\n           url = EXCLUDED.url,\n           raw_token = EXCLUDED.raw_token,\n           status = EXCLUDED.status,\n           post_endpoint = EXCLUDED.post_endpoint,\n           headers = EXCLUDED.headers,\n           tool_count = EXCLUDED.tool_count,\n           tools = EXCLUDED.tools,\n           updated_at = CURRENT_TIMESTAMP`,
+        `INSERT INTO mcp_servers (id, name, url, raw_token, status, post_endpoint, headers, tool_count, tools, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)
+         ON CONFLICT (id) DO UPDATE SET
+           name = EXCLUDED.name,
+           url = EXCLUDED.url,
+           raw_token = EXCLUDED.raw_token,
+           status = EXCLUDED.status,
+           post_endpoint = EXCLUDED.post_endpoint,
+           headers = EXCLUDED.headers,
+           tool_count = EXCLUDED.tool_count,
+           tools = EXCLUDED.tools,
+           updated_at = CURRENT_TIMESTAMP`,
         [
           serverItem.id,
           serverItem.name,
@@ -350,7 +372,8 @@ async function connectToMcpServer({ name, url, token }) {
 
   if (!listRes.ok) {
     const err = await listRes.text();
-    throw new Error(`MCP 响应错误 (${listRes.status}): ${err.slice(0, 300)}`);\n  }
+    throw new Error(`MCP 响应错误 (${listRes.status}): ${err.slice(0, 300)}`);
+  }
 
   const listData = await parseMcpResponse(listRes);
   if (listData.error) {
@@ -379,11 +402,26 @@ async function connectToMcpServer({ name, url, token }) {
       }
     });
 
-    mcpToolRegistry.set(toolKey, {\n      serverId,\n      serverName: name,\n      rawName: t.name,\n      postEndpoint: cleanUrl,\n      headers\n    });
+    mcpToolRegistry.set(toolKey, {
+      serverId,
+      serverName: name,
+      rawName: t.name,
+      postEndpoint: cleanUrl,
+      headers
+    });
   }
 
   const serverInfo = {
-    id: serverId,\n    name,\n    url: cleanUrl,\n    rawToken: token,\n    status: "active",\n    postEndpoint: cleanUrl,\n    headers,\n    toolCount: registeredTools.length,\n    tools: registeredTools\n  };
+    id: serverId,
+    name,
+    url: cleanUrl,
+    rawToken: token,
+    status: "active",
+    postEndpoint: cleanUrl,
+    headers,
+    toolCount: registeredTools.length,
+    tools: registeredTools
+  };
 
   mcpServers.set(serverId, serverInfo);
   await saveServerToStorage(serverInfo);
