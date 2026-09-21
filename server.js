@@ -15,8 +15,11 @@ const PANEL_PASSWORD = (process.env.PANEL_PASSWORD || "").trim();
 const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
 
 const DATA_FILE = path.join(__dirname, "mcp-config.json");
+const SETTINGS_FILE = path.join(__dirname, "mcp-settings.json");
+
 const mcpServers = new Map();
 const mcpToolRegistry = new Map();
+let excludedModels = new Set();
 
 const SESSION_SECRET = PANEL_PASSWORD
   ? crypto.createHash("sha256").update(`mcp-proxy-session:${PANEL_PASSWORD}`).digest("hex")
@@ -79,9 +82,57 @@ async function initDatabase() {
         tools JSONB,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
+      CREATE TABLE IF NOT EXISTS mcp_settings (
+        key TEXT PRIMARY KEY,
+        value JSONB,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
     `);
   } catch {
     pgPool = null;
+  }
+}
+
+async function saveExcludedModelsToStorage(modelsArray) {
+  excludedModels = new Set(modelsArray);
+  if (pgPool) {
+    try {
+      await pgPool.query(
+        `INSERT INTO mcp_settings (key, value, updated_at)
+         VALUES ('excluded_models', $1, CURRENT_TIMESTAMP)
+         ON CONFLICT (key) DO UPDATE SET
+           value = EXCLUDED.value,
+           updated_at = CURRENT_TIMESTAMP`,
+        [JSON.stringify(modelsArray)]
+      );
+    } catch {}
+  }
+  try {
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify({ excludedModels: modelsArray }, null, 2), "utf8");
+  } catch {}
+}
+
+async function loadExcludedModelsFromStorage() {
+  if (pgPool) {
+    try {
+      const res = await pgPool.query("SELECT value FROM mcp_settings WHERE key = 'excluded_models' LIMIT 1");
+      if (res.rows && res.rows.length > 0) {
+        const val = res.rows[0].value;
+        const list = Array.isArray(val) ? val : (typeof val === "string" ? JSON.parse(val) : []);
+        excludedModels = new Set(list);
+        return;
+      }
+    } catch {}
+  }
+
+  if (fs.existsSync(SETTINGS_FILE)) {
+    try {
+      const raw = fs.readFileSync(SETTINGS_FILE, "utf8");
+      const data = JSON.parse(raw);
+      if (Array.isArray(data.excludedModels)) {
+        excludedModels = new Set(data.excludedModels);
+      }
+    } catch {}
   }
 }
 
@@ -428,7 +479,6 @@ async function callMcpTool(toolKey, args) {
   return typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
 }
 
-// 纯净工具池：只包含用户在后台真实连接的外部 MCP 服务，不内置任何写死的虚假爬虫
 function getAllTools() {
   const tools = [];
   for (const s of mcpServers.values()) {
@@ -504,10 +554,22 @@ async function passThrough(requestBody, clientResponse) {
   clientResponse.end();
 }
 
-/**
- * 标准大模型宿主运行环境元数据（任何成熟客户端如 ChatGPT/Claude/Cursor 必备基础基建）
- * 向模型客观告知当前的真实世界基准时间，彻底避免模型因时钟盲区而发疯搜索或翻看提交记录。
- */
+function isModelExcluded(modelName) {
+  if (!modelName) return false;
+  const target = modelName.trim().toLowerCase();
+  for (const m of excludedModels) {
+    const pattern = m.trim().toLowerCase();
+    if (!pattern) continue;
+    if (pattern === target) return true;
+    if (pattern.includes("*")) {
+      const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+      const regex = new RegExp(`^${escaped}$`, "i");
+      if (regex.test(target)) return true;
+    }
+  }
+  return false;
+}
+
 function buildHostEnvironmentSystemMessage() {
   const now = new Date();
   const beijingTime = now.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
@@ -523,7 +585,6 @@ async function runAgent(requestBody, clientResponse) {
   const rawMessages = requestBody.messages;
   const hostMeta = buildHostEnvironmentSystemMessage();
 
-  // 注入宿主真实时间基准，不改变用户的其他提示词
   let messages;
   const existingSystemIdx = rawMessages.findIndex((m) => m.role === "system");
   if (existingSystemIdx >= 0) {
@@ -660,7 +721,6 @@ async function runAgent(requestBody, clientResponse) {
       return false;
     });
 
-    // 模型未发起任何工具调用（常规问答、时间回答、闲聊），直接输出最终结果，不进行多余轮次
     if (mcpCalls.length === 0) {
       if (isStream) {
         for (const line of streamedDeltas) {
@@ -687,7 +747,6 @@ async function runAgent(requestBody, clientResponse) {
       return;
     }
 
-    // 只有在真正需要调用真实 MCP 时，记录工具调用历史
     messages.push({
       role: "assistant",
       content: assistantContent || null,
@@ -843,6 +902,7 @@ function getLoginHtml() {
 
 await initDatabase();
 await loadConfigFromStorage();
+await loadExcludedModelsFromStorage();
 
 const server = http.createServer(async (request, response) => {
   try {
@@ -903,9 +963,49 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    if (reqUrl.pathname.startsWith("/api/mcp/")) {
+    // 面板 API
+    if (reqUrl.pathname.startsWith("/api/")) {
       if (!isPanelAuthorized(request)) {
         sendJson(response, 401, { error: "控制台未授权，请输入管理密码" });
+        return;
+      }
+
+      // 获取排除模型列表
+      if (request.method === "GET" && reqUrl.pathname === "/api/settings/excluded-models") {
+        sendJson(response, 200, { excludedModels: Array.from(excludedModels) });
+        return;
+      }
+
+      // 更新排除模型列表
+      if (request.method === "POST" && reqUrl.pathname === "/api/settings/excluded-models") {
+        const body = await readRequestBody(request);
+        const models = Array.isArray(body.models) ? body.models : [];
+        await saveExcludedModelsToStorage(models);
+        sendJson(response, 200, { success: true, excludedModels: Array.from(excludedModels) });
+        return;
+      }
+
+      // 获取上游所有模型列表
+      if (request.method === "GET" && reqUrl.pathname === "/api/upstream/models") {
+        if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
+          sendJson(response, 200, { models: [] });
+          return;
+        }
+        const modelsUrl = UPSTREAM_BASE_URL.endsWith("/v1")
+          ? `${UPSTREAM_BASE_URL}/models`
+          : `${UPSTREAM_BASE_URL}/v1/models`;
+
+        try {
+          const upstreamResponse = await fetch(modelsUrl, {
+            headers: { Authorization: `Bearer ${UPSTREAM_API_KEY}` },
+            signal: AbortSignal.timeout(10000)
+          });
+          const data = await upstreamResponse.json();
+          const list = Array.isArray(data.data) ? data.data.map(m => m.id).filter(Boolean) : [];
+          sendJson(response, 200, { models: list });
+        } catch (e) {
+          sendJson(response, 500, { error: e.message, models: [] });
+        }
         return;
       }
 
@@ -1019,10 +1119,12 @@ const server = http.createServer(async (request, response) => {
       }
 
       const body = await readRequestBody(request);
-      if (mcpToolRegistry.size > 0) {
-        await runAgent(body, response);
-      } else {
+
+      // 如果模型在排除列表中，或者没有激活任何 MCP 服务，直接纯净直通上游，绝不注入任何 tools
+      if (isModelExcluded(body.model) || mcpToolRegistry.size === 0) {
         await passThrough(body, response);
+      } else {
+        await runAgent(body, response);
       }
       return;
     }
