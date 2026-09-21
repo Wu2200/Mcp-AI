@@ -503,6 +503,47 @@ async function passThrough(requestBody, clientResponse) {
   clientResponse.end();
 }
 
+/**
+ * 智能判断请求是否涉及已激活的 MCP 服务。
+ * 只有在用户意图明确需要已连接的 MCP 时才注入 tools 走 Agent 模式；
+ * 通用问答、实时资讯、新闻、闲聊等直接 passThrough，完整保留上游网关的 Raw 网络搜索规则。
+ */
+function shouldRouteToMcpAgent(requestBody) {
+  if (mcpToolRegistry.size === 0) return false;
+  if (Array.isArray(requestBody.tools) && requestBody.tools.length > 0) return true;
+
+  const messages = requestBody.messages;
+  if (!Array.isArray(messages) || messages.length === 0) return false;
+
+  const activeServers = Array.from(mcpServers.values()).filter((s) => s.status === "active");
+  if (activeServers.length === 0) return false;
+
+  const textContent = messages
+    .map((m) => {
+      if (typeof m.content === "string") return m.content;
+      if (Array.isArray(m.content)) {
+        return m.content.map((c) => (typeof c === "string" ? c : c?.text || "")).join(" ");
+      }
+      return "";
+    })
+    .join("\n")
+    .toLowerCase();
+
+  // 1. 匹配用户配置的 MCP 服务器名称
+  for (const s of activeServers) {
+    const serverName = (s.name || "").toLowerCase().trim();
+    if (serverName && textContent.includes(serverName)) return true;
+  }
+
+  // 2. 匹配常见已接入服务的核心领域关键词
+  const keywords = [
+    "github", "repo", "仓库", "commit", "分支", "branch", "pr", "pull request",
+    "issue", "cloudflare", "worker", "workers", "dns", "kv", "d1", "r2", "mcp"
+  ];
+
+  return keywords.some((kw) => textContent.includes(kw));
+}
+
 async function runAgent(requestBody, clientResponse) {
   if (!Array.isArray(requestBody.messages) || requestBody.messages.length === 0) {
     throw new Error("messages 必须是非空数组");
@@ -511,7 +552,6 @@ async function runAgent(requestBody, clientResponse) {
   const isStream = requestBody.stream === true;
   const messages = [...requestBody.messages];
 
-  // 纯净协议：只合并客户端传入的 function 工具与用户在面板真实注册的 MCP 工具
   const clientTools = Array.isArray(requestBody.tools)
     ? requestBody.tools.filter((t) => t && t.type === "function")
     : [];
@@ -635,7 +675,6 @@ async function runAgent(requestBody, clientResponse) {
       return false;
     });
 
-    // 如果模型没有调用任何 MCP 工具（例如正常回答问题、普通闲聊），直接输出模型生成的原版回答并结束
     if (mcpCalls.length === 0) {
       if (isStream) {
         for (const line of streamedDeltas) {
@@ -662,7 +701,6 @@ async function runAgent(requestBody, clientResponse) {
       return;
     }
 
-    // 只有在模型自主决定需要调用工具时，才进行标准化 ReAct 交互
     messages.push({
       role: "assistant",
       content: assistantContent || null,
@@ -994,7 +1032,7 @@ const server = http.createServer(async (request, response) => {
       }
 
       const body = await readRequestBody(request);
-      if (mcpToolRegistry.size > 0) {
+      if (shouldRouteToMcpAgent(body)) {
         await runAgent(body, response);
       } else {
         await passThrough(body, response);
