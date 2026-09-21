@@ -30,7 +30,7 @@
     h1 { font-size: 24px; font-weight: 700; color: #fff; margin-bottom: 6px; }
     .subtitle { color: var(--text-muted); font-size: 14px; }
     .grid { display: grid; grid-template-columns: 1fr; gap: 20px; }
-    @media (min-width: 768px) { .grid-2 { grid-template-columns: 1fr 1fr; } }
+    @media (min-width: 768px) { .grid-2 { grid-template-columns: 1fr 1fr; } .grid-3 { grid-template-columns: 1fr 1fr 1fr; } }
     .card {
       background: var(--card-bg);
       border: 1px solid var(--card-border);
@@ -136,38 +136,71 @@
       </div>
     </header>
 
+    <div class="card" style="margin-bottom: 20px;">
+      <div class="card-title">Chatbox 接入设置 <span class="badge badge-green">已就绪</span></div>
+      <div class="grid grid-2">
+        <div>
+          <div class="param-label">API 域名 (Base URL)</div>
+          <div class="param-box" id="proxy-url">正在加载...</div>
+        </div>
+        <div>
+          <div class="param-label">模型 (Model)</div>
+          <div class="param-box">任意模型（由上游 CLIProxyAPI 提供）</div>
+        </div>
+      </div>
+      <p style="font-size: 13px; color: var(--text-muted); margin-top: 8px;">Chatbox 连接此地址后，只要对话中提及已启用的工具，大模型会自动触发工具执行。</p>
+    </div>
+
+    <h2 style="font-size: 18px; margin-bottom: 14px;">一键挂载官方 MCP（无需输入网址）</h2>
     <div class="grid grid-2" style="margin-bottom: 20px;">
       <div class="card">
-        <div class="card-title">Chatbox 接入设置 <span class="badge badge-green">已就绪</span></div>
-        <div class="param-label">API 域名 (Base URL)</div>
-        <div class="param-box" id="proxy-url">正在加载...</div>
-        <div class="param-label">模型 (Model)</div>
-        <div class="param-box">任意模型（由上游 CLIProxyAPI 提供）</div>
-        <p style="font-size: 13px; color: var(--text-muted);">Chatbox 连接此地址后，只要对话中提及已连接 MCP 相关的需求，大模型将自动触发工具调用。</p>
+        <div class="card-title">GitHub 官方 MCP</div>
+        <div class="input-group">
+          <label>GitHub Personal Access Token（经典令牌）</label>
+          <input id="gh-token" type="password" placeholder="ghp_xxxx 或 github_pat_xxxx">
+        </div>
+        <button class="btn" onclick="handleConnectBuiltin('github')">一键挂载 GitHub</button>
+        <span id="gh-status" style="margin-left: 10px; font-size: 13px;"></span>
       </div>
 
       <div class="card">
-        <div class="card-title">手动连接新的 MCP 服务</div>
+        <div class="card-title">Cloudflare 官方 MCP</div>
         <div class="input-group">
-          <label>服务名称（标识前缀）</label>
-          <input id="mcp-name" placeholder="例如：Cloudflare 或 GitHub" value="CF">
+          <label>Cloudflare API Token</label>
+          <input id="cf-token" type="password" placeholder="Cloudflare 令牌">
         </div>
         <div class="input-group">
-          <label>MCP 服务地址 (SSE / HTTP Endpoint)</label>
-          <input id="mcp-url" placeholder="https://your-mcp-server.com/sse">
+          <label>Cloudflare Account ID</label>
+          <input id="cf-account" placeholder="Cloudflare 账户 ID">
         </div>
-        <div class="input-group">
-          <label>认证令牌 (Token / Key，可选)</label>
-          <input id="mcp-token" type="password" placeholder="若无需认证可留空">
-        </div>
-        <button class="btn" id="connect-btn" onclick="handleConnectMcp()">连接并提取工具</button>
-        <span id="connect-status" style="margin-left: 10px; font-size: 13px;"></span>
+        <button class="btn" onclick="handleConnectBuiltin('cloudflare')">一键挂载 Cloudflare</button>
+        <span id="cf-status" style="margin-left: 10px; font-size: 13px;"></span>
       </div>
     </div>
 
     <div class="card" style="margin-bottom: 20px;">
+      <div class="card-title">第三方远程 MCP 链接（可选）</div>
+      <div class="grid grid-3">
+        <div class="input-group">
+          <label>服务前缀</label>
+          <input id="mcp-name" placeholder="例如：custom" value="custom">
+        </div>
+        <div class="input-group">
+          <label>服务地址 (SSE / HTTP Endpoint)</label>
+          <input id="mcp-url" placeholder="https://example.com/sse">
+        </div>
+        <div class="input-group">
+          <label>认证令牌 (可选)</label>
+          <input id="mcp-token" type="password" placeholder="Token">
+        </div>
+      </div>
+      <button class="btn" onclick="handleConnectCustom()">连接远程服务</button>
+      <span id="custom-status" style="margin-left: 10px; font-size: 13px;"></span>
+    </div>
+
+    <div class="card" style="margin-bottom: 20px;">
       <div class="card-title">已连接的 MCP 服务列表 <span class="badge" id="mcp-count">0</span></div>
-      <div id="mcp-list"><div style="color: var(--text-muted); font-size: 13px;">尚未连接任何 MCP 服务，请在上方输入地址添加。</div></div>
+      <div id="mcp-list"><div style="color: var(--text-muted); font-size: 13px;">尚未连接任何 MCP 服务，请在上方卡片直接点击一键挂载。</div></div>
     </div>
 
     <div class="card">
@@ -251,7 +284,7 @@
         document.getElementById("mcp-count").innerText = data.servers.length;
 
         if (data.servers.length === 0) {
-          listEl.innerHTML = '<div style="color: var(--text-muted); font-size: 13px;">尚未连接任何 MCP 服务，请在上方输入地址添加。</div>';
+          listEl.innerHTML = '<div style="color: var(--text-muted); font-size: 13px;">尚未连接任何 MCP 服务，请在上方卡片直接点击一键挂载。</div>';
         } else {
           let html = "";
           for (let s of data.servers) {
@@ -264,7 +297,7 @@
                 '<div><strong>' + s.name + '</strong> <span class="badge badge-green">' + s.toolCount + ' 个工具</span></div>' +
                 '<button class="btn btn-danger btn-sm" onclick="handleDeleteServer(\'' + s.id + '\')">断开</button>' +
               '</div>' +
-              '<div style="font-size: 12px; color: var(--text-muted); margin-bottom: 8px;">地址: ' + s.url + '</div>' +
+              '<div style="font-size: 12px; color: var(--text-muted); margin-bottom: 8px;">类型: ' + s.type + '</div>' +
               '<div>' + tags + '</div>' +
             '</div>';
           }
@@ -286,23 +319,70 @@
       }
     }
 
-    async function handleConnectMcp() {
+    async function handleConnectBuiltin(type) {
+      let body = { type };
+      let statusEl = document.getElementById(type === "github" ? "gh-status" : "cf-status");
+
+      if (type === "github") {
+        const token = document.getElementById("gh-token").value.trim();
+        if (!token) {
+          statusEl.innerText = "请输入 GitHub Token。";
+          statusEl.style.color = "#ef4444";
+          return;
+        }
+        body.token = token;
+      } else {
+        const token = document.getElementById("cf-token").value.trim();
+        const accountId = document.getElementById("cf-account").value.trim();
+        if (!token || !accountId) {
+          statusEl.innerText = "Token 与 Account ID 均为必填项。";
+          statusEl.style.color = "#ef4444";
+          return;
+        }
+        body.token = token;
+        body.accountId = accountId;
+      }
+
+      statusEl.innerText = "正在拉取官方工具列表...";
+      statusEl.style.color = "#38bdf8";
+
+      try {
+        const res = await fetch("/api/mcp/connect-builtin", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-panel-password": getPwd()
+          },
+          body: JSON.stringify(body)
+        });
+        const result = await res.json();
+        if (!res.ok) throw new Error(result.error || "挂载失败");
+        statusEl.innerText = "已就绪，载入 " + result.toolCount + " 个工具！";
+        statusEl.style.color = "#10b981";
+        loadServers();
+      } catch (err) {
+        statusEl.innerText = err.message;
+        statusEl.style.color = "#ef4444";
+      }
+    }
+
+    async function handleConnectCustom() {
       const name = document.getElementById("mcp-name").value.trim();
       const url = document.getElementById("mcp-url").value.trim();
       const token = document.getElementById("mcp-token").value.trim();
-      const statusEl = document.getElementById("connect-status");
+      const statusEl = document.getElementById("custom-status");
 
       if (!name || !url) {
-        statusEl.innerText = "名称与 URL 均为必填项。";
+        statusEl.innerText = "前缀与 URL 均为必填项。";
         statusEl.style.color = "#ef4444";
         return;
       }
 
-      statusEl.innerText = "正在连接并读取工具...";
+      statusEl.innerText = "连接中...";
       statusEl.style.color = "#38bdf8";
 
       try {
-        const res = await fetch("/api/mcp/connect", {
+        const res = await fetch("/api/mcp/connect-url", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -311,13 +391,9 @@
           body: JSON.stringify({ name, url, token })
         });
         const result = await res.json();
-        if (!res.ok) {
-          throw new Error(result.error || "连接失败");
-        }
+        if (!res.ok) throw new Error(result.error || "连接失败");
         statusEl.innerText = "成功载入 " + result.toolCount + " 个工具！";
         statusEl.style.color = "#10b981";
-        document.getElementById("mcp-url").value = "";
-        document.getElementById("mcp-token").value = "";
         loadServers();
       } catch (err) {
         statusEl.innerText = err.message;
@@ -326,7 +402,7 @@
     }
 
     async function handleDeleteServer(id) {
-      if (!confirm("确认移除该 MCP 连接？")) return;
+      if (!confirm("确认移除该 MCP 挂载？")) return;
       await fetch('/api/mcp/servers/' + id, {
         method: "DELETE",
         headers: { "x-panel-password": getPwd() }
