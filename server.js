@@ -258,16 +258,37 @@ function readRequestBody(request) {
   });
 }
 
-function cleanPayload(obj) {
-  if (!obj || typeof obj !== "object") return;
-  if (obj.generationConfig?.thinkingConfig) {
-    delete obj.generationConfig.thinkingConfig.includeThought;
-    delete obj.generationConfig.thinkingConfig.includeThough;
-  }
-  if (obj.generation_config?.thinking_config) {
-    delete obj.generation_config.thinking_config.includeThought;
-    delete obj.generation_config.thinking_config.includeThough;
-  }
+function isMcpContext(requestBody) {
+  if (mcpToolRegistry.size === 0) return false;
+  const rawMessages = requestBody.messages || [];
+  if (!Array.isArray(rawMessages) || rawMessages.length === 0) return false;
+
+  const combinedText = rawMessages
+    .map((m) => {
+      if (typeof m.content === "string") return m.content;
+      if (Array.isArray(m.content)) {
+        return m.content
+          .map((c) => (typeof c === "string" ? c : c?.text || ""))
+          .join(" ");
+      }
+      return "";
+    })
+    .join("\n");
+
+  const serverNames = Array.from(mcpServers.values())
+    .filter((s) => s.status === "active")
+    .map((s) => s.name.replace(/[^a-zA-Z0-9_\u4e00-\u9fa5]/g, ""))
+    .filter(Boolean);
+
+  const keywords = [
+    "mcp", "github", "git\\b", "repo", "代码库", "仓库", "commit", "pr\\b", "pull request",
+    "分支", "branch", "提取代码", "读取文件", "查看文件", "修改文件", "创建文件", "新建文件", "删除文件",
+    "cloudflare", "cf\\b", "worker", "workers", "kv\\b", "d1\\b", "r2\\b", "dns", "domain", "域名",
+    ...serverNames
+  ];
+
+  const pattern = new RegExp(`(${keywords.join("|")})`, "i");
+  return pattern.test(combinedText);
 }
 
 async function parseMcpResponse(res) {
@@ -480,7 +501,6 @@ function sendReasoningChunk(clientResponse, text, model = "default") {
 }
 
 async function passThrough(requestBody, clientResponse) {
-  cleanPayload(requestBody);
   setCorsHeaders(clientResponse);
   const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
     method: "POST",
@@ -556,7 +576,6 @@ async function runAgent(requestBody, clientResponse) {
       tool_choice: "auto",
       stream: true
     };
-    cleanPayload(payload);
 
     const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
       method: "POST",
@@ -990,7 +1009,7 @@ const server = http.createServer(async (request, response) => {
       }
 
       const body = await readRequestBody(request);
-      if (mcpToolRegistry.size > 0) {
+      if (isMcpContext(body)) {
         await runAgent(body, response);
       } else {
         await passThrough(body, response);
