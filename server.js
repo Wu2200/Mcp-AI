@@ -287,9 +287,59 @@ function readRequestBody(request) {
   });
 }
 
+function extractCombinedUserText(requestBody) {
+  const rawMessages = requestBody.messages || [];
+  if (!Array.isArray(rawMessages) || rawMessages.length === 0) return "";
+  return rawMessages
+    .map((m) => {
+      if (typeof m.content === "string") return m.content;
+      if (Array.isArray(m.content)) {
+        return m.content
+          .map((c) => (typeof c === "string" ? c : c?.text || ""))
+          .join(" ");
+      }
+      return "";
+    })
+    .join("\n");
+}
+
 function isMcpContext(requestBody) {
   if (mcpToolRegistry.size === 0) return false;
-  return true;
+  const text = extractCombinedUserText(requestBody);
+  if (!text) return false;
+
+  const serverNames = Array.from(mcpServers.values())
+    .filter((s) => s.status === "active")
+    .map((s) => s.name.replace(/[^a-zA-Z0-9_\u4e00-\u9fa5]/g, ""))
+    .filter(Boolean);
+
+  const keywords = [
+    "mcp", "github", "git\\b", "repo", "代码库", "仓库", "commit", "pr\\b", "pull request",
+    "分支", "branch", "提取代码", "读取文件", "查看文件", "修改文件", "创建文件", "新建文件", "删除文件",
+    "提交", "推送", "push", "写入", "更新", "修改", "替换", "帮我修改", "帮我提交",
+    "项目", "当前项目", "检测", "排查", "检查代码", "报错", "部署失败", "日志", "线上问题",
+    "cloudflare", "cf\\b", "worker", "workers", "kv\\b", "d1\\b", "r2\\b", "dns", "domain", "域名",
+    ...serverNames
+  ];
+
+  const pattern = new RegExp(`(${keywords.join("|")})`, "i");
+  return pattern.test(text);
+}
+
+function createEvidenceTracker(userText) {
+  const isRepoInspection = /(检测|检查|排查|是否存在问题|有什么问题|查看代码|当前项目|项目结构|最新提交)/i.test(userText);
+  const isRepoWrite = /(提交|推送|push|修改文件|创建文件|删除文件|更新文件|帮我修改|帮我提交|写入)/i.test(userText);
+
+  return {
+    requiresRepositoryEvidence: isRepoInspection || isRepoWrite,
+    requiresWriteEvidence: isRepoWrite,
+    hasRepositoryRead: false,
+    hasWriteOperation: false,
+    hasCommitVerification: false,
+    verifiedCommitSha: null,
+    readToolsCalled: [],
+    writeToolsCalled: []
+  };
 }
 
 async function parseMcpResponse(res) {
@@ -465,7 +515,7 @@ function buildToolPrompt() {
     `3. 只要存在与用户请求意图相关的工具，第一步必须调用该工具获取真实数据，严禁凭空臆造结果。`,
     `4. 严禁假操作、假提交与虚构结果：凡涉及文件修改、创建、删除、代码提交（commit）、分支或PR操作等写入类请求，必须发起真实的工具调用。在未调用工具或工具未返回成功结果前，严禁编造 Commit SHA、链接或声称“已提交/已修改”。`,
     `5. 工具执行若返回错误或失败，必须如实向用户说明失败详情，严禁隐瞒错误或将失败伪造成成功。`,
-    `6. 严禁编造不存在的仓库文件或虚构项目架构：严格以当前仓库实际拉取到的文件为准，不得凭空假想 worker.js、index.js 等无关文件。`
+    `6. 严格禁止凭空编造不存在的文件（如 worker.js、index.js 等）或虚构项目架构，必须严格以工具查询到的真实文件和代码为准。`
   ].join("\n");
 }
 
@@ -498,6 +548,23 @@ function sendReasoningChunk(clientResponse, text, model = "default") {
       {
         index: 0,
         delta: { reasoning_content: text },
+        finish_reason: null
+      }
+    ]
+  };
+  clientResponse.write(`data: ${JSON.stringify(chunk)}\n\n`);
+}
+
+function sendContentChunk(clientResponse, text, model = "default") {
+  const chunk = {
+    id: `chatcmpl-${Date.now()}`,
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [
+      {
+        index: 0,
+        delta: { content: text },
         finish_reason: null
       }
     ]
@@ -541,6 +608,8 @@ async function runAgent(requestBody, clientResponse) {
 
   const isStream = requestBody.stream === true;
   const rawMessages = requestBody.messages;
+  const userText = extractCombinedUserText(requestBody);
+  const evidenceTracker = createEvidenceTracker(userText);
   const toolPrompt = buildToolPrompt();
 
   const clientTools = Array.isArray(requestBody.tools) ? requestBody.tools : [];
@@ -572,6 +641,8 @@ async function runAgent(requestBody, clientResponse) {
       "X-Accel-Buffering": "no"
     });
   }
+
+  let enforcementInjected = false;
 
   for (let round = 0; round < 10; round += 1) {
     const payload = {
@@ -662,9 +733,6 @@ async function runAgent(requestBody, clientResponse) {
             }
           } else if (!isCallingTool && delta?.content) {
             assistantContent += delta.content;
-            if (isStream) {
-              clientResponse.write(`${line}\n\n`);
-            }
           }
         } catch {}
       }
@@ -675,7 +743,51 @@ async function runAgent(requestBody, clientResponse) {
     );
 
     if (mcpCalls.length === 0) {
+      if (evidenceTracker.requiresRepositoryEvidence && !evidenceTracker.hasRepositoryRead && !evidenceTracker.hasWriteOperation) {
+        if (!enforcementInjected) {
+          enforcementInjected = true;
+          messages.push({
+            role: "assistant",
+            content: assistantContent || null
+          });
+          messages.push({
+            role: "user",
+            content: "【系统拦截】：你正在回答针对当前仓库或代码的分析/操作请求，但本轮尚未调用任何仓库查询工具读取真实数据。严禁凭空臆想或根据猜想回答，严禁捏造文件或结构。请立即调用可用的查询工具（如读取文件、获取提交、列出目录等）获取真实数据后再作答。"
+          });
+          continue;
+        }
+
+        const refusalMsg = "无法完成仓库核验：未获得 GitHub 工具返回的真实数据，系统拒绝输出猜测性结论。";
+        if (isStream) {
+          sendContentChunk(clientResponse, refusalMsg, requestBody.model);
+          clientResponse.write("data: [DONE]\n\n");
+          clientResponse.end();
+          return;
+        }
+        sendJson(clientResponse, 200, {
+          id: `chatcmpl-${crypto.randomUUID()}`,
+          object: "chat.completion",
+          created: Math.floor(Date.now() / 1000),
+          model: requestBody.model || "default",
+          choices: [
+            {
+              index: 0,
+              message: { role: "assistant", content: refusalMsg },
+              finish_reason: "stop"
+            }
+          ]
+        });
+        return;
+      }
+
+      if (evidenceTracker.hasWriteOperation && !evidenceTracker.hasCommitVerification) {
+        assistantContent = assistantContent.replace(/(已提交|提交成功|已推送|push完成)/g, "已执行写入请求（等待二次确认）");
+      }
+
       if (isStream) {
+        if (assistantContent) {
+          sendContentChunk(clientResponse, assistantContent, requestBody.model);
+        }
         clientResponse.write("data: [DONE]\n\n");
         clientResponse.end();
         return;
@@ -710,8 +822,12 @@ async function runAgent(requestBody, clientResponse) {
     for (const tc of mcpCalls) {
       const toolInfo = mcpToolRegistry.get(tc.name);
       const serverDisplayName = getServiceDisplayName(toolInfo, tc.name);
-      const actionName = getToolAction(toolInfo?.rawName || tc.name);
+      const rawFnName = toolInfo?.rawName || tc.name;
+      const actionName = getToolAction(rawFnName);
       const args = toolArguments({ function: { arguments: tc.arguments } });
+
+      const isReadTool = actionName === "查询";
+      const isWriteTool = actionName === "创建" || actionName === "更新/修改" || actionName === "删除";
 
       if (isStream) {
         sendReasoningChunk(
@@ -735,6 +851,27 @@ async function runAgent(requestBody, clientResponse) {
         } catch (err) {
           isError = true;
           result = { error: err instanceof Error ? err.message : "执行工具失败" };
+        }
+      }
+
+      if (!isError) {
+        if (isReadTool) {
+          evidenceTracker.hasRepositoryRead = true;
+          evidenceTracker.readToolsCalled.push(rawFnName);
+          if (rawFnName.includes("commit")) {
+            evidenceTracker.hasCommitVerification = true;
+            try {
+              const resStr = JSON.stringify(result);
+              const shaMatch = resStr.match(/"sha":\s*"([a-f0-9]{40})"/i);
+              if (shaMatch) {
+                evidenceTracker.verifiedCommitSha = shaMatch[1];
+              }
+            } catch {}
+          }
+        }
+        if (isWriteTool) {
+          evidenceTracker.hasWriteOperation = true;
+          evidenceTracker.writeToolsCalled.push(rawFnName);
         }
       }
 
