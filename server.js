@@ -40,6 +40,14 @@ function getToolAction(toolName) {
   return "处理";
 }
 
+function getServiceDisplayName(toolInfo, toolName) {
+  if (toolInfo?.serverName) return toolInfo.serverName;
+  const name = (toolName || "").toLowerCase();
+  if (name.includes("github")) return "GitHub";
+  if (name.includes("cloudflare")) return "Cloudflare";
+  return "MCP";
+}
+
 function generateSessionToken() {
   const payload = `auth:${PANEL_PASSWORD}:${Date.now()}`;
   const sig = crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("hex");
@@ -728,7 +736,7 @@ async function runAgent(requestBody, clientResponse) {
 
     for (const tc of mcpCalls) {
       const toolInfo = mcpToolRegistry.get(tc.name);
-      const serverDisplayName = toolInfo?.serverName || "MCP";
+      const serverDisplayName = getServiceDisplayName(toolInfo, tc.name);
       const actionName = getToolAction(toolInfo?.rawName || tc.name);
       const args = toolArguments({ function: { arguments: tc.arguments } });
 
