@@ -33,6 +33,7 @@ function getToolAction(toolName) {
 }
 
 function getServiceDisplayName(toolInfo, toolName) {
+  if (toolName === "web_search") return "网络搜索引擎";
   if (toolInfo?.serverName) return toolInfo.serverName;
   const name = (toolName || "").toLowerCase();
   if (name.includes("github")) return "GitHub";
@@ -273,6 +274,35 @@ function readRequestBody(request) {
   });
 }
 
+async function executeWebSearch(query) {
+  try {
+    const res = await fetch("https://html.duckduckgo.com/html/", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+      },
+      body: `q=${encodeURIComponent(query)}`,
+      signal: AbortSignal.timeout(12000)
+    });
+    if (!res.ok) throw new Error(`搜索引擎状态异常 (${res.status})`);
+    const html = await res.text();
+    const snippets = [];
+    const re = /<a class="result__snippet[^>]*>(.*?)<\/a>/g;
+    let match;
+    while ((match = re.exec(html)) !== null && snippets.length < 5) {
+      const clean = match[1].replace(/<[^>]+>/g, "").trim();
+      if (clean) snippets.push(clean);
+    }
+    if (snippets.length === 0) {
+      return `搜索 "${query}" 未获取到最新结果。`;
+    }
+    return `关于 "${query}" 的最新实时网络搜索结果：\n\n` + snippets.map((s, idx) => `[${idx + 1}] ${s}`).join("\n\n");
+  } catch (err) {
+    return `网络搜索接口响应：${err instanceof Error ? err.message : "请求失败"}`;
+  }
+}
+
 async function parseMcpResponse(res) {
   const contentType = res.headers.get("Content-Type") || "";
   if (contentType.includes("text/event-stream")) {
@@ -404,6 +434,10 @@ async function connectToMcpServer({ name, url, token }) {
 }
 
 async function callMcpTool(toolKey, args) {
+  if (toolKey === "web_search") {
+    return await executeWebSearch(args?.query || "");
+  }
+
   let info = mcpToolRegistry.get(toolKey);
   if (!info) {
     for (const [k, v] of mcpToolRegistry.entries()) {
@@ -446,8 +480,26 @@ async function callMcpTool(toolKey, args) {
   return typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
 }
 
+const BUILTIN_SEARCH_TOOL = {
+  type: "function",
+  function: {
+    name: "web_search",
+    description: "在互联网上进行实时搜索。当需要查询最新资讯、新闻、天气、技术文档或你不确定的事实时，必须调用本工具。",
+    parameters: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "搜索关键词"
+        }
+      },
+      required: ["query"]
+    }
+  }
+};
+
 function getAllTools() {
-  const tools = [];
+  const tools = [BUILTIN_SEARCH_TOOL];
   for (const s of mcpServers.values()) {
     if (s.status === "active") {
       for (const t of s.tools) tools.push(t.openAiTool);
@@ -458,18 +510,18 @@ function getAllTools() {
 
 function buildToolPrompt() {
   const activeServers = Array.from(mcpServers.values()).filter((s) => s.status === "active");
-  if (activeServers.length === 0) return "";
   const serverNames = activeServers.map((s) => `${s.name} (${s.toolCount} 个工具)`).join("、");
   return [
-    `# 远程 MCP 真实执行环境`,
-    `当前已在线并提供功能的 MCP 服务：${serverNames}。`,
-    `系统已将真实外部函数挂载至对话中。`,
+    `# 增强型真实执行环境（已挂载网络搜索与远程 MCP）`,
+    `当前环境已激活以下能力：`,
+    `1. 【网络权限】：已内置 \`web_search\` 实时网络搜索工具。如需查询最新事实、新闻、资料、网页信息，请调用 \`web_search\` 工具。`,
+    activeServers.length > 0 ? `2. 【MCP 服务】：${serverNames}，包含已挂载的外部接口函数。` : "",
     `【铁律：禁止假调用、禁止口头承诺、必须实际调用工具】`,
-    `1. 遇到任何需要查询、读取、写入、创建、提交、修改或删除的指令，必须且只能通过 tool_calls 触发对应的函数，绝不可在正文中直接假装已经完成。`,
-    `2. 严禁在回答中编造 Commit SHA、PR 链接、文件内容或假装已更新。`,
+    `1. 遇到任何需要联网检索、查询、读取、写入、创建、提交、修改或删除的指令，必须且只能通过 tool_calls 触发对应的函数，绝不可在正文中直接假装已经完成。`,
+    `2. 严禁在回答中编造事实、Commit SHA、PR 链接或假装已更新。`,
     `3. 严禁在正文回答中用文本模拟“正在调用”、“已调用”或以代码块格式伪造工具返回。`,
     `4. 只有在收到工具的真正执行返回内容后，方可基于真实返回给用户输出结论。`
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 function upstreamChatCompletionsUrl() {
@@ -546,7 +598,6 @@ async function runAgent(requestBody, clientResponse) {
   const rawMessages = requestBody.messages;
   const toolPrompt = buildToolPrompt();
 
-  // 严格遵循标准 OpenAI Function Calling 规范：只挂载合法 function 工具，不硬塞厂商非标参数
   const clientTools = Array.isArray(requestBody.tools)
     ? requestBody.tools.filter((t) => t && t.type === "function")
     : [];
@@ -677,8 +728,9 @@ async function runAgent(requestBody, clientResponse) {
       }
     }
 
-    const mcpCalls = accumulatedToolCalls.filter((tc) => {
+    const availableCalls = accumulatedToolCalls.filter((tc) => {
       if (!tc || !tc.name) return false;
+      if (tc.name === "web_search") return true;
       if (mcpToolRegistry.has(tc.name)) return true;
       for (const [k, v] of mcpToolRegistry.entries()) {
         if (k.endsWith(tc.name) || tc.name.endsWith(v.rawName)) return true;
@@ -686,7 +738,7 @@ async function runAgent(requestBody, clientResponse) {
       return false;
     });
 
-    if (mcpCalls.length === 0) {
+    if (availableCalls.length === 0) {
       if (isStream) {
         for (const line of streamedDeltas) {
           clientResponse.write(`${line}\n\n`);
@@ -715,16 +767,16 @@ async function runAgent(requestBody, clientResponse) {
     messages.push({
       role: "assistant",
       content: assistantContent || null,
-      tool_calls: mcpCalls.map((tc) => ({
+      tool_calls: availableCalls.map((tc) => ({
         id: tc.id || `call_${crypto.randomUUID()}`,
         type: "function",
         function: { name: tc.name, arguments: tc.arguments }
       }))
     });
 
-    for (const tc of mcpCalls) {
-      let toolInfo = mcpToolRegistry.get(tc.name);
-      if (!toolInfo) {
+    for (const tc of availableCalls) {
+      let toolInfo = tc.name === "web_search" ? null : mcpToolRegistry.get(tc.name);
+      if (!toolInfo && tc.name !== "web_search") {
         for (const [k, v] of mcpToolRegistry.entries()) {
           if (k.endsWith(tc.name) || tc.name.endsWith(v.rawName)) {
             toolInfo = v;
@@ -734,7 +786,7 @@ async function runAgent(requestBody, clientResponse) {
       }
 
       const serverDisplayName = getServiceDisplayName(toolInfo, tc.name);
-      const actionName = getToolAction(toolInfo?.rawName || tc.name);
+      const actionName = tc.name === "web_search" ? "实时搜索" : getToolAction(toolInfo?.rawName || tc.name);
       const args = toolArguments({ function: { arguments: tc.arguments } });
 
       if (isStream) {
@@ -1046,11 +1098,7 @@ const server = http.createServer(async (request, response) => {
       }
 
       const body = await readRequestBody(request);
-      if (mcpToolRegistry.size > 0) {
-        await runAgent(body, response);
-      } else {
-        await passThrough(body, response);
-      }
+      await runAgent(body, response);
       return;
     }
 
