@@ -134,9 +134,9 @@ function loadConfigFromDisk() {
 
 async function connectToMcpServer({ name, url, token }) {
   const serverId = crypto.randomUUID();
-  const cleanUrl = url.trim().replace(/\/+$/, "");
+  let cleanUrl = url.trim();
   const headers = {
-    Accept: "application/json, text/event-stream",
+    Accept: "application/json",
     "Content-Type": "application/json",
     "User-Agent": "GitHubCopilotChat/0.24.1",
     "Editor-Version": "vscode/1.97.0"
@@ -146,43 +146,7 @@ async function connectToMcpServer({ name, url, token }) {
     headers["Authorization"] = `Bearer ${token.trim()}`;
   }
 
-  let postEndpoint = cleanUrl;
-
-  try {
-    const testResponse = await fetch(cleanUrl, {
-      method: "GET",
-      headers,
-      signal: AbortSignal.timeout(10000)
-    });
-
-    const contentType = testResponse.headers.get("content-type") || "";
-    if (contentType.includes("text/event-stream")) {
-      const reader = testResponse.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      const startTime = Date.now();
-
-      while (Date.now() - startTime < 8000) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-
-        for (const line of lines) {
-          if (line.startsWith("event: endpoint")) {
-            const nextLine = lines[lines.indexOf(line) + 1] || "";
-            if (nextLine.startsWith("data:")) {
-              const rel = nextLine.replace(/^data:\s*/, "").trim();
-              postEndpoint = new URL(rel, cleanUrl).toString();
-              break;
-            }
-          }
-        }
-        if (postEndpoint !== cleanUrl) break;
-      }
-    }
-  } catch {}
+  const postEndpoint = cleanUrl;
 
   const initPayload = {
     jsonrpc: "2.0",
@@ -200,7 +164,7 @@ async function connectToMcpServer({ name, url, token }) {
       method: "POST",
       headers,
       body: JSON.stringify(initPayload),
-      signal: AbortSignal.timeout(10000)
+      signal: AbortSignal.timeout(6000)
     });
   } catch {}
 
@@ -215,12 +179,12 @@ async function connectToMcpServer({ name, url, token }) {
     method: "POST",
     headers,
     body: JSON.stringify(listPayload),
-    signal: AbortSignal.timeout(15000)
+    signal: AbortSignal.timeout(8000)
   });
 
   if (!listRes.ok) {
     const err = await listRes.text();
-    throw new Error(`获取工具列表失败 (${listRes.status}): ${err.slice(0, 400)}`);
+    throw new Error(`MCP 服务响应错误 (${listRes.status}): ${err.slice(0, 300)}`);
   }
 
   const listData = await listRes.json();
