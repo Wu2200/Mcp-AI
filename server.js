@@ -24,21 +24,11 @@ const SESSION_SECRET = PANEL_PASSWORD
 
 function getToolAction(toolName) {
   const name = (toolName || "").toLowerCase();
-  if (name.includes("delete") || name.includes("remove")) {
-    return "删除";
-  }
-  if (name.includes("update") || name.includes("merge") || name.includes("resolve") || name.includes("patch") || name.includes("edit")) {
-    return "更新/修改";
-  }
-  if (name.includes("create") || name.includes("add") || name.includes("push") || name.includes("fork")) {
-    return "创建";
-  }
-  if (name.includes("get") || name.includes("list") || name.includes("search") || name.includes("read") || name.includes("docs")) {
-    return "查询";
-  }
-  if (name.includes("execute") || name.includes("run")) {
-    return "执行";
-  }
+  if (name.includes("delete") || name.includes("remove")) return "删除";
+  if (name.includes("update") || name.includes("merge") || name.includes("resolve") || name.includes("patch") || name.includes("edit")) return "更新";
+  if (name.includes("create") || name.includes("add") || name.includes("push") || name.includes("fork")) return "创建";
+  if (name.includes("get") || name.includes("list") || name.includes("search") || name.includes("read") || name.includes("docs")) return "查询";
+  if (name.includes("execute") || name.includes("run")) return "执行";
   return "处理";
 }
 
@@ -108,9 +98,6 @@ async function initDatabase() {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
-    try {
-      await pgPool.query("ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active';");
-    } catch {}
   } catch {
     pgPool = null;
   }
@@ -146,7 +133,6 @@ async function saveServerToStorage(serverItem) {
       );
     } catch {}
   }
-
   try {
     const data = Array.from(mcpServers.values());
     fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf8");
@@ -186,7 +172,6 @@ async function loadConfigFromStorage() {
             tools
           };
           mcpServers.set(row.id, serverInfo);
-
           if (status === "active") {
             for (const t of tools) {
               mcpToolRegistry.set(t.key, {
@@ -212,7 +197,6 @@ async function loadConfigFromStorage() {
       const status = item.status || "active";
       item.status = status;
       mcpServers.set(item.id, item);
-
       if (status === "active") {
         for (const t of item.tools) {
           mcpToolRegistry.set(t.key, {
@@ -287,39 +271,6 @@ function readRequestBody(request) {
     });
     request.on("error", reject);
   });
-}
-
-function isMcpContext(requestBody) {
-  if (mcpToolRegistry.size === 0) return false;
-  const rawMessages = requestBody.messages || [];
-  if (!Array.isArray(rawMessages) || rawMessages.length === 0) return false;
-
-  const combinedText = rawMessages
-    .map((m) => {
-      if (typeof m.content === "string") return m.content;
-      if (Array.isArray(m.content)) {
-        return m.content
-          .map((c) => (typeof c === "string" ? c : c?.text || ""))
-          .join(" ");
-      }
-      return "";
-    })
-    .join("\n");
-
-  const serverNames = Array.from(mcpServers.values())
-    .filter((s) => s.status === "active")
-    .map((s) => s.name.replace(/[^a-zA-Z0-9_\u4e00-\u9fa5]/g, ""))
-    .filter(Boolean);
-
-  const keywords = [
-    "mcp", "github", "git\\b", "repo", "代码库", "仓库", "commit", "pr\\b", "pull request",
-    "分支", "branch", "提取代码", "读取文件", "查看文件", "修改文件", "创建文件", "新建文件", "删除文件",
-    "cloudflare", "cf\\b", "worker", "workers", "kv\\b", "d1\\b", "r2\\b", "dns", "domain", "域名",
-    ...serverNames
-  ];
-
-  const pattern = new RegExp(`(${keywords.join("|")})`, "i");
-  return pattern.test(combinedText);
 }
 
 async function parseMcpResponse(res) {
@@ -408,7 +359,11 @@ async function connectToMcpServer({ name, url, token }) {
   const registeredTools = [];
   for (const t of rawTools) {
     const safePrefix = name.toLowerCase().replace(/[^a-z0-9_]/g, "_");
-    const toolKey = `mcp_${safePrefix}_${t.name.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+    const sanitizedToolName = t.name.replace(/[^a-zA-Z0-9_-]/g, "_");
+    const toolKey = sanitizedToolName.startsWith(`${safePrefix}_`)
+      ? sanitizedToolName
+      : `${safePrefix}_${sanitizedToolName}`;
+
     registeredTools.push({
       key: toolKey,
       rawName: t.name,
@@ -449,7 +404,15 @@ async function connectToMcpServer({ name, url, token }) {
 }
 
 async function callMcpTool(toolKey, args) {
-  const info = mcpToolRegistry.get(toolKey);
+  let info = mcpToolRegistry.get(toolKey);
+  if (!info) {
+    for (const [k, v] of mcpToolRegistry.entries()) {
+      if (k.endsWith(toolKey) || toolKey.endsWith(v.rawName)) {
+        info = v;
+        break;
+      }
+    }
+  }
   if (!info) throw new Error(`未找到工具：${toolKey}`);
 
   const res = await fetch(info.postEndpoint, {
@@ -471,7 +434,16 @@ async function callMcpTool(toolKey, args) {
 
   const data = await parseMcpResponse(res);
   if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
-  return data.result ?? data;
+  const rawResult = data.result ?? data;
+  if (rawResult && Array.isArray(rawResult.content)) {
+    const textPieces = rawResult.content
+      .filter((item) => item.type === "text" && item.text)
+      .map((item) => item.text);
+    if (textPieces.length > 0) {
+      return textPieces.join("\n\n");
+    }
+  }
+  return typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
 }
 
 function getAllTools() {
@@ -489,15 +461,14 @@ function buildToolPrompt() {
   if (activeServers.length === 0) return "";
   const serverNames = activeServers.map((s) => `${s.name} (${s.toolCount} 个工具)`).join("、");
   return [
-    `# 远程 MCP 工具环境`,
-    `当前已连接的 MCP 服务：${serverNames}。`,
-    `系统已将外部工具列表挂载至本次对话中。`,
-    `【强制执行规则】`,
-    `1. 当用户提出的任何请求需要查询账号、数据、配置、仓库、服务信息或执行变更操作时，你必须主动判断并自主发起工具调用（tool_calls），绝不可在未调用工具的情况下直接拒绝用户或回答“我无法直接访问您的账号”。`,
-    `2. 识别用户的意图时必须包容各种简写、代称（例如：cf = Cloudflare、gh = GitHub、k8s = Kubernetes 等）。`,
-    `3. 只要存在与用户请求意图相关的工具，第一步必须调用该工具获取真实数据，严禁凭空臆造结果。`,
-    `4. 严禁假操作、假提交与虚构结果：凡涉及文件修改、创建、删除、代码提交（commit）、分支或PR操作等写入类请求，必须发起真实的工具调用。在未调用工具或工具未返回成功结果前，严禁编造 Commit SHA、链接或声称“已提交/已修改”。`,
-    `5. 工具执行若返回错误或失败，必须如实向用户说明失败详情，严禁隐瞒错误或将失败伪造成成功。`
+    `# 远程 MCP 真实执行环境`,
+    `当前已在线并提供功能的 MCP 服务：${serverNames}。`,
+    `系统已将真实外部函数挂载至对话中。`,
+    `【铁律：禁止假调用、禁止口头承诺、必须实际调用工具】`,
+    `1. 遇到任何需要查询、读取、写入、创建、提交、修改或删除的指令，必须且只能通过 tool_calls 触发对应的函数，绝不可在正文中直接假装已经完成。`,
+    `2. 严禁在回答中编造 Commit SHA、PR 链接、文件内容或假装已更新。`,
+    `3. 严禁在正文回答中用文本模拟“正在调用”、“已调用”或以代码块格式伪造工具返回。`,
+    `4. 只有在收到工具的真正执行返回内容后，方可基于真实返回给用户输出结论。`
   ].join("\n");
 }
 
@@ -510,10 +481,10 @@ function upstreamChatCompletionsUrl() {
 
 function toolArguments(toolCall) {
   try {
-    const value = JSON.parse(toolCall.function?.arguments || "{}");
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      throw new Error();
-    }
+    const raw = toolCall.function?.arguments;
+    if (typeof raw === "object" && raw !== null) return raw;
+    const value = JSON.parse(raw || "{}");
+    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
     return value;
   } catch {
     return null;
@@ -656,7 +627,7 @@ async function runAgent(requestBody, clientResponse) {
     let buffer = "";
     let accumulatedToolCalls = [];
     let assistantContent = "";
-    let isCallingTool = false;
+    let streamedDeltas = [];
 
     while (true) {
       const { done, value } = await reader.read();
@@ -675,13 +646,11 @@ async function runAgent(requestBody, clientResponse) {
         try {
           const parsed = JSON.parse(dataStr);
           const delta = parsed.choices?.[0]?.delta;
-
           if (delta?.reasoning_content && isStream) {
             clientResponse.write(`${line}\n\n`);
           }
 
           if (delta?.tool_calls) {
-            isCallingTool = true;
             for (const tc of delta.tool_calls) {
               const index = tc.index ?? 0;
               if (!accumulatedToolCalls[index]) {
@@ -695,22 +664,30 @@ async function runAgent(requestBody, clientResponse) {
               if (tc.function?.name) accumulatedToolCalls[index].name = tc.function.name;
               if (tc.function?.arguments) accumulatedToolCalls[index].arguments += tc.function.arguments;
             }
-          } else if (!isCallingTool && delta?.content) {
+          }
+
+          if (delta?.content) {
             assistantContent += delta.content;
-            if (isStream) {
-              clientResponse.write(`${line}\n\n`);
-            }
+            streamedDeltas.push(line);
           }
         } catch {}
       }
     }
 
-    const mcpCalls = accumulatedToolCalls.filter((tc) =>
-      mcpToolRegistry.has(tc.name)
-    );
+    const mcpCalls = accumulatedToolCalls.filter((tc) => {
+      if (!tc || !tc.name) return false;
+      if (mcpToolRegistry.has(tc.name)) return true;
+      for (const [k, v] of mcpToolRegistry.entries()) {
+        if (k.endsWith(tc.name) || tc.name.endsWith(v.rawName)) return true;
+      }
+      return false;
+    });
 
     if (mcpCalls.length === 0) {
       if (isStream) {
+        for (const line of streamedDeltas) {
+          clientResponse.write(`${line}\n\n`);
+        }
         clientResponse.write("data: [DONE]\n\n");
         clientResponse.end();
         return;
@@ -743,7 +720,16 @@ async function runAgent(requestBody, clientResponse) {
     });
 
     for (const tc of mcpCalls) {
-      const toolInfo = mcpToolRegistry.get(tc.name);
+      let toolInfo = mcpToolRegistry.get(tc.name);
+      if (!toolInfo) {
+        for (const [k, v] of mcpToolRegistry.entries()) {
+          if (k.endsWith(tc.name) || tc.name.endsWith(v.rawName)) {
+            toolInfo = v;
+            break;
+          }
+        }
+      }
+
       const serverDisplayName = getServiceDisplayName(toolInfo, tc.name);
       const actionName = getToolAction(toolInfo?.rawName || tc.name);
       const args = toolArguments({ function: { arguments: tc.arguments } });
@@ -751,48 +737,37 @@ async function runAgent(requestBody, clientResponse) {
       if (isStream) {
         sendReasoningChunk(
           clientResponse,
-          `\n> 正在调用 ${serverDisplayName} ${actionName}工具\n`,
+          `\n> 正在调用 ${serverDisplayName} ${actionName}接口\n`,
           requestBody.model
         );
       }
 
       let result;
       let isError = false;
-      if (!args) {
-        result = { error: "工具参数不是有效 JSON" };
+      if (args === null) {
+        result = JSON.stringify({ error: "工具参数格式错误" });
         isError = true;
       } else {
         try {
           result = await callMcpTool(tc.name, args);
-          if (result && typeof result === "object" && (result.error || result.isError)) {
-            isError = true;
-          }
         } catch (err) {
           isError = true;
-          result = { error: err instanceof Error ? err.message : "执行工具失败" };
+          result = JSON.stringify({ error: err instanceof Error ? err.message : "执行工具失败" });
         }
       }
 
       if (isStream) {
-        if (isError) {
-          sendReasoningChunk(
-            clientResponse,
-            `> ${serverDisplayName} ${actionName}失败\n\n`,
-            requestBody.model
-          );
-        } else {
-          sendReasoningChunk(
-            clientResponse,
-            `> ${serverDisplayName} ${actionName}完成\n\n`,
-            requestBody.model
-          );
-        }
+        sendReasoningChunk(
+          clientResponse,
+          `> ${serverDisplayName} ${actionName}${isError ? "失败" : "成功"}\n\n`,
+          requestBody.model
+        );
       }
 
       messages.push({
         role: "tool",
         tool_call_id: tc.id || `call_${crypto.randomUUID()}`,
-        content: JSON.stringify(result)
+        content: typeof result === "string" ? result : JSON.stringify(result)
       });
     }
   }
@@ -1068,7 +1043,7 @@ const server = http.createServer(async (request, response) => {
       }
 
       const body = await readRequestBody(request);
-      if (isMcpContext(body)) {
+      if (mcpToolRegistry.size > 0) {
         await runAgent(body, response);
       } else {
         await passThrough(body, response);
