@@ -1,10 +1,17 @@
 import crypto from "node:crypto";
+import fs from "node:fs";
 import http from "node:http";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT || 10000);
 const UPSTREAM_BASE_URL = requiredEnv("UPSTREAM_BASE_URL").replace(/\/+$/, "");
 const UPSTREAM_API_KEY = requiredEnv("UPSTREAM_API_KEY");
 const PROXY_API_KEY = (process.env.PROXY_API_KEY || "").trim();
+const PANEL_PASSWORD = (process.env.PANEL_PASSWORD || "").trim();
 
 const mcpServers = new Map();
 const mcpToolRegistry = new Map();
@@ -38,13 +45,19 @@ function sendOpenAIError(response, statusCode, message, type = "invalid_request_
   });
 }
 
-function isAuthorized(request) {
+function isProxyAuthorized(request) {
   if (!PROXY_API_KEY) return true;
   const authorization = request.headers.authorization || "";
   const token = authorization.startsWith("Bearer ")
     ? authorization.slice(7).trim()
     : authorization.trim();
   return token === PROXY_API_KEY;
+}
+
+function isPanelAuthorized(request) {
+  if (!PANEL_PASSWORD) return true;
+  const token = (request.headers["x-panel-password"] || "").trim();
+  return token === PANEL_PASSWORD;
 }
 
 function readRequestBody(request) {
@@ -598,282 +611,6 @@ async function runAgent(requestBody, clientResponse) {
   throw new Error("工具调用轮数达到上限。");
 }
 
-function renderHtmlDashboard() {
-  return `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>MCP Agent 控制台</title>
-  <style>
-    :root {
-      --bg: #0b0f19;
-      --card-bg: #151c2e;
-      --card-border: #232f48;
-      --text-main: #f8fafc;
-      --text-muted: #94a3b8;
-      --primary: #38bdf8;
-      --primary-hover: #0ea5e9;
-      --accent: #10b981;
-      --danger: #ef4444;
-      --input-bg: #0b0f19;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", sans-serif;
-      background: var(--bg);
-      color: var(--text-main);
-      line-height: 1.5;
-      padding: 24px 16px;
-    }
-    .container { max-width: 1000px; margin: 0 auto; }
-    header { margin-bottom: 24px; border-bottom: 1px solid var(--card-border); padding-bottom: 16px; }
-    h1 { font-size: 24px; font-weight: 700; color: #fff; margin-bottom: 6px; }
-    .subtitle { color: var(--text-muted); font-size: 14px; }
-    .grid { display: grid; grid-template-columns: 1fr; gap: 20px; }
-    @media (min-width: 768px) { .grid-2 { grid-template-columns: 1fr 1fr; } }
-    .card {
-      background: var(--card-bg);
-      border: 1px solid var(--card-border);
-      border-radius: 10px;
-      padding: 20px;
-    }
-    .card-title { font-size: 16px; font-weight: 600; margin-bottom: 14px; display: flex; align-items: center; justify-content: space-between; }
-    .badge {
-      display: inline-block;
-      font-size: 11px;
-      font-weight: 600;
-      padding: 2px 8px;
-      border-radius: 9999px;
-      background: #0284c7;
-      color: #fff;
-    }
-    .badge-green { background: #059669; }
-    .param-box { background: var(--input-bg); border-radius: 6px; padding: 12px; font-family: monospace; font-size: 13px; margin-bottom: 12px; word-break: break-all; }
-    .param-label { color: var(--text-muted); font-size: 12px; margin-bottom: 4px; }
-    .input-group { margin-bottom: 14px; }
-    .input-group label { display: block; font-size: 13px; color: var(--text-muted); margin-bottom: 6px; }
-    .input-group input, .input-group textarea, .input-group select {
-      width: 100%;
-      background: var(--input-bg);
-      border: 1px solid var(--card-border);
-      border-radius: 6px;
-      padding: 8px 12px;
-      color: #fff;
-      font-size: 14px;
-      outline: none;
-    }
-    .input-group input:focus, .input-group textarea:focus { border-color: var(--primary); }
-    button.btn {
-      background: var(--primary);
-      color: #0b0f19;
-      border: none;
-      font-weight: 600;
-      padding: 9px 16px;
-      border-radius: 6px;
-      cursor: pointer;
-      font-size: 14px;
-      transition: background 0.2s;
-    }
-    button.btn:hover { background: var(--primary-hover); }
-    button.btn-danger { background: var(--danger); color: #fff; }
-    button.btn-sm { padding: 4px 8px; font-size: 12px; }
-    .server-item {
-      background: var(--input-bg);
-      border: 1px solid var(--card-border);
-      border-radius: 8px;
-      padding: 14px;
-      margin-bottom: 12px;
-    }
-    .server-item-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
-    .tool-tag {
-      display: inline-block;
-      background: #232f48;
-      font-size: 12px;
-      padding: 2px 6px;
-      border-radius: 4px;
-      margin: 2px 4px 2px 0;
-      font-family: monospace;
-      color: #e2e8f0;
-    }
-    pre { background: var(--input-bg); padding: 10px; border-radius: 6px; font-size: 12px; overflow-x: auto; color: #38bdf8; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <header>
-      <h1>MCP Agent 通用代理控制台</h1>
-      <div class="subtitle">专用于将原生 MCP 服务转换并接入 Chatbox / OpenAI 客户端</div>
-    </header>
-
-    <div class="grid grid-2" style="margin-bottom: 20px;">
-      <div class="card">
-        <div class="card-title">Chatbox 接入设置 <span class="badge badge-green">已就绪</span></div>
-        <div class="param-label">API 域名 (Base URL)</div>
-        <div class="param-box" id="proxy-url">正在加载...</div>
-        <div class="param-label">模型 (Model)</div>
-        <div class="param-box">任意模型（由上游 CLIProxyAPI 提供）</div>
-        <p style="font-size: 13px; color: var(--text-muted);">Chatbox 连接此地址后，只要对话中提及已连接 MCP 相关的需求，大模型将自动触发工具调用。</p>
-      </div>
-
-      <div class="card">
-        <div class="card-title">手动连接新的 MCP 服务</div>
-        <div class="input-group">
-          <label>服务名称（标识前缀）</label>
-          <input id="mcp-name" placeholder="例如：Cloudflare 或 GitHub" value="CF">
-        </div>
-        <div class="input-group">
-          <label>MCP 服务地址 (SSE / HTTP Endpoint)</label>
-          <input id="mcp-url" placeholder="https://your-mcp-server.com/sse">
-        </div>
-        <div class="input-group">
-          <label>认证令牌 (Token / Key，可选)</label>
-          <input id="mcp-token" type="password" placeholder="若无需认证可留空">
-        </div>
-        <button class="btn" id="connect-btn" onclick="handleConnectMcp()">连接并提取工具</button>
-        <span id="connect-status" style="margin-left: 10px; font-size: 13px;"></span>
-      </div>
-    </div>
-
-    <div class="card" style="margin-bottom: 20px;">
-      <div class="card-title">已连接的 MCP 服务列表 <span class="badge" id="mcp-count">0</span></div>
-      <div id="mcp-list"><div style="color: var(--text-muted); font-size: 13px;">尚未连接任何 MCP 服务，请在上方输入地址添加。</div></div>
-    </div>
-
-    <div class="card">
-      <div class="card-title">已注册工具在线测试</div>
-      <div class="grid grid-2">
-        <div>
-          <div class="input-group">
-            <label>选择已注册工具</label>
-            <select id="tool-select"></select>
-          </div>
-          <div class="input-group">
-            <label>入参 (JSON 格式)</label>
-            <textarea id="tool-args" rows="6">{}</textarea>
-          </div>
-          <button class="btn" onclick="handleExecuteTest()">手动运行工具</button>
-        </div>
-        <div>
-          <label style="font-size: 13px; color: var(--text-muted); display: block; margin-bottom: 6px;">返回结果</label>
-          <pre id="tool-result">等待执行...</pre>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <script>
-    document.getElementById("proxy-url").innerText = window.location.origin + "/v1";
-
-    async function loadServers() {
-      try {
-        const res = await fetch("/api/mcp/servers");
-        const data = await res.json();
-        const listEl = document.getElementById("mcp-list");
-        document.getElementById("mcp-count").innerText = data.servers.length;
-
-        if (data.servers.length === 0) {
-          listEl.innerHTML = '<div style="color: var(--text-muted); font-size: 13px;">尚未连接任何 MCP 服务，请在上方输入地址添加。</div>';
-        } else {
-          listEl.innerHTML = data.servers.map(s => `
-            <div class="server-item">
-              <div class="server-item-header">
-                <div><strong>${s.name}</strong> <span class="badge badge-green">${s.toolCount} 个工具</span></div>
-                <button class="btn btn-danger btn-sm" onclick="handleDeleteServer('${s.id}')">断开</button>
-              </div>
-              <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 8px;">地址: ${s.url}</div>
-              <div>
-                ${s.tools.map(t => `<span class="tool-tag" title="${t.description || ''}">${t.key}</span>`).join('')}
-              </div>
-            </div>
-          `).join('');
-        }
-
-        const sel = document.getElementById("tool-select");
-        if (data.allTools.length === 0) {
-          sel.innerHTML = '<option value="">暂无可用工具</option>';
-        } else {
-          sel.innerHTML = data.allTools.map(t => `<option value="${t.name}">${t.name}</option>`).join('');
-        }
-      } catch (err) {
-        console.error(err);
-      }
-    }
-
-    async function handleConnectMcp() {
-      const name = document.getElementById("mcp-name").value.trim();
-      const url = document.getElementById("mcp-url").value.trim();
-      const token = document.getElementById("mcp-token").value.trim();
-      const statusEl = document.getElementById("connect-status");
-
-      if (!name || !url) {
-        statusEl.innerText = "名称与 URL 均为必填项。";
-        statusEl.style.color = "#ef4444";
-        return;
-      }
-
-      statusEl.innerText = "正在连接并读取工具...";
-      statusEl.style.color = "#38bdf8";
-
-      try {
-        const res = await fetch("/api/mcp/connect", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name, url, token })
-        });
-        const result = await res.json();
-        if (!res.ok) {
-          throw new Error(result.error || "连接失败");
-        }
-        statusEl.innerText = `成功载入 ${result.toolCount} 个工具！`;
-        statusEl.style.color = "#10b981";
-        document.getElementById("mcp-url").value = "";
-        document.getElementById("mcp-token").value = "";
-        loadServers();
-      } catch (err) {
-        statusEl.innerText = err.message;
-        statusEl.style.color = "#ef4444";
-      }
-    }
-
-    async function handleDeleteServer(id) {
-      if (!confirm("确认移除该 MCP 连接？")) return;
-      await fetch('/api/mcp/servers/' + id, { method: "DELETE" });
-      loadServers();
-    }
-
-    async function handleExecuteTest() {
-      const tool = document.getElementById("tool-select").value;
-      const resBox = document.getElementById("tool-result");
-      if (!tool) return;
-      let args = {};
-      try {
-        args = JSON.parse(document.getElementById("tool-args").value || "{}");
-      } catch {
-        resBox.innerText = "参数不是合法的 JSON。";
-        return;
-      }
-
-      resBox.innerText = "正在调用工具...";
-      try {
-        const res = await fetch("/api/mcp/test-tool", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ tool, args })
-        });
-        const result = await res.json();
-        resBox.innerText = JSON.stringify(result, null, 2);
-      } catch (err) {
-        resBox.innerText = "调用失败：" + err.message;
-      }
-    }
-
-    loadServers();
-  </script>
-</body>
-</html>`;
-}
-
 const server = http.createServer(async (request, response) => {
   try {
     if (request.method === "OPTIONS") {
@@ -885,8 +622,10 @@ const server = http.createServer(async (request, response) => {
 
     if (request.method === "GET" && request.url === "/") {
       setCorsHeaders(response);
+      const htmlPath = path.join(__dirname, "dashboard.html");
+      const htmlContent = fs.readFileSync(htmlPath, "utf8");
       response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      response.end(renderHtmlDashboard());
+      response.end(htmlContent);
       return;
     }
 
@@ -895,39 +634,51 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    if (request.method === "GET" && request.url === "/api/mcp/servers") {
-      const allTools = getAllTools().map((t) => ({ name: t.function.name, description: t.function.description }));
-      sendJson(response, 200, {
-        servers: Array.from(mcpServers.values()),
-        allTools
-      });
+    if (request.method === "GET" && request.url === "/api/mcp/auth-status") {
+      sendJson(response, 200, { required: Boolean(PANEL_PASSWORD) });
       return;
     }
 
-    if (request.method === "POST" && request.url === "/api/mcp/connect") {
-      const body = await readRequestBody(request);
-      const serverInfo = await connectToMcpServer(body);
-      sendJson(response, 200, serverInfo);
-      return;
+    if (request.url.startsWith("/api/mcp/")) {
+      if (!isPanelAuthorized(request)) {
+        sendJson(response, 401, { error: "控制台密码验证失败，请重新登录。" });
+        return;
+      }
+
+      if (request.method === "GET" && request.url === "/api/mcp/servers") {
+        const allTools = getAllTools().map((t) => ({ name: t.function.name, description: t.function.description }));
+        sendJson(response, 200, {
+          servers: Array.from(mcpServers.values()),
+          allTools
+        });
+        return;
+      }
+
+      if (request.method === "POST" && request.url === "/api/mcp/connect") {
+        const body = await readRequestBody(request);
+        const serverInfo = await connectToMcpServer(body);
+        sendJson(response, 200, serverInfo);
+        return;
+      }
+
+      if (request.method === "DELETE" && request.url.startsWith("/api/mcp/servers/")) {
+        const id = request.url.replace("/api/mcp/servers/", "");
+        const ok = removeMcpServer(id);
+        sendJson(response, 200, { success: ok });
+        return;
+      }
+
+      if (request.method === "POST" && request.url === "/api/mcp/test-tool") {
+        const body = await readRequestBody(request);
+        const toolName = body.tool;
+        const toolArgs = body.args || {};
+        const result = await callMcpTool(toolName, toolArgs);
+        sendJson(response, 200, result);
+        return;
+      }
     }
 
-    if (request.method === "DELETE" && request.url.startsWith("/api/mcp/servers/")) {
-      const id = request.url.replace("/api/mcp/servers/", "");
-      const ok = removeMcpServer(id);
-      sendJson(response, 200, { success: ok });
-      return;
-    }
-
-    if (request.method === "POST" && request.url === "/api/mcp/test-tool") {
-      const body = await readRequestBody(request);
-      const toolName = body.tool;
-      const toolArgs = body.args || {};
-      const result = await callMcpTool(toolName, toolArgs);
-      sendJson(response, 200, result);
-      return;
-    }
-
-    if (!isAuthorized(request)) {
+    if (!isProxyAuthorized(request)) {
       sendOpenAIError(response, 401, "API Key 无效，请检查 Chatbox 填写的密钥是否与 Render 环境变量 PROXY_API_KEY 一致。", "authentication_error");
       return;
     }
