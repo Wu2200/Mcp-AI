@@ -546,21 +546,10 @@ async function runAgent(requestBody, clientResponse) {
   const rawMessages = requestBody.messages;
   const toolPrompt = buildToolPrompt();
 
-  const clientTools = Array.isArray(requestBody.tools) ? [...requestBody.tools] : [];
-  const modelName = (requestBody.model || "").toLowerCase();
-
-  // 兼容网关网络搜索配置（如 NewAPI / OneAPI / CLIProxy Payload 规则）
-  const hasWebSearch = clientTools.some(
-    (t) => t.type === "web_search" || t.google_search || t.function?.name === "web_search"
-  );
-  if (!hasWebSearch) {
-    if (modelName.startsWith("gpt") || modelName.includes("openai") || modelName.startsWith("o1") || modelName.startsWith("o3")) {
-      clientTools.push({ type: "web_search" });
-    } else if (modelName.includes("gemini")) {
-      clientTools.push({ google_search: {} });
-    }
-  }
-
+  // 严格遵循标准 OpenAI Function Calling 规范：只挂载合法 function 工具，不硬塞厂商非标参数
+  const clientTools = Array.isArray(requestBody.tools)
+    ? requestBody.tools.filter((t) => t && t.type === "function")
+    : [];
   const mcpTools = getAllTools();
   const tools = [...clientTools, ...mcpTools];
 
@@ -600,18 +589,6 @@ async function runAgent(requestBody, clientResponse) {
     if (tools.length > 0) {
       payload.tools = tools;
       payload.tool_choice = "auto";
-
-      // 满足 Gemini 在混合使用内置工具 (google_search) 和 Function calling 时的强制规范
-      if (modelName.includes("gemini") || tools.some((t) => t.google_search)) {
-        payload.tool_config = {
-          ...(payload.tool_config || {}),
-          include_server_side_tool_invocations: true
-        };
-        payload.toolConfig = {
-          ...(payload.toolConfig || {}),
-          includeServerSideToolInvocations: true
-        };
-      }
     }
 
     const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
