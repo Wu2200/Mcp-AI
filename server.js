@@ -287,7 +287,7 @@ function readRequestBody(request) {
     let size = 0;
     request.on("data", (chunk) => {
       size += chunk.length;
-      if (size > 20 * 1024 * 1024) {
+      if (size > 50 * 1024 * 1024) {
         reject(new Error("请求过大"));
         request.destroy();
         return;
@@ -436,16 +436,7 @@ async function connectToMcpServer({ name, url, token }) {
   return serverInfo;
 }
 
-// 保护上下文不被单次海量输出撑爆（超过 15,000 字符智能裁剪保留头尾）
-function pruneToolResult(rawText) {
-  if (typeof rawText !== "string") return rawText;
-  const MAX_LEN = 15000;
-  if (rawText.length <= MAX_LEN) return rawText;
-  const head = rawText.slice(0, 8000);
-  const tail = rawText.slice(-4000);
-  return `${head}\n\n...[内容过长，中间部分已自动修剪，保留前 8000 字符与后 4000 字符]...\n\n${tail}`;
-}
-
+// 真实返回工具调用结果，严禁暴力截断大文件或丢弃中间内容
 async function callMcpTool(toolKey, args) {
   let info = mcpToolRegistry.get(toolKey);
   if (!info) {
@@ -467,31 +458,28 @@ async function callMcpTool(toolKey, args) {
       method: "tools/call",
       params: { name: info.rawName, arguments: args }
     }),
-    signal: AbortSignal.timeout(60000)
+    signal: AbortSignal.timeout(120000)
   });
 
   if (!res.ok) {
     const txt = await res.text();
-    throw new Error(`执行失败 (${res.status}): ${txt.slice(0, 300)}`);
+    throw new Error(`执行失败 (${res.status}): ${txt.slice(0, 500)}`);
   }
 
   const data = await parseMcpResponse(res);
   if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
   const rawResult = data.result ?? data;
-  let finalContent = "";
+
   if (rawResult && Array.isArray(rawResult.content)) {
     const textPieces = rawResult.content
       .filter((item) => item.type === "text" && item.text)
       .map((item) => item.text);
     if (textPieces.length > 0) {
-      finalContent = textPieces.join("\n\n");
+      return textPieces.join("\n\n");
     }
   }
-  if (!finalContent) {
-    finalContent = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
-  }
 
-  return pruneToolResult(finalContent);
+  return typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
 }
 
 function getAllTools() {
@@ -588,7 +576,7 @@ function isModelEnabledForMcp(modelName) {
 function buildHostEnvironmentSystemMessage() {
   const now = new Date();
   const beijingTime = now.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
-  return `[System Environment] Current Time (Asia/Shanghai): ${beijingTime}.`;
+  return `[System Environment] Current Time: ${beijingTime} (UTC+8).`;
 }
 
 async function runAgent(requestBody, clientResponse) {
@@ -633,7 +621,7 @@ async function runAgent(requestBody, clientResponse) {
     const payload = {
       ...requestBody,
       messages,
-      stream: true
+      stream: isStream
     };
 
     if (tools.length > 0) {
@@ -673,6 +661,53 @@ async function runAgent(requestBody, clientResponse) {
         return;
       }
       throw new Error(`上游接口返回错误 (${upstreamResponse.status})：${err.slice(0, 500)}`);
+    }
+
+    if (!isStream) {
+      const json = await upstreamResponse.json();
+      const message = json.choices?.[0]?.message;
+      const toolCalls = message?.tool_calls || [];
+      const mcpCalls = toolCalls.filter((tc) => {
+        if (!tc || !tc.function?.name) return false;
+        const name = tc.function.name;
+        if (mcpToolRegistry.has(name)) return true;
+        for (const [k, v] of mcpToolRegistry.entries()) {
+          if (k.endsWith(name) || name.endsWith(v.rawName)) return true;
+        }
+        return false;
+      });
+
+      if (mcpCalls.length === 0) {
+        sendJson(clientResponse, 200, json);
+        return;
+      }
+
+      messages.push(message);
+
+      for (const tc of mcpCalls) {
+        let toolInfo = mcpToolRegistry.get(tc.function.name);
+        if (!toolInfo) {
+          for (const [k, v] of mcpToolRegistry.entries()) {
+            if (k.endsWith(tc.function.name) || tc.function.name.endsWith(v.rawName)) {
+              toolInfo = v;
+              break;
+            }
+          }
+        }
+        const args = toolArguments(tc);
+        let result;
+        try {
+          result = await callMcpTool(tc.function.name, args);
+        } catch (err) {
+          result = JSON.stringify({ error: err.message });
+        }
+        messages.push({
+          role: "tool",
+          tool_call_id: tc.id,
+          content: typeof result === "string" ? result : JSON.stringify(result)
+        });
+      }
+      continue;
     }
 
     const reader = upstreamResponse.body.getReader();
@@ -715,13 +750,11 @@ async function runAgent(requestBody, clientResponse) {
             }
           }
 
-          // 核心修复：普通文本/长代码输出必须实时写入客户端，绝不在内存憋着，彻底避免 Chatbox 超时截断！
+          // 核心修复：文字与超长代码实时直推客户端，绝不积压，无任何长度限制
           if (delta?.content) {
             assistantContent += delta.content;
-            if (isStream) {
-              clientResponse.write(`${line}\n\n`);
-            }
-          } else if (delta?.reasoning_content && isStream) {
+            clientResponse.write(`${line}\n\n`);
+          } else if (delta?.reasoning_content) {
             clientResponse.write(`${line}\n\n`);
           }
         } catch {}
@@ -737,31 +770,12 @@ async function runAgent(requestBody, clientResponse) {
       return false;
     });
 
-    // 模型输出完毕且没有发起任何工具调用，直接优雅结束流式传输，零截断
     if (mcpCalls.length === 0) {
-      if (isStream) {
-        clientResponse.write("data: [DONE]\n\n");
-        clientResponse.end();
-        return;
-      }
-
-      sendJson(clientResponse, 200, {
-        id: `chatcmpl-${crypto.randomUUID()}`,
-        object: "chat.completion",
-        created: Math.floor(Date.now() / 1000),
-        model: requestBody.model || "default",
-        choices: [
-          {
-            index: 0,
-            message: { role: "assistant", content: assistantContent },
-            finish_reason: "stop"
-          }
-        ]
-      });
+      clientResponse.write("data: [DONE]\n\n");
+      clientResponse.end();
       return;
     }
 
-    // 只有在命中真实工具调用时，才记录助手消息并执行工具
     messages.push({
       role: "assistant",
       content: assistantContent || null,
@@ -787,13 +801,11 @@ async function runAgent(requestBody, clientResponse) {
       const rawAction = toolInfo?.rawName || tc.name;
       const args = toolArguments({ function: { arguments: tc.arguments } });
 
-      if (isStream) {
-        sendReasoningChunk(
-          clientResponse,
-          `\n> 正在执行 ${displayName} [${rawAction}]...\n`,
-          requestBody.model
-        );
-      }
+      sendReasoningChunk(
+        clientResponse,
+        `\n> 正在执行 ${displayName} [${rawAction}]...\n`,
+        requestBody.model
+      );
 
       let result;
       if (args === null) {
@@ -806,13 +818,11 @@ async function runAgent(requestBody, clientResponse) {
         }
       }
 
-      if (isStream) {
-        sendReasoningChunk(
-          clientResponse,
-          `> ${displayName} [${rawAction}] 完成\n\n`,
-          requestBody.model
-        );
-      }
+      sendReasoningChunk(
+        clientResponse,
+        `> ${displayName} [${rawAction}] 完成\n\n`,
+        requestBody.model
+      );
 
       messages.push({
         role: "tool",
