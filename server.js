@@ -434,8 +434,12 @@ function buildToolPrompt() {
   const serverNames = activeServers.map((s) => `${s.name} (${s.toolCount} 个工具)`).join("、");
   return [
     `# 远程 MCP 工具环境`,
-    `当前已启动连接的 MCP 服务：${serverNames}。`,
-    `你已具备调用上述外部工具的能力。当用户的请求需要查询数据或执行操作时，必须优先调用匹配的 MCP 工具，根据真实执行结果组织回答。`
+    `当前已连接的 MCP 服务：${serverNames}。`,
+    `系统已将外部工具列表挂载至本次对话中。`,
+    `【强制执行规则】`,
+    `1. 当用户提出的任何请求需要查询账号、数据、配置、仓库、服务信息或执行变更操作时，你必须主动判断并自主发起工具调用（tool_calls），绝不可在未调用工具的情况下直接拒绝用户或回答“我无法直接访问您的账号”。`,
+    `2. 识别用户的意图时必须包容各种简写、代称（例如：cf = Cloudflare、gh = GitHub、k8s = Kubernetes 等）。`,
+    `3. 只要存在与用户请求意图相关的工具，第一步必须调用该工具获取真实数据，严禁凭空臆造结果。`
   ].join("\n");
 }
 
@@ -473,40 +477,6 @@ function sendReasoningChunk(clientResponse, text, model = "default") {
     ]
   };
   clientResponse.write(`data: ${JSON.stringify(chunk)}\n\n`);
-}
-
-function isMcpContext(requestBody) {
-  if (mcpToolRegistry.size === 0) return false;
-  const rawMessages = requestBody.messages || [];
-  if (!Array.isArray(rawMessages) || rawMessages.length === 0) return false;
-
-  if (Array.isArray(requestBody.tools) && requestBody.tools.length > 0) return true;
-
-  const combinedText = rawMessages
-    .map((m) => {
-      if (typeof m.content === "string") return m.content;
-      if (Array.isArray(m.content)) {
-        return m.content
-          .map((c) => (typeof c === "string" ? c : c?.text || ""))
-          .join(" ");
-      }
-      return "";
-    })
-    .join("\n");
-
-  const serverNames = Array.from(mcpServers.values())
-    .filter((s) => s.status === "active")
-    .map((s) => s.name.replace(/[^a-zA-Z0-9_\u4e00-\u9fa5]/g, ""))
-    .filter(Boolean);
-
-  const keywords = [
-    "mcp", "github", "git\\b", "repo", "代码库", "仓库", "commit", "pr\\b", "pull request",
-    "分支", "branch", "提取代码", "读取文件", "查看文件", "修改文件", "创建文件", "新建文件", "删除文件",
-    ...serverNames
-  ];
-
-  const pattern = new RegExp(`(${keywords.join("|")})`, "i");
-  return pattern.test(combinedText);
 }
 
 async function passThrough(requestBody, clientResponse) {
@@ -1020,7 +990,7 @@ const server = http.createServer(async (request, response) => {
       }
 
       const body = await readRequestBody(request);
-      if (isMcpContext(body)) {
+      if (mcpToolRegistry.size > 0) {
         await runAgent(body, response);
       } else {
         await passThrough(body, response);
