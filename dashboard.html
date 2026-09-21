@@ -141,7 +141,7 @@
       <div class="grid grid-2">
         <div>
           <div class="param-label">API 域名 (Base URL)</div>
-          <div class="param-box" id="proxy-url">正在加载...</div>
+          <div class="param-box" id="proxy-url"></div>
         </div>
         <div>
           <div class="param-label">模型 (Model)</div>
@@ -215,6 +215,8 @@
         } else {
           loadServers();
         }
+      }).catch(() => {
+        loadServers();
       });
     }
 
