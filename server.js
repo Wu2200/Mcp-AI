@@ -11,10 +11,166 @@ const PORT = Number(process.env.PORT || 10000);
 const UPSTREAM_BASE_URL = (process.env.UPSTREAM_BASE_URL || "").trim().replace(/\/+$/, "");
 const UPSTREAM_API_KEY = (process.env.UPSTREAM_API_KEY || "").trim();
 const PROXY_API_KEY = (process.env.PROXY_API_KEY || "").trim();
+const PANEL_PASSWORD = (process.env.PANEL_PASSWORD || "").trim();
+const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
 
 const DATA_FILE = path.join(__dirname, "mcp-config.json");
 const mcpServers = new Map();
 const mcpToolRegistry = new Map();
+
+let pgPool = null;
+
+async function initDatabase() {
+  if (!DATABASE_URL) return;
+  try {
+    const { default: pg } = await import("pg");
+    pgPool = new pg.Pool({
+      connectionString: DATABASE_URL,
+      ssl: { rejectUnauthorized: false }
+    });
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS mcp_servers (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        url TEXT NOT NULL,
+        raw_token TEXT,
+        post_endpoint TEXT,
+        headers JSONB,
+        tool_count INT,
+        tools JSONB,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+  } catch (err) {
+    pgPool = null;
+  }
+}
+
+async function saveConfigToStorage(serverItem) {
+  if (pgPool) {
+    try {
+      await pgPool.query(
+        `INSERT INTO mcp_servers (id, name, url, raw_token, post_endpoint, headers, tool_count, tools, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)
+         ON CONFLICT (id) DO UPDATE SET
+           name = EXCLUDED.name,
+           url = EXCLUDED.url,
+           raw_token = EXCLUDED.raw_token,
+           post_endpoint = EXCLUDED.post_endpoint,
+           headers = EXCLUDED.headers,
+           tool_count = EXCLUDED.tool_count,
+           tools = EXCLUDED.tools,
+           updated_at = CURRENT_TIMESTAMP`,
+        [
+          serverItem.id,
+          serverItem.name,
+          serverItem.url,
+          serverItem.rawToken,
+          serverItem.postEndpoint,
+          JSON.stringify(serverItem.headers || {}),
+          serverItem.toolCount,
+          JSON.stringify(serverItem.tools || [])
+        ]
+      );
+    } catch {}
+  }
+
+  try {
+    const data = Array.from(mcpServers.values()).map((s) => ({
+      id: s.id,
+      name: s.name,
+      url: s.url,
+      token: s.rawToken,
+      postEndpoint: s.postEndpoint,
+      headers: s.headers,
+      tools: s.tools
+    }));
+    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf8");
+  } catch {}
+}
+
+async function deleteConfigFromStorage(id) {
+  if (pgPool) {
+    try {
+      await pgPool.query("DELETE FROM mcp_servers WHERE id = $1", [id]);
+    } catch {}
+  }
+  try {
+    const data = Array.from(mcpServers.values()).map((s) => ({
+      id: s.id,
+      name: s.name,
+      url: s.url,
+      token: s.rawToken,
+      postEndpoint: s.postEndpoint,
+      headers: s.headers,
+      tools: s.tools
+    }));
+    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf8");
+  } catch {}
+}
+
+async function loadConfigFromStorage() {
+  if (pgPool) {
+    try {
+      const res = await pgPool.query("SELECT * FROM mcp_servers ORDER BY updated_at ASC");
+      if (res.rows && res.rows.length > 0) {
+        for (const row of res.rows) {
+          const tools = typeof row.tools === "string" ? JSON.parse(row.tools) : (row.tools || []);
+          const headers = typeof row.headers === "string" ? JSON.parse(row.headers) : (row.headers || {});
+          mcpServers.set(row.id, {
+            id: row.id,
+            name: row.name,
+            url: row.url,
+            rawToken: row.raw_token,
+            postEndpoint: row.post_endpoint,
+            headers,
+            toolCount: tools.length,
+            tools
+          });
+
+          for (const t of tools) {
+            mcpToolRegistry.set(t.key, {
+              serverId: row.id,
+              serverName: row.name,
+              rawName: t.rawName,
+              postEndpoint: row.post_endpoint,
+              headers
+            });
+          }
+        }
+        return;
+      }
+    } catch {}
+  }
+
+  if (!fs.existsSync(DATA_FILE)) return;
+  try {
+    const raw = fs.readFileSync(DATA_FILE, "utf8");
+    const list = JSON.parse(raw);
+    for (const item of list) {
+      mcpServers.set(item.id, {
+        id: item.id,
+        name: item.name,
+        url: item.url,
+        rawToken: item.token,
+        postEndpoint: item.postEndpoint,
+        headers: item.headers,
+        toolCount: item.tools.length,
+        tools: item.tools
+      });
+
+      for (const t of item.tools) {
+        mcpToolRegistry.set(t.key, {
+          serverId: item.id,
+          serverName: item.name,
+          rawName: t.rawName,
+          postEndpoint: item.postEndpoint,
+          headers: item.headers
+        });
+      }
+    }
+  } catch {}
+}
 
 function setCorsHeaders(response) {
   response.setHeader("Access-Control-Allow-Origin", "*");
@@ -42,6 +198,12 @@ function isProxyAuthorized(request) {
     ? authorization.slice(7).trim()
     : authorization.trim();
   return token === PROXY_API_KEY;
+}
+
+function isPanelAuthorized(request) {
+  if (!PANEL_PASSWORD) return true;
+  const pass = (request.headers["x-panel-password"] || "").trim();
+  return pass === PANEL_PASSWORD;
 }
 
 function readRequestBody(request) {
@@ -79,51 +241,6 @@ function cleanPayload(obj) {
     delete obj.generation_config.thinking_config.includeThought;
     delete obj.generation_config.thinking_config.includeThough;
   }
-}
-
-function saveConfigToDisk() {
-  try {
-    const data = Array.from(mcpServers.values()).map((s) => ({
-      id: s.id,
-      name: s.name,
-      url: s.url,
-      token: s.rawToken,
-      postEndpoint: s.postEndpoint,
-      headers: s.headers,
-      tools: s.tools
-    }));
-    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf8");
-  } catch {}
-}
-
-function loadConfigFromDisk() {
-  if (!fs.existsSync(DATA_FILE)) return;
-  try {
-    const raw = fs.readFileSync(DATA_FILE, "utf8");
-    const list = JSON.parse(raw);
-    for (const item of list) {
-      mcpServers.set(item.id, {
-        id: item.id,
-        name: item.name,
-        url: item.url,
-        rawToken: item.token,
-        postEndpoint: item.postEndpoint,
-        headers: item.headers,
-        toolCount: item.tools.length,
-        tools: item.tools
-      });
-
-      for (const t of item.tools) {
-        mcpToolRegistry.set(t.key, {
-          serverId: item.id,
-          serverName: item.name,
-          rawName: t.rawName,
-          postEndpoint: item.postEndpoint,
-          headers: item.headers
-        });
-      }
-    }
-  } catch {}
 }
 
 async function parseMcpResponse(res) {
@@ -243,7 +360,7 @@ async function connectToMcpServer({ name, url, token }) {
   };
 
   mcpServers.set(serverId, serverInfo);
-  saveConfigToDisk();
+  await saveConfigToStorage(serverInfo);
   return serverInfo;
 }
 
@@ -609,7 +726,8 @@ async function runAgent(requestBody, clientResponse) {
   throw new Error("工具调用轮数达到上限");
 }
 
-loadConfigFromDisk();
+await initDatabase();
+await loadConfigFromStorage();
 
 const server = http.createServer(async (request, response) => {
   try {
@@ -634,29 +752,51 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    if (request.method === "GET" && request.url === "/api/mcp/servers") {
-      sendJson(response, 200, { servers: Array.from(mcpServers.values()) });
+    if (request.method === "GET" && request.url === "/api/panel/status") {
+      sendJson(response, 200, { requiresPassword: Boolean(PANEL_PASSWORD) });
       return;
     }
 
-    if (request.method === "POST" && request.url === "/api/mcp/connect") {
+    if (request.method === "POST" && request.url === "/api/panel/verify") {
       const body = await readRequestBody(request);
-      const serverInfo = await connectToMcpServer(body);
-      sendJson(response, 200, { toolCount: serverInfo.toolCount });
+      if (!PANEL_PASSWORD || body.password === PANEL_PASSWORD) {
+        sendJson(response, 200, { success: true });
+      } else {
+        sendJson(response, 401, { error: "密码错误" });
+      }
       return;
     }
 
-    if (request.method === "DELETE" && request.url.startsWith("/api/mcp/servers/")) {
-      const id = request.url.replace("/api/mcp/servers/", "");
-      mcpServers.delete(id);
-      for (const [key, val] of mcpToolRegistry.entries()) {
-        if (val.serverId === id) {
-          mcpToolRegistry.delete(key);
-        }
+    if (request.url.startsWith("/api/mcp/")) {
+      if (!isPanelAuthorized(request)) {
+        sendJson(response, 401, { error: "控制台未授权，请输入管理密码" });
+        return;
       }
-      saveConfigToDisk();
-      sendJson(response, 200, { success: true });
-      return;
+
+      if (request.method === "GET" && request.url === "/api/mcp/servers") {
+        sendJson(response, 200, { servers: Array.from(mcpServers.values()) });
+        return;
+      }
+
+      if (request.method === "POST" && request.url === "/api/mcp/connect") {
+        const body = await readRequestBody(request);
+        const serverInfo = await connectToMcpServer(body);
+        sendJson(response, 200, { toolCount: serverInfo.toolCount });
+        return;
+      }
+
+      if (request.method === "DELETE" && request.url.startsWith("/api/mcp/servers/")) {
+        const id = request.url.replace("/api/mcp/servers/", "");
+        mcpServers.delete(id);
+        for (const [key, val] of mcpToolRegistry.entries()) {
+          if (val.serverId === id) {
+            mcpToolRegistry.delete(key);
+          }
+        }
+        await deleteConfigFromStorage(id);
+        sendJson(response, 200, { success: true });
+        return;
+      }
     }
 
     if (!isProxyAuthorized(request)) {
