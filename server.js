@@ -84,7 +84,19 @@ async function initDatabase() {
       ssl: { rejectUnauthorized: false }
     });
     await pgPool.query(`
-      CREATE TABLE IF NOT EXISTS mcp_servers (\n        id TEXT PRIMARY KEY,\n        name TEXT NOT NULL,\n        url TEXT NOT NULL,\n        raw_token TEXT,\n        status TEXT DEFAULT 'active',\n        post_endpoint TEXT,\n        headers JSONB,\n        tool_count INT,\n        tools JSONB,\n        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n      );\n    `);
+      CREATE TABLE IF NOT EXISTS mcp_servers (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        url TEXT NOT NULL,
+        raw_token TEXT,
+        status TEXT DEFAULT 'active',
+        post_endpoint TEXT,
+        headers JSONB,
+        tool_count INT,
+        tools JSONB,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
     try {
       await pgPool.query("ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active';");
     } catch {}
@@ -97,7 +109,18 @@ async function saveServerToStorage(serverItem) {
   if (pgPool) {
     try {
       await pgPool.query(
-        `INSERT INTO mcp_servers (id, name, url, raw_token, status, post_endpoint, headers, tool_count, tools, updated_at)\n         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)\n         ON CONFLICT (id) DO UPDATE SET\n           name = EXCLUDED.name,\n           url = EXCLUDED.url,\n           raw_token = EXCLUDED.raw_token,\n           status = EXCLUDED.status,\n           post_endpoint = EXCLUDED.post_endpoint,\n           headers = EXCLUDED.headers,\n           tool_count = EXCLUDED.tool_count,\n           tools = EXCLUDED.tools,\n           updated_at = CURRENT_TIMESTAMP`,
+        `INSERT INTO mcp_servers (id, name, url, raw_token, status, post_endpoint, headers, tool_count, tools, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)
+         ON CONFLICT (id) DO UPDATE SET
+           name = EXCLUDED.name,
+           url = EXCLUDED.url,
+           raw_token = EXCLUDED.raw_token,
+           status = EXCLUDED.status,
+           post_endpoint = EXCLUDED.post_endpoint,
+           headers = EXCLUDED.headers,
+           tool_count = EXCLUDED.tool_count,
+           tools = EXCLUDED.tools,
+           updated_at = CURRENT_TIMESTAMP`,
         [
           serverItem.id,
           serverItem.name,
@@ -280,6 +303,7 @@ function isMcpContext(requestBody) {
   const keywords = [
     "mcp", "github", "git\\b", "repo", "代码库", "仓库", "commit", "pr\\b", "pull request",
     "分支", "branch", "提取代码", "读取文件", "查看文件", "修改文件", "创建文件", "新建文件", "删除文件",
+    "提交", "推送", "push", "写入", "更新", "修改", "替换", "帮我修改", "帮我提交",
     "cloudflare", "cf\\b", "worker", "workers", "kv\\b", "d1\\b", "r2\\b", "dns", "domain", "域名",
     ...serverNames
   ];
@@ -458,7 +482,9 @@ function buildToolPrompt() {
     `【强制执行规则】`,
     `1. 当用户提出的任何请求需要查询账号、数据、配置、仓库、服务信息或执行变更操作时，你必须主动判断并自主发起工具调用（tool_calls），绝不可在未调用工具的情况下直接拒绝用户或回答“我无法直接访问您的账号”。`,
     `2. 识别用户的意图时必须包容各种简写、代称（例如：cf = Cloudflare、gh = GitHub、k8s = Kubernetes 等）。`,
-    `3. 只要存在与用户请求意图相关的工具，第一步必须调用该工具获取真实数据，严禁凭空臆造结果。`
+    `3. 只要存在与用户请求意图相关的工具，第一步必须调用该工具获取真实数据，严禁凭空臆造结果。`,
+    `4. 严禁假操作、假提交与虚构结果：凡涉及文件修改、创建、删除、代码提交（commit）、分支或PR操作等写入类请求，必须发起真实的工具调用。在未调用工具或工具未返回成功结果前，严禁编造 Commit SHA、链接或声称“已提交/已修改”。`,
+    `5. 工具执行若返回错误或失败，必须如实向用户说明失败详情，严禁隐瞒错误或将失败伪造成成功。`
   ].join("\n");
 }
 
@@ -715,22 +741,36 @@ async function runAgent(requestBody, clientResponse) {
       }
 
       let result;
+      let isError = false;
       if (!args) {
         result = { error: "工具参数不是有效 JSON" };
+        isError = true;
       } else {
         try {
           result = await callMcpTool(tc.name, args);
+          if (result && typeof result === "object" && (result.error || result.isError)) {
+            isError = true;
+          }
         } catch (err) {
+          isError = true;
           result = { error: err instanceof Error ? err.message : "执行工具失败" };
         }
       }
 
       if (isStream) {
-        sendReasoningChunk(
-          clientResponse,
-          `> ${serverDisplayName} ${actionName}完成\n\n`,
-          requestBody.model
-        );
+        if (isError) {
+          sendReasoningChunk(
+            clientResponse,
+            `> ${serverDisplayName} ${actionName}失败\n\n`,
+            requestBody.model
+          );
+        } else {
+          sendReasoningChunk(
+            clientResponse,
+            `> ${serverDisplayName} ${actionName}完成\n\n`,
+            requestBody.model
+          );
+        }
       }
 
       messages.push({
