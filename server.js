@@ -64,19 +64,7 @@ async function initDatabase() {
       ssl: { rejectUnauthorized: false }
     });
     await pgPool.query(`
-      CREATE TABLE IF NOT EXISTS mcp_servers (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        url TEXT NOT NULL,
-        raw_token TEXT,
-        status TEXT DEFAULT 'active',
-        post_endpoint TEXT,
-        headers JSONB,
-        tool_count INT,
-        tools JSONB,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
+      CREATE TABLE IF NOT EXISTS mcp_servers (\n        id TEXT PRIMARY KEY,\n        name TEXT NOT NULL,\n        url TEXT NOT NULL,\n        raw_token TEXT,\n        status TEXT DEFAULT 'active',\n        post_endpoint TEXT,\n        headers JSONB,\n        tool_count INT,\n        tools JSONB,\n        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n      );\n    `);
     try {
       await pgPool.query("ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active';");
     } catch {}
@@ -390,6 +378,7 @@ async function connectToMcpServer({ name, url, token }) {
 
     mcpToolRegistry.set(toolKey, {
       serverId,
+      serverName: name,
       rawName: t.name,
       postEndpoint: cleanUrl,
       headers
@@ -703,13 +692,14 @@ async function runAgent(requestBody, clientResponse) {
     });
 
     for (const tc of mcpCalls) {
+      const toolInfo = mcpToolRegistry.get(tc.name);
+      const serverDisplayName = toolInfo?.serverName || "MCP";
       const args = toolArguments({ function: { arguments: tc.arguments } });
-      const toolName = tc.name;
 
       if (isStream) {
         sendReasoningChunk(
           clientResponse,
-          `\n> 正在执行 MCP 工具：\`${toolName}\`\n\`\`\`json\n${JSON.stringify(args || {}, null, 2)}\n\`\`\`\n`,
+          `\n> 正在调用 ${serverDisplayName} 工具\n`,
           requestBody.model
         );
       }
@@ -726,11 +716,9 @@ async function runAgent(requestBody, clientResponse) {
       }
 
       if (isStream) {
-        const preview = JSON.stringify(result);
-        const brief = preview.length > 300 ? `${preview.slice(0, 300)}...` : preview;
         sendReasoningChunk(
           clientResponse,
-          `> \`${toolName}\` 执行完毕，结果：\n\`\`\`json\n${brief}\n\`\`\`\n\n`,
+          `> ${serverDisplayName} 工具执行完成\n\n`,
           requestBody.model
         );
       }
@@ -807,9 +795,9 @@ function getLoginHtml() {
   <div class="card">
     <h1>MCP 控制台认证</h1>
     <p>请输入后台管理密码以进入面板</p>
-    <input id="pwd" type="password" placeholder="输入管理密码" onkeydown="if(event.key==='Enter')login()">
-    <button onclick="login()">验证并进入</button>
-    <div id="err-msg"></div>
+    <input id=\"pwd\" type=\"password\" placeholder=\"输入管理密码\" onkeydown=\"if(event.key==='Enter')login()\">
+    <button onclick=\"login()\">验证并进入</button>
+    <div id=\"err-msg\"></div>
   </div>
   <script>
     async function login() {
