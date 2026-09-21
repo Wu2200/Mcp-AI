@@ -18,6 +18,41 @@ const DATA_FILE = path.join(__dirname, "mcp-config.json");
 const mcpServers = new Map();
 const mcpToolRegistry = new Map();
 
+const SESSION_SECRET = crypto.randomBytes(32).toString("hex");
+
+function generateSessionToken() {
+  const payload = `auth:${PANEL_PASSWORD}:${Date.now()}`;
+  const sig = crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("hex");
+  return Buffer.from(`${payload}:${sig}`).toString("base64url");
+}
+
+function verifySessionToken(token) {
+  if (!PANEL_PASSWORD) return true;
+  if (!token) return false;
+  try {
+    const raw = Buffer.from(token, "base64url").toString("utf8");
+    const parts = raw.split(":");
+    if (parts.length !== 4 || parts[0] !== "auth" || parts[1] !== PANEL_PASSWORD) return false;
+    const payload = `${parts[0]}:${parts[1]}:${parts[2]}`;
+    const sig = crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("hex");
+    return sig === parts[3];
+  } catch {
+    return false;
+  }
+}
+
+function parseCookies(request) {
+  const list = {};
+  const rc = request.headers.cookie;
+  if (rc) {
+    rc.split(";").forEach((cookie) => {
+      const parts = cookie.split("=");
+      list[parts.shift().trim()] = decodeURI(parts.join("="));
+    });
+  }
+  return list;
+}
+
 let pgPool = null;
 
 async function initDatabase() {
@@ -34,6 +69,7 @@ async function initDatabase() {
         name TEXT NOT NULL,
         url TEXT NOT NULL,
         raw_token TEXT,
+        status TEXT DEFAULT 'active',
         post_endpoint TEXT,
         headers JSONB,
         tool_count INT,
@@ -41,21 +77,25 @@ async function initDatabase() {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
-  } catch (err) {
+    try {
+      await pgPool.query("ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active';");
+    } catch {}
+  } catch {
     pgPool = null;
   }
 }
 
-async function saveConfigToStorage(serverItem) {
+async function saveServerToStorage(serverItem) {
   if (pgPool) {
     try {
       await pgPool.query(
-        `INSERT INTO mcp_servers (id, name, url, raw_token, post_endpoint, headers, tool_count, tools, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)
+        `INSERT INTO mcp_servers (id, name, url, raw_token, status, post_endpoint, headers, tool_count, tools, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)
          ON CONFLICT (id) DO UPDATE SET
            name = EXCLUDED.name,
            url = EXCLUDED.url,
            raw_token = EXCLUDED.raw_token,
+           status = EXCLUDED.status,
            post_endpoint = EXCLUDED.post_endpoint,
            headers = EXCLUDED.headers,
            tool_count = EXCLUDED.tool_count,
@@ -66,6 +106,7 @@ async function saveConfigToStorage(serverItem) {
           serverItem.name,
           serverItem.url,
           serverItem.rawToken,
+          serverItem.status || "active",
           serverItem.postEndpoint,
           JSON.stringify(serverItem.headers || {}),
           serverItem.toolCount,
@@ -76,35 +117,19 @@ async function saveConfigToStorage(serverItem) {
   }
 
   try {
-    const data = Array.from(mcpServers.values()).map((s) => ({
-      id: s.id,
-      name: s.name,
-      url: s.url,
-      token: s.rawToken,
-      postEndpoint: s.postEndpoint,
-      headers: s.headers,
-      tools: s.tools
-    }));
+    const data = Array.from(mcpServers.values());
     fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf8");
   } catch {}
 }
 
-async function deleteConfigFromStorage(id) {
+async function deleteServerFromStorage(id) {
   if (pgPool) {
     try {
       await pgPool.query("DELETE FROM mcp_servers WHERE id = $1", [id]);
     } catch {}
   }
   try {
-    const data = Array.from(mcpServers.values()).map((s) => ({
-      id: s.id,
-      name: s.name,
-      url: s.url,
-      token: s.rawToken,
-      postEndpoint: s.postEndpoint,
-      headers: s.headers,
-      tools: s.tools
-    }));
+    const data = Array.from(mcpServers.values());
     fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf8");
   } catch {}
 }
@@ -117,25 +142,30 @@ async function loadConfigFromStorage() {
         for (const row of res.rows) {
           const tools = typeof row.tools === "string" ? JSON.parse(row.tools) : (row.tools || []);
           const headers = typeof row.headers === "string" ? JSON.parse(row.headers) : (row.headers || {});
-          mcpServers.set(row.id, {
+          const status = row.status || "active";
+          const serverInfo = {
             id: row.id,
             name: row.name,
             url: row.url,
             rawToken: row.raw_token,
+            status,
             postEndpoint: row.post_endpoint,
             headers,
             toolCount: tools.length,
             tools
-          });
+          };
+          mcpServers.set(row.id, serverInfo);
 
-          for (const t of tools) {
-            mcpToolRegistry.set(t.key, {
-              serverId: row.id,
-              serverName: row.name,
-              rawName: t.rawName,
-              postEndpoint: row.post_endpoint,
-              headers
-            });
+          if (status === "active") {
+            for (const t of tools) {
+              mcpToolRegistry.set(t.key, {
+                serverId: row.id,
+                serverName: row.name,
+                rawName: t.rawName,
+                postEndpoint: row.post_endpoint,
+                headers
+              });
+            }
           }
         }
         return;
@@ -148,25 +178,20 @@ async function loadConfigFromStorage() {
     const raw = fs.readFileSync(DATA_FILE, "utf8");
     const list = JSON.parse(raw);
     for (const item of list) {
-      mcpServers.set(item.id, {
-        id: item.id,
-        name: item.name,
-        url: item.url,
-        rawToken: item.token,
-        postEndpoint: item.postEndpoint,
-        headers: item.headers,
-        toolCount: item.tools.length,
-        tools: item.tools
-      });
+      const status = item.status || "active";
+      item.status = status;
+      mcpServers.set(item.id, item);
 
-      for (const t of item.tools) {
-        mcpToolRegistry.set(t.key, {
-          serverId: item.id,
-          serverName: item.name,
-          rawName: t.rawName,
-          postEndpoint: item.postEndpoint,
-          headers: item.headers
-        });
+      if (status === "active") {
+        for (const t of item.tools) {
+          mcpToolRegistry.set(t.key, {
+            serverId: item.id,
+            serverName: item.name,
+            rawName: t.rawName,
+            postEndpoint: item.postEndpoint,
+            headers: item.headers
+          });
+        }
       }
     }
   } catch {}
@@ -202,8 +227,10 @@ function isProxyAuthorized(request) {
 
 function isPanelAuthorized(request) {
   if (!PANEL_PASSWORD) return true;
-  const pass = (request.headers["x-panel-password"] || "").trim();
-  return pass === PANEL_PASSWORD;
+  const cookies = parseCookies(request);
+  if (verifySessionToken(cookies.panel_auth)) return true;
+  const headerToken = (request.headers["x-panel-password"] || "").trim();
+  return headerToken === PANEL_PASSWORD;
 }
 
 function readRequestBody(request) {
@@ -353,6 +380,7 @@ async function connectToMcpServer({ name, url, token }) {
     name,
     url: cleanUrl,
     rawToken: token,
+    status: "active",
     postEndpoint: cleanUrl,
     headers,
     toolCount: registeredTools.length,
@@ -360,7 +388,7 @@ async function connectToMcpServer({ name, url, token }) {
   };
 
   mcpServers.set(serverId, serverInfo);
-  await saveConfigToStorage(serverInfo);
+  await saveServerToStorage(serverInfo);
   return serverInfo;
 }
 
@@ -393,18 +421,20 @@ async function callMcpTool(toolKey, args) {
 function getAllTools() {
   const tools = [];
   for (const s of mcpServers.values()) {
-    for (const t of s.tools) tools.push(t.openAiTool);
+    if (s.status === "active") {
+      for (const t of s.tools) tools.push(t.openAiTool);
+    }
   }
   return tools;
 }
 
 function buildToolPrompt() {
-  const tools = getAllTools();
-  if (tools.length === 0) return "";
-  const serverNames = Array.from(mcpServers.values()).map(s => `${s.name} (${s.toolCount} 个工具)`).join("、");
+  const activeServers = Array.from(mcpServers.values()).filter((s) => s.status === "active");
+  if (activeServers.length === 0) return "";
+  const serverNames = activeServers.map((s) => `${s.name} (${s.toolCount} 个工具)`).join("、");
   return [
     `# 远程 MCP 工具环境`,
-    `当前已连接的 MCP 服务：${serverNames}。`,
+    `当前已启动连接的 MCP 服务：${serverNames}。`,
     `你已具备调用上述外部工具的能力。当用户的请求需要查询数据或执行操作时，必须优先调用匹配的 MCP 工具，根据真实执行结果组织回答。`
   ].join("\n");
 }
@@ -465,6 +495,7 @@ function isMcpContext(requestBody) {
     .join("\n");
 
   const serverNames = Array.from(mcpServers.values())
+    .filter((s) => s.status === "active")
     .map((s) => s.name.replace(/[^a-zA-Z0-9_\u4e00-\u9fa5]/g, ""))
     .filter(Boolean);
 
@@ -726,6 +757,96 @@ async function runAgent(requestBody, clientResponse) {
   throw new Error("工具调用轮数达到上限");
 }
 
+function getLoginHtml() {
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MCP 控制台 - 登录认证</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: #f8fafc;
+      color: #0f172a;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+    }
+    .card {
+      background: #ffffff;
+      border: 1px solid #e2e8f0;
+      border-radius: 12px;
+      padding: 32px 24px;
+      width: 100%;
+      max-width: 360px;
+      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+      text-align: center;
+    }
+    h1 { font-size: 18px; font-weight: 700; margin-bottom: 8px; }
+    p { font-size: 13px; color: #64748b; margin-bottom: 20px; }
+    input {
+      width: 100%;
+      background: #ffffff;
+      border: 1px solid #cbd5e1;
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 14px;
+      outline: none;
+      margin-bottom: 14px;
+    }
+    input:focus { border-color: #2563eb; }
+    button {
+      width: 100%;
+      background: #2563eb;
+      color: #ffffff;
+      border: none;
+      font-weight: 600;
+      font-size: 14px;
+      padding: 10px;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    button:hover { background: #1d4ed8; }
+    #err-msg { color: #dc2626; font-size: 13px; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>MCP 控制台认证</h1>
+    <p>请输入后台管理密码以进入面板</p>
+    <input id="pwd" type="password" placeholder="输入管理密码" onkeydown="if(event.key==='Enter')login()">
+    <button onclick="login()">验证并进入</button>
+    <div id="err-msg"></div>
+  </div>
+  <script>
+    async function login() {
+      const pwd = document.getElementById("pwd").value.trim();
+      const err = document.getElementById("err-msg");
+      if (!pwd) { err.innerText = "请输入管理密码"; return; }
+      try {
+        const res = await fetch("/api/panel/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password: pwd })
+        });
+        if (res.ok) {
+          location.reload();
+        } else {
+          err.innerText = "密码错误，请重新输入";
+        }
+      } catch (e) {
+        err.innerText = e.message;
+      }
+    }
+  </script>
+</body>
+</html>`;
+}
+
 await initDatabase();
 await loadConfigFromStorage();
 
@@ -740,6 +861,14 @@ const server = http.createServer(async (request, response) => {
 
     if (request.method === "GET" && (request.url === "/" || request.url.startsWith("/?"))) {
       setCorsHeaders(response);
+      if (PANEL_PASSWORD) {
+        const cookies = parseCookies(request);
+        if (!verifySessionToken(cookies.panel_auth)) {
+          response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+          response.end(getLoginHtml());
+          return;
+        }
+      }
       const htmlPath = path.join(__dirname, "dashboard.html");
       const htmlContent = fs.readFileSync(htmlPath, "utf8");
       response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
@@ -752,18 +881,29 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    if (request.method === "GET" && request.url === "/api/panel/status") {
-      sendJson(response, 200, { requiresPassword: Boolean(PANEL_PASSWORD) });
-      return;
-    }
-
-    if (request.method === "POST" && request.url === "/api/panel/verify") {
+    if (request.method === "POST" && request.url === "/api/panel/login") {
       const body = await readRequestBody(request);
       if (!PANEL_PASSWORD || body.password === PANEL_PASSWORD) {
-        sendJson(response, 200, { success: true });
+        const token = generateSessionToken();
+        setCorsHeaders(response);
+        response.writeHead(200, {
+          "Content-Type": "application/json",
+          "Set-Cookie": `panel_auth=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`
+        });
+        response.end(JSON.stringify({ success: true }));
       } else {
         sendJson(response, 401, { error: "密码错误" });
       }
+      return;
+    }
+
+    if (request.method === "POST" && request.url === "/api/panel/logout") {
+      setCorsHeaders(response);
+      response.writeHead(200, {
+        "Content-Type": "application/json",
+        "Set-Cookie": `panel_auth=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`
+      });
+      response.end(JSON.stringify({ success: true }));
       return;
     }
 
@@ -785,6 +925,46 @@ const server = http.createServer(async (request, response) => {
         return;
       }
 
+      if (request.method === "POST" && request.url.includes("/start")) {
+        const id = request.url.replace("/api/mcp/servers/", "").replace("/start", "");
+        const s = mcpServers.get(id);
+        if (!s) {
+          sendJson(response, 404, { error: "未找到该服务" });
+          return;
+        }
+        s.status = "active";
+        for (const t of s.tools) {
+          mcpToolRegistry.set(t.key, {
+            serverId: s.id,
+            serverName: s.name,
+            rawName: t.rawName,
+            postEndpoint: s.postEndpoint,
+            headers: s.headers
+          });
+        }
+        await saveServerToStorage(s);
+        sendJson(response, 200, { success: true, status: "active" });
+        return;
+      }
+
+      if (request.method === "POST" && request.url.includes("/stop")) {
+        const id = request.url.replace("/api/mcp/servers/", "").replace("/stop", "");
+        const s = mcpServers.get(id);
+        if (!s) {
+          sendJson(response, 404, { error: "未找到该服务" });
+          return;
+        }
+        s.status = "disabled";
+        for (const [key, val] of mcpToolRegistry.entries()) {
+          if (val.serverId === id) {
+            mcpToolRegistry.delete(key);
+          }
+        }
+        await saveServerToStorage(s);
+        sendJson(response, 200, { success: true, status: "disabled" });
+        return;
+      }
+
       if (request.method === "DELETE" && request.url.startsWith("/api/mcp/servers/")) {
         const id = request.url.replace("/api/mcp/servers/", "");
         mcpServers.delete(id);
@@ -793,7 +973,7 @@ const server = http.createServer(async (request, response) => {
             mcpToolRegistry.delete(key);
           }
         }
-        await deleteConfigFromStorage(id);
+        await deleteServerFromStorage(id);
         sendJson(response, 200, { success: true });
         return;
       }
