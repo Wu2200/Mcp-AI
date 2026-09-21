@@ -286,9 +286,9 @@
       display: inline-flex;
       align-items: center;
       gap: 6px;
-      background: #fee2e2;
-      color: #991b1b;
-      border: 1px solid #fecaca;
+      background: #dcfce7;
+      color: #166534;
+      border: 1px solid #bbf7d0;
       font-size: 12px;
       font-family: monospace;
       padding: 4px 10px;
@@ -298,14 +298,14 @@
     .model-tag-del {
       cursor: pointer;
       font-weight: 700;
-      color: #dc2626;
+      color: #16a34a;
       border: none;
       background: none;
       padding: 0;
       line-height: 1;
     }
     .model-tag-del:hover {
-      color: #7f1d1d;
+      color: #dc2626;
     }
     .candidate-tag {
       display: inline-block;
@@ -322,11 +322,11 @@
       transition: all 0.15s;
     }
     .candidate-tag:hover {
-      background: #e0f2fe;
-      color: #0369a1;
-      border-color: #7dd3fc;
+      background: #dcfce7;
+      color: #166534;
+      border-color: #86efac;
     }
-    #conn-msg, #exclude-msg {
+    #conn-msg, #enable-msg {
       margin-left: 12px;
       font-size: 13px;
       font-weight: 500;
@@ -344,7 +344,7 @@
     <div class="header">
       <div>
         <h1>MCP 代理控制台</h1>
-        <p>为客户端提供多 MCP 工具接入与持久化存储</p>
+        <p>为客户端提供多 MCP 工具接入与模型精准调度</p>
       </div>
       <button class="btn-logout" onclick="handleLogout()">退出登录</button>
     </div>
@@ -360,34 +360,35 @@
       </div>
       <div class="group">
         <label>模型 (Model)</label>
-        <div class="box">跟随你的上游设置（如 gpt-4o、gemini-2.5-flash 等）</div>
+        <div class="box">跟随你的上游设置（如 gpt-4o、claude-3-5-sonnet、gemini-2.5-flash 等）</div>
       </div>
     </div>
 
-    <!-- 排除模型配置卡片 -->
+    <!-- 启用模型配置卡片（白名单模式） -->
     <div class="card">
       <div class="card-title">
-        <span>排除模型设置（跳过 MCP，保留上游网络搜索与原生直通）</span>
+        <span>启用 MCP 的模型设置（白名单模式）</span>
+        <span class="badge badge-green">仅选中模型支持 MCP</span>
       </div>
       <p style="font-size: 13px; color: #64748b; margin-bottom: 14px;">
-        加入此列表的模型在请求时<strong>绝不注入任何 MCP 工具</strong>，直接原样透传给上游。这样上游网关的“无工具时自动注入网络搜索”规则会 100% 满血生效，永不产生冲突。
+        <strong>白名单规则</strong>：只有加入此列表的模型才会挂载 MCP 工具。未在此列表中的其他所有模型将<strong>完全纯净直通上游</strong>（绝不携带任何 tools 参数），从而 100% 触发上游网关自带的原生网络搜索，互不干扰。
       </p>
 
       <div class="group">
-        <label>已排除的模型列表（支持通配符如 gemini*、gpt-4o-mini 等）：</label>
-        <div id="excluded-tags" style="min-height: 38px; padding: 6px 0;">
-          <span style="font-size: 13px; color: #94a3b8;">暂无排除模型，所有模型均正常挂载 MCP。</span>
+        <label>当前支持 MCP 的模型列表（支持完全匹配或通配符，如 claude*、gpt-4o*）：</label>
+        <div id="enabled-tags" style="min-height: 38px; padding: 6px 0;">
+          <span style="font-size: 13px; color: #94a3b8;">暂未启用任何模型，所有请求默认直通上游网关。</span>
         </div>
       </div>
 
       <div class="group" style="display: flex; gap: 8px; margin-top: 10px;">
-        <input id="custom-model-input" placeholder="手动输入模型名称或通配符（如 gemini*，回车添加）" onkeydown="if(event.key==='Enter')addCustomModel()">
+        <input id="custom-model-input" placeholder="手动输入模型名称或通配符（如 claude*，回车添加）" onkeydown="if(event.key==='Enter')addCustomModel()">
         <button class="btn btn-secondary" onclick="addCustomModel()">添加</button>
       </div>
 
       <div class="group" style="margin-top: 14px;">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-          <label style="margin: 0;">从上游快速选择模型（点击即加入排除）：</label>
+          <label style="margin: 0;">从上游所有模型中选择（点击即可开启 MCP）：</label>
           <button class="btn-action btn-start" onclick="fetchUpstreamModels()">刷新上游模型列表</button>
         </div>
         <div id="upstream-candidates" style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px; max-height: 140px; overflow-y: auto;">
@@ -396,8 +397,8 @@
       </div>
 
       <div style="display: flex; align-items: center; margin-top: 16px;">
-        <button class="btn" onclick="saveExcludedModels()">保存排除配置</button>
-        <span id="exclude-msg"></span>
+        <button class="btn" onclick="saveEnabledModels()">保存启用配置</button>
+        <span id="enable-msg"></span>
       </div>
     </div>
 
@@ -434,23 +435,23 @@
   <script>
     document.getElementById("proxy-url").innerText = window.location.origin + "/v1";
 
-    let currentExcludedList = [];
+    let currentEnabledList = [];
 
     async function handleLogout() {
       await fetch("/api/panel/logout", { method: "POST" });
       location.reload();
     }
 
-    function renderExcludedTags() {
-      const container = document.getElementById("excluded-tags");
-      if (!currentExcludedList || currentExcludedList.length === 0) {
-        container.innerHTML = '<span style="font-size: 13px; color: #94a3b8;">暂无排除模型，所有模型均正常挂载 MCP。</span>';
+    function renderEnabledTags() {
+      const container = document.getElementById("enabled-tags");
+      if (!currentEnabledList || currentEnabledList.length === 0) {
+        container.innerHTML = '<span style="font-size: 13px; color: #94a3b8;">暂未启用任何模型，所有请求默认直通上游网关。</span>';
         return;
       }
-      container.innerHTML = currentExcludedList.map((m, idx) => `
+      container.innerHTML = currentEnabledList.map((m, idx) => `
         <span class="model-tag">
-          <span>${m}</span>
-          <button class="model-tag-del" onclick="removeExcludedModel(${idx})">×</button>
+          <span>✓ ${m}</span>
+          <button class="model-tag-del" onclick="removeEnabledModel(${idx})">×</button>
         </span>
       `).join("");
     }
@@ -459,41 +460,41 @@
       const input = document.getElementById("custom-model-input");
       const val = input.value.trim();
       if (!val) return;
-      if (!currentExcludedList.includes(val)) {
-        currentExcludedList.push(val);
-        renderExcludedTags();
+      if (!currentEnabledList.includes(val)) {
+        currentEnabledList.push(val);
+        renderEnabledTags();
       }
       input.value = "";
     }
 
-    function removeExcludedModel(idx) {
-      currentExcludedList.splice(idx, 1);
-      renderExcludedTags();
+    function removeEnabledModel(idx) {
+      currentEnabledList.splice(idx, 1);
+      renderEnabledTags();
     }
 
-    async function loadExcludedSettings() {
+    async function loadEnabledSettings() {
       try {
-        const res = await fetch("/api/settings/excluded-models");
+        const res = await fetch("/api/settings/enabled-models");
         if (res.ok) {
           const data = await res.json();
-          currentExcludedList = data.excludedModels || [];
-          renderExcludedTags();
+          currentEnabledList = data.enabledModels || [];
+          renderEnabledTags();
         }
       } catch {}
     }
 
-    async function saveExcludedModels() {
-      const msg = document.getElementById("exclude-msg");
+    async function saveEnabledModels() {
+      const msg = document.getElementById("enable-msg");
       msg.innerText = "正在保存...";
       msg.style.color = "#2563eb";
       try {
-        const res = await fetch("/api/settings/excluded-models", {
+        const res = await fetch("/api/settings/enabled-models", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ models: currentExcludedList })
+          body: JSON.stringify({ models: currentEnabledList })
         });
         if (res.ok) {
-          msg.innerText = "排除模型配置已保存并生效！";
+          msg.innerText = "配置保存成功！仅选中的模型将启用 MCP。";
           msg.style.color = "#16a34a";
         } else {
           throw new Error("保存失败");
@@ -524,9 +525,9 @@
     }
 
     function selectCandidate(name) {
-      if (!currentExcludedList.includes(name)) {
-        currentExcludedList.push(name);
-        renderExcludedTags();
+      if (!currentEnabledList.includes(name)) {
+        currentEnabledList.push(name);
+        renderEnabledTags();
       }
     }
 
@@ -647,7 +648,7 @@
       loadServers();
     }
 
-    loadExcludedSettings();
+    loadEnabledSettings();
     loadServers();
   </script>
 </body>
