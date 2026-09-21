@@ -20,6 +20,26 @@ const mcpToolRegistry = new Map();
 
 const SESSION_SECRET = crypto.randomBytes(32).toString("hex");
 
+function getToolAction(toolName) {
+  const name = (toolName || "").toLowerCase();
+  if (name.includes("delete") || name.includes("remove")) {
+    return "删除";
+  }
+  if (name.includes("update") || name.includes("merge") || name.includes("resolve") || name.includes("patch") || name.includes("edit")) {
+    return "更新/修改";
+  }
+  if (name.includes("create") || name.includes("add") || name.includes("push") || name.includes("fork")) {
+    return "创建";
+  }
+  if (name.includes("get") || name.includes("list") || name.includes("search") || name.includes("read") || name.includes("docs")) {
+    return "查询";
+  }
+  if (name.includes("execute") || name.includes("run")) {
+    return "执行";
+  }
+  return "处理";
+}
+
 function generateSessionToken() {
   const payload = `auth:${PANEL_PASSWORD}:${Date.now()}`;
   const sig = crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("hex");
@@ -64,7 +84,19 @@ async function initDatabase() {
       ssl: { rejectUnauthorized: false }
     });
     await pgPool.query(`
-      CREATE TABLE IF NOT EXISTS mcp_servers (\n        id TEXT PRIMARY KEY,\n        name TEXT NOT NULL,\n        url TEXT NOT NULL,\n        raw_token TEXT,\n        status TEXT DEFAULT 'active',\n        post_endpoint TEXT,\n        headers JSONB,\n        tool_count INT,\n        tools JSONB,\n        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n      );\n    `);
+      CREATE TABLE IF NOT EXISTS mcp_servers (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        url TEXT NOT NULL,
+        raw_token TEXT,
+        status TEXT DEFAULT 'active',
+        post_endpoint TEXT,
+        headers JSONB,
+        tool_count INT,
+        tools JSONB,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
     try {
       await pgPool.query("ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active';");
     } catch {}
@@ -538,7 +570,7 @@ async function runAgent(requestBody, clientResponse) {
       if (idx === existingSystemIndex) {
         return {
           role: "system",
-          content: `${m.content || ""}\n\n${toolPrompt}`
+          content: `${m.content || ""}\n\ntoolPrompt`
         };
       }
       return m;
@@ -585,15 +617,14 @@ async function runAgent(requestBody, clientResponse) {
           created: Math.floor(Date.now() / 1000),
           model: requestBody.model || "default",
           choices: [
-            {
-              index: 0,
-              delta: { content: `\n\n上游返回错误 (${upstreamResponse.status})：${err.slice(0, 500)}` },
+            {\n              index: 0,
+              delta: { content: `\\n\\n上游返回错误 (${upstreamResponse.status})：${err.slice(0, 500)}` },
               finish_reason: "stop"
             }
           ]
         };
-        clientResponse.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
-        clientResponse.write("data: [DONE]\n\n");
+        clientResponse.write(`data: ${JSON.stringify(errorChunk)}\\n\\n`);
+        clientResponse.write("data: [DONE]\\n\\n");
         clientResponse.end();
         return;
       }
@@ -694,12 +725,13 @@ async function runAgent(requestBody, clientResponse) {
     for (const tc of mcpCalls) {
       const toolInfo = mcpToolRegistry.get(tc.name);
       const serverDisplayName = toolInfo?.serverName || "MCP";
+      const actionName = getToolAction(toolInfo?.rawName || tc.name);
       const args = toolArguments({ function: { arguments: tc.arguments } });
 
       if (isStream) {
         sendReasoningChunk(
           clientResponse,
-          `\n> 正在调用 ${serverDisplayName} 工具\n`,
+          `\n> 正在调用 ${serverDisplayName} ${actionName}工具\n`,
           requestBody.model
         );
       }
@@ -718,7 +750,7 @@ async function runAgent(requestBody, clientResponse) {
       if (isStream) {
         sendReasoningChunk(
           clientResponse,
-          `> ${serverDisplayName} 工具执行完成\n\n`,
+          `> ${serverDisplayName} ${actionName}完成\n\n`,
           requestBody.model
         );
       }
@@ -795,9 +827,9 @@ function getLoginHtml() {
   <div class="card">
     <h1>MCP 控制台认证</h1>
     <p>请输入后台管理密码以进入面板</p>
-    <input id=\"pwd\" type=\"password\" placeholder=\"输入管理密码\" onkeydown=\"if(event.key==='Enter')login()\">
-    <button onclick=\"login()\">验证并进入</button>
-    <div id=\"err-msg\"></div>
+    <input id="pwd" type="password" placeholder="输入管理密码" onkeydown="if(event.key==='Enter')login()">
+    <button onclick="login()">验证并进入</button>
+    <div id="err-msg"></div>
   </div>
   <script>
     async function login() {
@@ -1016,13 +1048,13 @@ const server = http.createServer(async (request, response) => {
           choices: [
             {
               index: 0,
-              delta: { content: `\n\n[代理服务错误]: ${err instanceof Error ? err.message : "未知错误"}` },
+              delta: { content: `\\n\\n[代理服务错误]: ${err instanceof Error ? err.message : "未知错误"}` },
               finish_reason: "stop"
             }
           ]
         };
-        response.write(`data: ${JSON.stringify(errChunk)}\n\n`);
-        response.write("data: [DONE]\n\n");
+        response.write(`data: ${JSON.stringify(errChunk)}\\n\\n`);
+        response.write("data: [DONE]\\n\\n");
         response.end();
       } catch {}
       return;
