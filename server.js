@@ -600,6 +600,18 @@ async function runAgent(requestBody, clientResponse) {
     if (tools.length > 0) {
       payload.tools = tools;
       payload.tool_choice = "auto";
+
+      // 满足 Gemini 在混合使用内置工具 (google_search) 和 Function calling 时的强制规范
+      if (modelName.includes("gemini") || tools.some((t) => t.google_search)) {
+        payload.tool_config = {
+          ...(payload.tool_config || {}),
+          include_server_side_tool_invocations: true
+        };
+        payload.toolConfig = {
+          ...(payload.toolConfig || {}),
+          includeServerSideToolInvocations: true
+        };
+      }
     }
 
     const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
