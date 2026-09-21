@@ -69,6 +69,18 @@ function readRequestBody(request) {
   });
 }
 
+function cleanPayload(obj) {
+  if (!obj || typeof obj !== "object") return;
+  if (obj.generationConfig?.thinkingConfig) {
+    delete obj.generationConfig.thinkingConfig.includeThought;
+    delete obj.generationConfig.thinkingConfig.includeThough;
+  }
+  if (obj.generation_config?.thinking_config) {
+    delete obj.generation_config.thinking_config.includeThought;
+    delete obj.generation_config.thinking_config.includeThough;
+  }
+}
+
 function saveConfigToDisk() {
   try {
     const data = Array.from(mcpServers.values()).map((s) => ({
@@ -316,39 +328,41 @@ function sendReasoningChunk(clientResponse, text, model = "default") {
   clientResponse.write(`data: ${JSON.stringify(chunk)}\n\n`);
 }
 
-function applyCliproxyRules(payload) {
-  const model = String(payload.model || "").toLowerCase();
+function isMcpContext(requestBody) {
+  if (mcpToolRegistry.size === 0) return false;
+  const rawMessages = requestBody.messages || [];
+  if (!Array.isArray(rawMessages) || rawMessages.length === 0) return false;
 
-  if (model.startsWith("gpt") || model.includes("codex")) {
-    if (!payload.reasoning) {
-      payload.reasoning = { summary: "detailed" };
-    }
-    if (Array.isArray(payload.tools)) {
-      const hasWebSearch = payload.tools.some(
-        (t) => t.type === "web_search" || t.function?.name === "web_search"
-      );
-      if (!hasWebSearch) {
-        payload.tools.push({ type: "web_search" });
-      }
-    }
-  }
+  if (Array.isArray(requestBody.tools) && requestBody.tools.length > 0) return true;
 
-  if (model.startsWith("gemini")) {
-    if (!payload.generationConfig) {
-      payload.generationConfig = { thinkingConfig: { includeThought: true } };
-    }
-    if (Array.isArray(payload.tools)) {
-      const hasGoogleSearch = payload.tools.some(
-        (t) => t.google_search !== undefined || t.type === "google_search"
-      );
-      if (!hasGoogleSearch) {
-        payload.tools.push({ google_search: {} });
+  const combinedText = rawMessages
+    .map((m) => {
+      if (typeof m.content === "string") return m.content;
+      if (Array.isArray(m.content)) {
+        return m.content
+          .map((c) => (typeof c === "string" ? c : c?.text || ""))
+          .join(" ");
       }
-    }
-  }
+      return "";
+    })
+    .join("\n");
+
+  const serverNames = Array.from(mcpServers.values())
+    .map((s) => s.name.replace(/[^a-zA-Z0-9_\u4e00-\u9fa5]/g, ""))
+    .filter(Boolean);
+
+  const keywords = [
+    "mcp", "github", "git\\b", "repo", "代码库", "仓库", "commit", "pr\\b", "pull request",
+    "分支", "branch", "提取代码", "读取文件", "查看文件", "修改文件", "创建文件", "新建文件", "删除文件",
+    ...serverNames
+  ];
+
+  const pattern = new RegExp(`(${keywords.join("|")})`, "i");
+  return pattern.test(combinedText);
 }
 
 async function passThrough(requestBody, clientResponse) {
+  cleanPayload(requestBody);
   setCorsHeaders(clientResponse);
   const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
     method: "POST",
@@ -420,12 +434,11 @@ async function runAgent(requestBody, clientResponse) {
     const payload = {
       ...requestBody,
       messages,
-      tools: [...tools],
+      tools,
       tool_choice: "auto",
       stream: true
     };
-
-    applyCliproxyRules(payload);
+    cleanPayload(payload);
 
     const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
       method: "POST",
@@ -687,7 +700,7 @@ const server = http.createServer(async (request, response) => {
       }
 
       const body = await readRequestBody(request);
-      if (mcpToolRegistry.size > 0) {
+      if (isMcpContext(body)) {
         await runAgent(body, response);
       } else {
         await passThrough(body, response);
