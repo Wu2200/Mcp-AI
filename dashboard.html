@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MCP Agent 控制台</title>
+  <style>
+    :root {
+      --bg: #0b0f19;
+      --card-bg: #151c2e;
+      --card-border: #232f48;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --primary: #38bdf8;
+      --primary-hover: #0ea5e9;
+      --accent: #10b981;
+      --danger: #ef4444;
+      --input-bg: #0b0f19;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", sans-serif;
+      background: var(--bg);
+      color: var(--text-main);
+      line-height: 1.5;
+      padding: 24px 16px;
+    }
+    .container { max-width: 1000px; margin: 0 auto; }
+    header { margin-bottom: 24px; border-bottom: 1px solid var(--card-border); padding-bottom: 16px; display: flex; justify-content: space-between; align-items: flex-end; }
+    h1 { font-size: 24px; font-weight: 700; color: #fff; margin-bottom: 6px; }
+    .subtitle { color: var(--text-muted); font-size: 14px; }
+    .grid { display: grid; grid-template-columns: 1fr; gap: 20px; }
+    @media (min-width: 768px) { .grid-2 { grid-template-columns: 1fr 1fr; } }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 20px;
+    }
+    .card-title { font-size: 16px; font-weight: 600; margin-bottom: 14px; display: flex; align-items: center; justify-content: space-between; }
+    .badge {
+      display: inline-block;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 9999px;
+      background: #0284c7;
+      color: #fff;
+    }
+    .badge-green { background: #059669; }
+    .param-box { background: var(--input-bg); border-radius: 6px; padding: 12px; font-family: monospace; font-size: 13px; margin-bottom: 12px; word-break: break-all; }
+    .param-label { color: var(--text-muted); font-size: 12px; margin-bottom: 4px; }
+    .input-group { margin-bottom: 14px; }
+    .input-group label { display: block; font-size: 13px; color: var(--text-muted); margin-bottom: 6px; }
+    .input-group input, .input-group textarea, .input-group select {
+      width: 100%;
+      background: var(--input-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 6px;
+      padding: 8px 12px;
+      color: #fff;
+      font-size: 14px;
+      outline: none;
+    }
+    .input-group input:focus, .input-group textarea:focus { border-color: var(--primary); }
+    button.btn {
+      background: var(--primary);
+      color: #0b0f19;
+      border: none;
+      font-weight: 600;
+      padding: 9px 16px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+      transition: background 0.2s;
+    }
+    button.btn:hover { background: var(--primary-hover); }
+    button.btn-danger { background: var(--danger); color: #fff; }
+    button.btn-sm { padding: 4px 8px; font-size: 12px; }
+    .server-item {
+      background: var(--input-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 14px;
+      margin-bottom: 12px;
+    }
+    .server-item-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .tool-tag {
+      display: inline-block;
+      background: #232f48;
+      font-size: 12px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      margin: 2px 4px 2px 0;
+      font-family: monospace;
+      color: #e2e8f0;
+    }
+    pre { background: var(--input-bg); padding: 10px; border-radius: 6px; font-size: 12px; overflow-x: auto; color: #38bdf8; }
+    #login-overlay {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(11, 15, 25, 0.95);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+    }
+    .login-box {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 30px;
+      width: 320px;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div id="login-overlay" style="display: none;">
+    <div class="login-box">
+      <h2 style="font-size: 18px; margin-bottom: 12px;">请输入控制台密码</h2>
+      <input type="password" id="login-pwd" placeholder="面板密码" style="width: 100%; background: var(--input-bg); border: 1px solid var(--card-border); border-radius: 6px; padding: 8px 12px; color: #fff; margin-bottom: 16px; outline: none;">
+      <button class="btn" style="width: 100%;" onclick="submitPassword()">验证并进入</button>
+      <div id="login-err" style="color: var(--danger); font-size: 12px; margin-top: 10px;"></div>
+    </div>
+  </div>
+
+  <div class="container">
+    <header>
+      <div>
+        <h1>MCP Agent 通用代理控制台</h1>
+        <div class="subtitle">专用于将原生 MCP 服务转换并接入 Chatbox / OpenAI 客户端</div>
+      </div>
+      <div>
+        <button class="btn btn-sm" onclick="logout()">退出锁定</button>
+      </div>
+    </header>
+
+    <div class="grid grid-2" style="margin-bottom: 20px;">
+      <div class="card">
+        <div class="card-title">Chatbox 接入设置 <span class="badge badge-green">已就绪</span></div>
+        <div class="param-label">API 域名 (Base URL)</div>
+        <div class="param-box" id="proxy-url">正在加载...</div>
+        <div class="param-label">模型 (Model)</div>
+        <div class="param-box">任意模型（由上游 CLIProxyAPI 提供）</div>
+        <p style="font-size: 13px; color: var(--text-muted);">Chatbox 连接此地址后，只要对话中提及已连接 MCP 相关的需求，大模型将自动触发工具调用。</p>
+      </div>
+
+      <div class="card">
+        <div class="card-title">手动连接新的 MCP 服务</div>
+        <div class="input-group">
+          <label>服务名称（标识前缀）</label>
+          <input id="mcp-name" placeholder="例如：Cloudflare 或 GitHub" value="CF">
+        </div>
+        <div class="input-group">
+          <label>MCP 服务地址 (SSE / HTTP Endpoint)</label>
+          <input id="mcp-url" placeholder="https://your-mcp-server.com/sse">
+        </div>
+        <div class="input-group">
+          <label>认证令牌 (Token / Key，可选)</label>
+          <input id="mcp-token" type="password" placeholder="若无需认证可留空">
+        </div>
+        <button class="btn" id="connect-btn" onclick="handleConnectMcp()">连接并提取工具</button>
+        <span id="connect-status" style="margin-left: 10px; font-size: 13px;"></span>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom: 20px;">
+      <div class="card-title">已连接的 MCP 服务列表 <span class="badge" id="mcp-count">0</span></div>
+      <div id="mcp-list"><div style="color: var(--text-muted); font-size: 13px;">尚未连接任何 MCP 服务，请在上方输入地址添加。</div></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">已注册工具在线测试</div>
+      <div class="grid grid-2">
+        <div>
+          <div class="input-group">
+            <label>选择已注册工具</label>
+            <select id="tool-select"></select>
+          </div>
+          <div class="input-group">
+            <label>入参 (JSON 格式)</label>
+            <textarea id="tool-args" rows="6">{}</textarea>
+          </div>
+          <button class="btn" onclick="handleExecuteTest()">手动运行工具</button>
+        </div>
+        <div>
+          <label style="font-size: 13px; color: var(--text-muted); display: block; margin-bottom: 6px;">返回结果</label>
+          <pre id="tool-result">等待执行...</pre>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    document.getElementById("proxy-url").innerText = window.location.origin + "/v1";
+
+    function getPwd() {
+      return localStorage.getItem("mcp_panel_pwd") || "";
+    }
+
+    function checkAuthRequired() {
+      fetch("/api/mcp/auth-status").then(r => r.json()).then(data => {
+        if (data.required) {
+          if (!getPwd()) {
+            document.getElementById("login-overlay").style.display = "flex";
+          } else {
+            loadServers();
+          }
+        } else {
+          loadServers();
+        }
+      });
+    }
+
+    function submitPassword() {
+      const val = document.getElementById("login-pwd").value.trim();
+      localStorage.setItem("mcp_panel_pwd", val);
+      document.getElementById("login-err").innerText = "验证中...";
+      fetch("/api/mcp/servers", {
+        headers: { "x-panel-password": val }
+      }).then(res => {
+        if (res.status === 401) {
+          document.getElementById("login-err").innerText = "密码错误，请重新输入。";
+        } else {
+          document.getElementById("login-overlay").style.display = "none";
+          document.getElementById("login-err").innerText = "";
+          loadServers();
+        }
+      }).catch(err => {
+        document.getElementById("login-err").innerText = err.message;
+      });
+    }
+
+    function logout() {
+      localStorage.removeItem("mcp_panel_pwd");
+      location.reload();
+    }
+
+    async function loadServers() {
+      try {
+        const res = await fetch("/api/mcp/servers", {
+          headers: { "x-panel-password": getPwd() }
+        });
+        if (res.status === 401) {
+          document.getElementById("login-overlay").style.display = "flex";
+          return;
+        }
+        const data = await res.json();
+        const listEl = document.getElementById("mcp-list");
+        document.getElementById("mcp-count").innerText = data.servers.length;
+
+        if (data.servers.length === 0) {
+          listEl.innerHTML = '<div style="color: var(--text-muted); font-size: 13px;">尚未连接任何 MCP 服务，请在上方输入地址添加。</div>';
+        } else {
+          let html = "";
+          for (let s of data.servers) {
+            let tags = "";
+            for (let t of s.tools) {
+              tags += '<span class="tool-tag" title="' + (t.description || '') + '">' + t.key + '</span>';
+            }
+            html += '<div class="server-item">' +
+              '<div class="server-item-header">' +
+                '<div><strong>' + s.name + '</strong> <span class="badge badge-green">' + s.toolCount + ' 个工具</span></div>' +
+                '<button class="btn btn-danger btn-sm" onclick="handleDeleteServer(\'' + s.id + '\')">断开</button>' +
+              '</div>' +
+              '<div style="font-size: 12px; color: var(--text-muted); margin-bottom: 8px;">地址: ' + s.url + '</div>' +
+              '<div>' + tags + '</div>' +
+            '</div>';
+          }
+          listEl.innerHTML = html;
+        }
+
+        const sel = document.getElementById("tool-select");
+        if (data.allTools.length === 0) {
+          sel.innerHTML = '<option value="">暂无可用工具</option>';
+        } else {
+          let opts = "";
+          for (let t of data.allTools) {
+            opts += '<option value="' + t.name + '">' + t.name + '</option>';
+          }
+          sel.innerHTML = opts;
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    async function handleConnectMcp() {
+      const name = document.getElementById("mcp-name").value.trim();
+      const url = document.getElementById("mcp-url").value.trim();
+      const token = document.getElementById("mcp-token").value.trim();
+      const statusEl = document.getElementById("connect-status");
+
+      if (!name || !url) {
+        statusEl.innerText = "名称与 URL 均为必填项。";
+        statusEl.style.color = "#ef4444";
+        return;
+      }
+
+      statusEl.innerText = "正在连接并读取工具...";
+      statusEl.style.color = "#38bdf8";
+
+      try {
+        const res = await fetch("/api/mcp/connect", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-panel-password": getPwd()
+          },
+          body: JSON.stringify({ name, url, token })
+        });
+        const result = await res.json();
+        if (!res.ok) {
+          throw new Error(result.error || "连接失败");
+        }
+        statusEl.innerText = "成功载入 " + result.toolCount + " 个工具！";
+        statusEl.style.color = "#10b981";
+        document.getElementById("mcp-url").value = "";
+        document.getElementById("mcp-token").value = "";
+        loadServers();
+      } catch (err) {
+        statusEl.innerText = err.message;
+        statusEl.style.color = "#ef4444";
+      }
+    }
+
+    async function handleDeleteServer(id) {
+      if (!confirm("确认移除该 MCP 连接？")) return;
+      await fetch('/api/mcp/servers/' + id, {
+        method: "DELETE",
+        headers: { "x-panel-password": getPwd() }
+      });
+      loadServers();
+    }
+
+    async function handleExecuteTest() {
+      const tool = document.getElementById("tool-select").value;
+      const resBox = document.getElementById("tool-result");
+      if (!tool) return;
+      let args = {};
+      try {
+        args = JSON.parse(document.getElementById("tool-args").value || "{}");
+      } catch {
+        resBox.innerText = "参数不是合法的 JSON。";
+        return;
+      }
+
+      resBox.innerText = "正在调用工具...";
+      try {
+        const res = await fetch("/api/mcp/test-tool", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-panel-password": getPwd()
+          },
+          body: JSON.stringify({ tool, args })
+        });
+        const result = await res.json();
+        resBox.innerText = JSON.stringify(result, null, 2);
+      } catch (err) {
+        resBox.innerText = "调用失败：" + err.message;
+      }
+    }
+
+    checkAuthRequired();
+  </script>
+</body>
+</html>
