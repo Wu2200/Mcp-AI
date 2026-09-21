@@ -287,7 +287,7 @@ function readRequestBody(request) {
     let size = 0;
     request.on("data", (chunk) => {
       size += chunk.length;
-      if (size > 50 * 1024 * 1024) {
+      if (size > 20 * 1024 * 1024) {
         reject(new Error("请求过大"));
         request.destroy();
         return;
@@ -436,7 +436,56 @@ async function connectToMcpServer({ name, url, token }) {
   return serverInfo;
 }
 
-// 真实返回工具调用结果，严禁暴力截断大文件或丢弃中间内容
+// 规范且深度解析 MCP 工具返回：支持 text、resource(text/blob base64) 等所有官方标准内容，彻底避免文件丢失
+function extractMcpResultContent(data) {
+  if (!data) return "{}";
+  if (typeof data === "string") return data;
+
+  const rawResult = data.result !== undefined ? data.result : data;
+  if (!rawResult) return "{}";
+
+  // 标准 MCP 格式 content 数组
+  if (Array.isArray(rawResult.content)) {
+    const pieces = [];
+    for (const item of rawResult.content) {
+      if (!item) continue;
+      // 1. 普通文本
+      if (item.type === "text" && item.text) {
+        pieces.push(item.text);
+      }
+      // 2. 嵌入资源类型 (resource 或 embedded_resource)
+      else if ((item.type === "resource" || item.type === "embedded_resource") && item.resource) {
+        if (item.resource.text) {
+          pieces.push(item.resource.text);
+        } else if (item.resource.blob) {
+          try {
+            const decoded = Buffer.from(item.resource.blob, "base64").toString("utf8");
+            pieces.push(decoded);
+          } catch {
+            pieces.push(item.resource.blob);
+          }
+        }
+      }
+      // 3. 其他兜底字段
+      else if (item.text) {
+        pieces.push(item.text);
+      }
+    }
+    if (pieces.length > 0) {
+      return pieces.join("\n\n");
+    }
+  }
+
+  // 4. GitHub REST API 风格的 base64 内容兜底解析
+  if (rawResult.content && rawResult.encoding === "base64" && typeof rawResult.content === "string") {
+    try {
+      return Buffer.from(rawResult.content, "base64").toString("utf8");
+    } catch {}
+  }
+
+  return typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult, null, 2);
+}
+
 async function callMcpTool(toolKey, args) {
   let info = mcpToolRegistry.get(toolKey);
   if (!info) {
@@ -458,28 +507,18 @@ async function callMcpTool(toolKey, args) {
       method: "tools/call",
       params: { name: info.rawName, arguments: args }
     }),
-    signal: AbortSignal.timeout(120000)
+    signal: AbortSignal.timeout(60000)
   });
 
   if (!res.ok) {
     const txt = await res.text();
-    throw new Error(`执行失败 (${res.status}): ${txt.slice(0, 500)}`);
+    throw new Error(`执行失败 (${res.status}): ${txt.slice(0, 300)}`);
   }
 
   const data = await parseMcpResponse(res);
   if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
-  const rawResult = data.result ?? data;
 
-  if (rawResult && Array.isArray(rawResult.content)) {
-    const textPieces = rawResult.content
-      .filter((item) => item.type === "text" && item.text)
-      .map((item) => item.text);
-    if (textPieces.length > 0) {
-      return textPieces.join("\n\n");
-    }
-  }
-
-  return typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
+  return extractMcpResultContent(data);
 }
 
 function getAllTools() {
@@ -576,7 +615,10 @@ function isModelEnabledForMcp(modelName) {
 function buildHostEnvironmentSystemMessage() {
   const now = new Date();
   const beijingTime = now.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
-  return `[System Environment] Current Time: ${beijingTime} (UTC+8).`;
+  return [
+    `[System Environment] Current Time: ${beijingTime} (UTC+8).`,
+    `Tool Usage Rule: Strictly execute tools relevant to the target platform (e.g. use GitHub tools only for GitHub repositories). Never attempt workarounds or execute unrelated tools.`
+  ].join("\n");
 }
 
 async function runAgent(requestBody, clientResponse) {
@@ -621,7 +663,7 @@ async function runAgent(requestBody, clientResponse) {
     const payload = {
       ...requestBody,
       messages,
-      stream: isStream
+      stream: true
     };
 
     if (tools.length > 0) {
@@ -661,53 +703,6 @@ async function runAgent(requestBody, clientResponse) {
         return;
       }
       throw new Error(`上游接口返回错误 (${upstreamResponse.status})：${err.slice(0, 500)}`);
-    }
-
-    if (!isStream) {
-      const json = await upstreamResponse.json();
-      const message = json.choices?.[0]?.message;
-      const toolCalls = message?.tool_calls || [];
-      const mcpCalls = toolCalls.filter((tc) => {
-        if (!tc || !tc.function?.name) return false;
-        const name = tc.function.name;
-        if (mcpToolRegistry.has(name)) return true;
-        for (const [k, v] of mcpToolRegistry.entries()) {
-          if (k.endsWith(name) || name.endsWith(v.rawName)) return true;
-        }
-        return false;
-      });
-
-      if (mcpCalls.length === 0) {
-        sendJson(clientResponse, 200, json);
-        return;
-      }
-
-      messages.push(message);
-
-      for (const tc of mcpCalls) {
-        let toolInfo = mcpToolRegistry.get(tc.function.name);
-        if (!toolInfo) {
-          for (const [k, v] of mcpToolRegistry.entries()) {
-            if (k.endsWith(tc.function.name) || tc.function.name.endsWith(v.rawName)) {
-              toolInfo = v;
-              break;
-            }
-          }
-        }
-        const args = toolArguments(tc);
-        let result;
-        try {
-          result = await callMcpTool(tc.function.name, args);
-        } catch (err) {
-          result = JSON.stringify({ error: err.message });
-        }
-        messages.push({
-          role: "tool",
-          tool_call_id: tc.id,
-          content: typeof result === "string" ? result : JSON.stringify(result)
-        });
-      }
-      continue;
     }
 
     const reader = upstreamResponse.body.getReader();
@@ -750,11 +745,12 @@ async function runAgent(requestBody, clientResponse) {
             }
           }
 
-          // 核心修复：文字与超长代码实时直推客户端，绝不积压，无任何长度限制
           if (delta?.content) {
             assistantContent += delta.content;
-            clientResponse.write(`${line}\n\n`);
-          } else if (delta?.reasoning_content) {
+            if (isStream) {
+              clientResponse.write(`${line}\n\n`);
+            }
+          } else if (delta?.reasoning_content && isStream) {
             clientResponse.write(`${line}\n\n`);
           }
         } catch {}
@@ -770,12 +766,31 @@ async function runAgent(requestBody, clientResponse) {
       return false;
     });
 
+    // 模型输出完毕且没有发起任何工具调用，直接优雅结束流式传输，零截断
     if (mcpCalls.length === 0) {
-      clientResponse.write("data: [DONE]\n\n");
-      clientResponse.end();
+      if (isStream) {
+        clientResponse.write("data: [DONE]\n\n");
+        clientResponse.end();
+        return;
+      }
+
+      sendJson(clientResponse, 200, {
+        id: `chatcmpl-${crypto.randomUUID()}`,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: requestBody.model || "default",
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: assistantContent },
+            finish_reason: "stop"
+          }
+        ]
+      });
       return;
     }
 
+    // 只有在命中真实工具调用时，才记录助手消息并执行工具
     messages.push({
       role: "assistant",
       content: assistantContent || null,
@@ -801,11 +816,13 @@ async function runAgent(requestBody, clientResponse) {
       const rawAction = toolInfo?.rawName || tc.name;
       const args = toolArguments({ function: { arguments: tc.arguments } });
 
-      sendReasoningChunk(
-        clientResponse,
-        `\n> 正在执行 ${displayName} [${rawAction}]...\n`,
-        requestBody.model
-      );
+      if (isStream) {
+        sendReasoningChunk(
+          clientResponse,
+          `\n> 正在执行 ${displayName} [${rawAction}]...\n`,
+          requestBody.model
+        );
+      }
 
       let result;
       if (args === null) {
@@ -818,11 +835,13 @@ async function runAgent(requestBody, clientResponse) {
         }
       }
 
-      sendReasoningChunk(
-        clientResponse,
-        `> ${displayName} [${rawAction}] 完成\n\n`,
-        requestBody.model
-      );
+      if (isStream) {
+        sendReasoningChunk(
+          clientResponse,
+          `> ${displayName} [${rawAction}] 完成\n\n`,
+          requestBody.model
+        );
+      }
 
       messages.push({
         role: "tool",
