@@ -33,7 +33,7 @@ function getToolAction(toolName) {
 }
 
 function getServiceDisplayName(toolInfo, toolName) {
-  if (toolName === "web_search") return "网络搜索引擎";
+  if (toolName === "web_search") return "网络搜索";
   if (toolInfo?.serverName) return toolInfo.serverName;
   const name = (toolName || "").toLowerCase();
   if (name.includes("github")) return "GitHub";
@@ -283,7 +283,7 @@ async function executeWebSearch(query) {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
       },
       body: `q=${encodeURIComponent(query)}`,
-      signal: AbortSignal.timeout(12000)
+      signal: AbortSignal.timeout(10000)
     });
     if (!res.ok) throw new Error(`搜索引擎状态异常 (${res.status})`);
     const html = await res.text();
@@ -297,7 +297,7 @@ async function executeWebSearch(query) {
     if (snippets.length === 0) {
       return `搜索 "${query}" 未获取到最新结果。`;
     }
-    return `关于 "${query}" 的最新实时网络搜索结果：\n\n` + snippets.map((s, idx) => `[${idx + 1}] ${s}`).join("\n\n");
+    return `关于 "${query}" 的最新网络搜索结果：\n\n` + snippets.map((s, idx) => `[${idx + 1}] ${s}`).join("\n\n");
   } catch (err) {
     return `网络搜索接口响应：${err instanceof Error ? err.message : "请求失败"}`;
   }
@@ -484,14 +484,11 @@ const BUILTIN_SEARCH_TOOL = {
   type: "function",
   function: {
     name: "web_search",
-    description: "在互联网上进行实时搜索。当需要查询最新资讯、新闻、天气、技术文档或你不确定的事实时，必须调用本工具。",
+    description: "联网搜索引擎。仅在用户明确需要获取实时最新新闻、天气或特定外部公开资讯时调用。常规常识问答和当前时间绝不调用。",
     parameters: {
       type: "object",
       properties: {
-        query: {
-          type: "string",
-          description: "搜索关键词"
-        }
+        query: { type: "string", description: "搜索关键词" }
       },
       required: ["query"]
     }
@@ -509,19 +506,25 @@ function getAllTools() {
 }
 
 function buildToolPrompt() {
-  const activeServers = Array.from(mcpServers.values()).filter((s) => s.status === "active");
-  const serverNames = activeServers.map((s) => `${s.name} (${s.toolCount} 个工具)`).join("、");
+  const now = new Date();
+  const bjTime = now.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
+  const utcTime = now.toISOString().replace("T", " ").replace(/\..+/, " UTC");
+
   return [
-    `# 增强型真实执行环境（已挂载网络搜索与远程 MCP）`,
-    `当前环境已激活以下能力：`,
-    `1. 【网络权限】：已内置 \`web_search\` 实时网络搜索工具。如需查询最新事实、新闻、资料、网页信息，请调用 \`web_search\` 工具。`,
-    activeServers.length > 0 ? `2. 【MCP 服务】：${serverNames}，包含已挂载的外部接口函数。` : "",
-    `【铁律：禁止假调用、禁止口头承诺、必须实际调用工具】`,
-    `1. 遇到任何需要联网检索、查询、读取、写入、创建、提交、修改或删除的指令，必须且只能通过 tool_calls 触发对应的函数，绝不可在正文中直接假装已经完成。`,
-    `2. 严禁在回答中编造事实、Commit SHA、PR 链接或假装已更新。`,
-    `3. 严禁在正文回答中用文本模拟“正在调用”、“已调用”或以代码块格式伪造工具返回。`,
-    `4. 只有在收到工具的真正执行返回内容后，方可基于真实返回给用户输出结论。`
-  ].filter(Boolean).join("\n");
+    `# 运行环境与时间信息`,
+    `- 当前北京时间 (UTC+8): ${bjTime}`,
+    `- 当前全球标准时间 (UTC): ${utcTime}`,
+    `- 用户询问当前时间、日期或今天星期几时，直接使用上述时间回答，严禁调用任何工具！`,
+    ``,
+    `# 工具调用规范`,
+    `1. 【精准按需调用，严禁盲目乱调】：只有当用户指令明确针对某个服务时才调用对应工具。`,
+    `   - 用户询问 GitHub 仓库、代码、分支、提交时：只能调用 GitHub 相关工具。`,
+    `   - 用户询问 Cloudflare、Workers、DNS、域名时：只能调用 Cloudflare 相关工具。`,
+    `   - 用户明确需要查询最新互联网新闻、外部网页时：只能调用 web_search 工具。`,
+    `   - 用户进行普通聊天、问答、数学计算、常识解释或询问当前时间时：直接给出文字回答，绝对不得调用任何工具！`,
+    `2. 【严禁全量轮询】：严禁在一次请求中无脑将无关工具全部执行一遍。`,
+    `3. 【真实性要求】：严禁口头伪造 Commit SHA 或虚构操作结果。涉及修改/提交必须真实调用对应接口。`
+  ].join("\n");
 }
 
 function upstreamChatCompletionsUrl() {
@@ -611,7 +614,7 @@ async function runAgent(requestBody, clientResponse) {
       if (idx === existingSystemIndex) {
         return {
           role: "system",
-          content: `${m.content || ""}\n\n${toolPrompt}`
+          content: `${toolPrompt}\n\n${m.content || ""}`
         };
       }
       return m;
