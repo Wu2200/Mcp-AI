@@ -316,6 +316,38 @@ function sendReasoningChunk(clientResponse, text, model = "default") {
   clientResponse.write(`data: ${JSON.stringify(chunk)}\n\n`);
 }
 
+function applyCliproxyRules(payload) {
+  const model = String(payload.model || "").toLowerCase();
+
+  if (model.startsWith("gpt") || model.includes("codex")) {
+    if (!payload.reasoning) {
+      payload.reasoning = { summary: "detailed" };
+    }
+    if (Array.isArray(payload.tools)) {
+      const hasWebSearch = payload.tools.some(
+        (t) => t.type === "web_search" || t.function?.name === "web_search"
+      );
+      if (!hasWebSearch) {
+        payload.tools.push({ type: "web_search" });
+      }
+    }
+  }
+
+  if (model.startsWith("gemini")) {
+    if (!payload.generationConfig) {
+      payload.generationConfig = { thinkingConfig: { includeThought: true } };
+    }
+    if (Array.isArray(payload.tools)) {
+      const hasGoogleSearch = payload.tools.some(
+        (t) => t.google_search !== undefined || t.type === "google_search"
+      );
+      if (!hasGoogleSearch) {
+        payload.tools.push({ google_search: {} });
+      }
+    }
+  }
+}
+
 async function passThrough(requestBody, clientResponse) {
   setCorsHeaders(clientResponse);
   const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
@@ -353,7 +385,10 @@ async function runAgent(requestBody, clientResponse) {
   const isStream = requestBody.stream === true;
   const rawMessages = requestBody.messages;
   const toolPrompt = buildToolPrompt();
-  const tools = getAllTools();
+
+  const clientTools = Array.isArray(requestBody.tools) ? requestBody.tools : [];
+  const mcpTools = getAllTools();
+  const tools = [...clientTools, ...mcpTools];
 
   const existingSystemIndex = rawMessages.findIndex((m) => m.role === "system");
   let messages;
@@ -385,11 +420,12 @@ async function runAgent(requestBody, clientResponse) {
     const payload = {
       ...requestBody,
       messages,
-      tools,
+      tools: [...tools],
       tool_choice: "auto",
-      stream: true,
-      n: 1
+      stream: true
     };
+
+    applyCliproxyRules(payload);
 
     const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
       method: "POST",
