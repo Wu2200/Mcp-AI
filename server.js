@@ -659,13 +659,14 @@ async function runAgent(requestBody, clientResponse) {
     });
   }
 
+  // 工业标准 SSE 心跳间隔：15 秒（兼顾网络防超时与系统零负担）
   let keepAliveTimer = null;
   if (isStream) {
     keepAliveTimer = setInterval(() => {
       try {
         clientResponse.write(": keep-alive\n\n");
       } catch {}
-    }, 3000);
+    }, 15000);
   }
 
   try {
@@ -1229,5 +1230,9 @@ const server = http.createServer(async (request, response) => {
     sendJson(response, 500, { error: err.message });
   }
 });
+
+server.keepAliveTimeout = 600000;
+server.requestTimeout = 600000;
+server.headersTimeout = 600000;
 
 server.listen(PORT, "0.0.0.0");
