@@ -667,7 +667,7 @@ async function runAgent(requestBody, clientResponse) {
   }
 
   try {
-    for (let round = 0; round < 15; round += 1) {
+    for (let round = 0; round < 100; round += 1) {
       const payload = {
         ...requestBody,
         messages,
