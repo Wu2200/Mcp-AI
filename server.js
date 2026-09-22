@@ -436,7 +436,6 @@ async function connectToMcpServer({ name, url, token }) {
   return serverInfo;
 }
 
-// 规范且深度解析 MCP 工具返回：支持 text、resource(text/blob base64) 等所有官方标准内容，彻底避免文件丢失
 function extractMcpResultContent(data) {
   if (!data) return "{}";
   if (typeof data === "string") return data;
@@ -444,17 +443,13 @@ function extractMcpResultContent(data) {
   const rawResult = data.result !== undefined ? data.result : data;
   if (!rawResult) return "{}";
 
-  // 标准 MCP 格式 content 数组
   if (Array.isArray(rawResult.content)) {
     const pieces = [];
     for (const item of rawResult.content) {
       if (!item) continue;
-      // 1. 普通文本
       if (item.type === "text" && item.text) {
         pieces.push(item.text);
-      }
-      // 2. 嵌入资源类型 (resource 或 embedded_resource)
-      else if ((item.type === "resource" || item.type === "embedded_resource") && item.resource) {
+      } else if ((item.type === "resource" || item.type === "embedded_resource") && item.resource) {
         if (item.resource.text) {
           pieces.push(item.resource.text);
         } else if (item.resource.blob) {
@@ -465,9 +460,7 @@ function extractMcpResultContent(data) {
             pieces.push(item.resource.blob);
           }
         }
-      }
-      // 3. 其他兜底字段
-      else if (item.text) {
+      } else if (item.text) {
         pieces.push(item.text);
       }
     }
@@ -476,7 +469,6 @@ function extractMcpResultContent(data) {
     }
   }
 
-  // 4. GitHub REST API 风格的 base64 内容兜底解析
   if (rawResult.content && rawResult.encoding === "base64" && typeof rawResult.content === "string") {
     try {
       return Buffer.from(rawResult.content, "base64").toString("utf8");
@@ -550,7 +542,8 @@ function toolArguments(toolCall) {
   }
 }
 
-function sendReasoningChunk(clientResponse, text, model = "default") {
+// 统一包装为 Chatbox / OpenAI 客户端可安全解析的标准 SSE Chunk
+function sendSSEChunk(clientResponse, delta, model = "default") {
   const chunk = {
     id: `chatcmpl-${Date.now()}`,
     object: "chat.completion.chunk",
@@ -559,12 +552,16 @@ function sendReasoningChunk(clientResponse, text, model = "default") {
     choices: [
       {
         index: 0,
-        delta: { reasoning_content: text },
+        delta,
         finish_reason: null
       }
     ]
   };
   clientResponse.write(`data: ${JSON.stringify(chunk)}\n\n`);
+}
+
+function sendReasoningChunk(clientResponse, text, model = "default") {
+  sendSSEChunk(clientResponse, { reasoning_content: text }, model);
 }
 
 async function passThrough(requestBody, clientResponse) {
@@ -659,14 +656,14 @@ async function runAgent(requestBody, clientResponse) {
     });
   }
 
-  // 工业标准 SSE 心跳间隔：15 秒（兼顾网络防超时与系统零负担）
+  // 客户端兼容的合法 SSE 保活心跳：输出空 delta，所有客户端均合法兼容且永不掐线
   let keepAliveTimer = null;
   if (isStream) {
     keepAliveTimer = setInterval(() => {
       try {
-        clientResponse.write(": keep-alive\n\n");
+        sendSSEChunk(clientResponse, {}, requestBody.model || "default");
       } catch {}
-    }, 15000);
+    }, 5000);
   }
 
   try {
@@ -768,6 +765,7 @@ async function runAgent(requestBody, clientResponse) {
       let buffer = "";
       let accumulatedToolCalls = [];
       let assistantContent = "";
+      let hasToolCalls = false;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -788,6 +786,7 @@ async function runAgent(requestBody, clientResponse) {
             const delta = parsed.choices?.[0]?.delta;
 
             if (delta?.tool_calls) {
+              hasToolCalls = true;
               for (const tc of delta.tool_calls) {
                 const index = tc.index ?? 0;
                 if (!accumulatedToolCalls[index]) {
@@ -803,10 +802,14 @@ async function runAgent(requestBody, clientResponse) {
               }
             }
 
+            // 遇到普通正文内容：实时推给客户端，避免任何超时；若本轮是工具调用，正文不透传以免污染
             if (delta?.content) {
               assistantContent += delta.content;
-              clientResponse.write(`${line}\n\n`);
+              if (!hasToolCalls) {
+                clientResponse.write(`${line}\n\n`);
+              }
             } else if (delta?.reasoning_content) {
+              // 推送模型原生思考过程给客户端（Chatbox 深度思考展示）
               clientResponse.write(`${line}\n\n`);
             }
           } catch {}
