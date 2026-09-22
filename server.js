@@ -287,7 +287,7 @@ function readRequestBody(request) {
     let size = 0;
     request.on("data", (chunk) => {
       size += chunk.length;
-      if (size > 20 * 1024 * 1024) {
+      if (size > 50 * 1024 * 1024) {
         reject(new Error("请求过大"));
         request.destroy();
         return;
@@ -436,7 +436,6 @@ async function connectToMcpServer({ name, url, token }) {
   return serverInfo;
 }
 
-// 规范且深度解析 MCP 工具返回：支持 text、resource(text/blob base64) 等所有官方标准内容，彻底避免文件丢失
 function extractMcpResultContent(data) {
   if (!data) return "{}";
   if (typeof data === "string") return data;
@@ -444,17 +443,13 @@ function extractMcpResultContent(data) {
   const rawResult = data.result !== undefined ? data.result : data;
   if (!rawResult) return "{}";
 
-  // 标准 MCP 格式 content 数组
   if (Array.isArray(rawResult.content)) {
     const pieces = [];
     for (const item of rawResult.content) {
       if (!item) continue;
-      // 1. 普通文本
       if (item.type === "text" && item.text) {
         pieces.push(item.text);
-      }
-      // 2. 嵌入资源类型 (resource 或 embedded_resource)
-      else if ((item.type === "resource" || item.type === "embedded_resource") && item.resource) {
+      } else if ((item.type === "resource" || item.type === "embedded_resource") && item.resource) {
         if (item.resource.text) {
           pieces.push(item.resource.text);
         } else if (item.resource.blob) {
@@ -465,9 +460,7 @@ function extractMcpResultContent(data) {
             pieces.push(item.resource.blob);
           }
         }
-      }
-      // 3. 其他兜底字段
-      else if (item.text) {
+      } else if (item.text) {
         pieces.push(item.text);
       }
     }
@@ -476,7 +469,6 @@ function extractMcpResultContent(data) {
     }
   }
 
-  // 4. GitHub REST API 风格的 base64 内容兜底解析
   if (rawResult.content && rawResult.encoding === "base64" && typeof rawResult.content === "string") {
     try {
       return Buffer.from(rawResult.content, "base64").toString("utf8");
@@ -512,7 +504,7 @@ async function callMcpTool(toolKey, args) {
 
   if (!res.ok) {
     const txt = await res.text();
-    throw new Error(`执行失败 (${res.status}): ${txt.slice(0, 300)}`);
+    throw new Error(`执行失败 (${res.status}): ${txt.slice(0, 500)}`);
   }
 
   const data = await parseMcpResponse(res);
@@ -576,7 +568,7 @@ async function passThrough(requestBody, clientResponse) {
       "Content-Type": "application/json"
     },
     body: JSON.stringify(requestBody),
-    signal: AbortSignal.timeout(300000)
+    signal: AbortSignal.timeout(600000)
   });
 
   clientResponse.writeHead(upstreamResponse.status, {
@@ -659,199 +651,234 @@ async function runAgent(requestBody, clientResponse) {
     });
   }
 
-  for (let round = 0; round < 15; round += 1) {
-    const payload = {
-      ...requestBody,
-      messages,
-      stream: true
-    };
+  let keepAliveTimer = null;
+  if (isStream) {
+    keepAliveTimer = setInterval(() => {
+      try {
+        clientResponse.write(": keep-alive\n\n");
+      } catch {}
+    }, 3000);
+  }
 
-    if (tools.length > 0) {
-      payload.tools = tools;
-      payload.tool_choice = "auto";
-    }
+  try {
+    for (let round = 0; round < 15; round += 1) {
+      const payload = {
+        ...requestBody,
+        messages,
+        stream: isStream
+      };
 
-    const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${UPSTREAM_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(300000)
-    });
-
-    if (!upstreamResponse.ok) {
-      const err = await upstreamResponse.text();
-      if (isStream) {
-        const errorChunk = {
-          id: `chatcmpl-${Date.now()}`,
-          object: "chat.completion.chunk",
-          created: Math.floor(Date.now() / 1000),
-          model: requestBody.model || "default",
-          choices: [
-            {
-              index: 0,
-              delta: { content: `\n\n上游返回错误 (${upstreamResponse.status})：${err.slice(0, 500)}` },
-              finish_reason: "stop"
-            }
-          ]
-        };
-        clientResponse.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
-        clientResponse.write("data: [DONE]\n\n");
-        clientResponse.end();
-        return;
+      if (tools.length > 0) {
+        payload.tools = tools;
+        payload.tool_choice = "auto";
       }
-      throw new Error(`上游接口返回错误 (${upstreamResponse.status})：${err.slice(0, 500)}`);
-    }
 
-    const reader = upstreamResponse.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    let accumulatedToolCalls = [];
-    let assistantContent = "";
+      const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${UPSTREAM_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(600000)
+      });
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith("data:")) continue;
-        const dataStr = trimmed.slice(5).trim();
-        if (dataStr === "[DONE]") continue;
-
-        try {
-          const parsed = JSON.parse(dataStr);
-          const delta = parsed.choices?.[0]?.delta;
-
-          if (delta?.tool_calls) {
-            for (const tc of delta.tool_calls) {
-              const index = tc.index ?? 0;
-              if (!accumulatedToolCalls[index]) {
-                accumulatedToolCalls[index] = {
-                  id: tc.id || `call_${crypto.randomUUID()}`,
-                  name: tc.function?.name || "",
-                  arguments: ""
-                };
+      if (!upstreamResponse.ok) {
+        const err = await upstreamResponse.text();
+        if (isStream) {
+          const errorChunk = {
+            id: `chatcmpl-${Date.now()}`,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: requestBody.model || "default",
+            choices: [
+              {
+                index: 0,
+                delta: { content: `\n\n上游返回错误 (${upstreamResponse.status})：${err.slice(0, 500)}` },
+                finish_reason: "stop"
               }
-              if (tc.id) accumulatedToolCalls[index].id = tc.id;
-              if (tc.function?.name) accumulatedToolCalls[index].name = tc.function.name;
-              if (tc.function?.arguments) accumulatedToolCalls[index].arguments += tc.function.arguments;
+            ]
+          };
+          clientResponse.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
+          clientResponse.write("data: [DONE]\n\n");
+          clientResponse.end();
+          return;
+        }
+        throw new Error(`上游接口返回错误 (${upstreamResponse.status})：${err.slice(0, 500)}`);
+      }
+
+      if (!isStream) {
+        const json = await upstreamResponse.json();
+        const message = json.choices?.[0]?.message;
+        const toolCalls = message?.tool_calls || [];
+        const mcpCalls = toolCalls.filter((tc) => {
+          if (!tc || !tc.function?.name) return false;
+          const name = tc.function.name;
+          if (mcpToolRegistry.has(name)) return true;
+          for (const [k, v] of mcpToolRegistry.entries()) {
+            if (k.endsWith(name) || name.endsWith(v.rawName)) return true;
+          }
+          return false;
+        });
+
+        if (mcpCalls.length === 0) {
+          sendJson(clientResponse, 200, json);
+          return;
+        }
+
+        messages.push(message);
+
+        for (const tc of mcpCalls) {
+          let toolInfo = mcpToolRegistry.get(tc.function.name);
+          if (!toolInfo) {
+            for (const [k, v] of mcpToolRegistry.entries()) {
+              if (k.endsWith(tc.function.name) || tc.function.name.endsWith(v.rawName)) {
+                toolInfo = v;
+                break;
+              }
             }
           }
+          const args = toolArguments(tc);
+          let result;
+          try {
+            result = await callMcpTool(tc.function.name, args);
+          } catch (err) {
+            result = JSON.stringify({ error: err.message });
+          }
+          messages.push({
+            role: "tool",
+            tool_call_id: tc.id,
+            content: typeof result === "string" ? result : JSON.stringify(result)
+          });
+        }
+        continue;
+      }
 
-          if (delta?.content) {
-            assistantContent += delta.content;
-            if (isStream) {
+      const reader = upstreamResponse.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let accumulatedToolCalls = [];
+      let assistantContent = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith("data:")) continue;
+          const dataStr = trimmed.slice(5).trim();
+          if (dataStr === "[DONE]") continue;
+
+          try {
+            const parsed = JSON.parse(dataStr);
+            const delta = parsed.choices?.[0]?.delta;
+
+            if (delta?.tool_calls) {
+              for (const tc of delta.tool_calls) {
+                const index = tc.index ?? 0;
+                if (!accumulatedToolCalls[index]) {
+                  accumulatedToolCalls[index] = {
+                    id: tc.id || `call_${crypto.randomUUID()}`,
+                    name: tc.function?.name || "",
+                    arguments: ""
+                  };
+                }
+                if (tc.id) accumulatedToolCalls[index].id = tc.id;
+                if (tc.function?.name) accumulatedToolCalls[index].name = tc.function.name;
+                if (tc.function?.arguments) accumulatedToolCalls[index].arguments += tc.function.arguments;
+              }
+            }
+
+            if (delta?.content) {
+              assistantContent += delta.content;
+              clientResponse.write(`${line}\n\n`);
+            } else if (delta?.reasoning_content) {
               clientResponse.write(`${line}\n\n`);
             }
-          } else if (delta?.reasoning_content && isStream) {
-            clientResponse.write(`${line}\n\n`);
-          }
-        } catch {}
-      }
-    }
-
-    const mcpCalls = accumulatedToolCalls.filter((tc) => {
-      if (!tc || !tc.name) return false;
-      if (mcpToolRegistry.has(tc.name)) return true;
-      for (const [k, v] of mcpToolRegistry.entries()) {
-        if (k.endsWith(tc.name) || tc.name.endsWith(v.rawName)) return true;
-      }
-      return false;
-    });
-
-    // 模型输出完毕且没有发起任何工具调用，直接优雅结束流式传输，零截断
-    if (mcpCalls.length === 0) {
-      if (isStream) {
-        clientResponse.write("data: [DONE]\n\n");
-        clientResponse.end();
-        return;
-      }
-
-      sendJson(clientResponse, 200, {
-        id: `chatcmpl-${crypto.randomUUID()}`,
-        object: "chat.completion",
-        created: Math.floor(Date.now() / 1000),
-        model: requestBody.model || "default",
-        choices: [
-          {
-            index: 0,
-            message: { role: "assistant", content: assistantContent },
-            finish_reason: "stop"
-          }
-        ]
-      });
-      return;
-    }
-
-    // 只有在命中真实工具调用时，才记录助手消息并执行工具
-    messages.push({
-      role: "assistant",
-      content: assistantContent || null,
-      tool_calls: mcpCalls.map((tc) => ({
-        id: tc.id || `call_${crypto.randomUUID()}`,
-        type: "function",
-        function: { name: tc.name, arguments: tc.arguments }
-      }))
-    });
-
-    for (const tc of mcpCalls) {
-      let toolInfo = mcpToolRegistry.get(tc.name);
-      if (!toolInfo) {
-        for (const [k, v] of mcpToolRegistry.entries()) {
-          if (k.endsWith(tc.name) || tc.name.endsWith(v.rawName)) {
-            toolInfo = v;
-            break;
-          }
+          } catch {}
         }
       }
 
-      const displayName = toolInfo?.serverName || "MCP";
-      const rawAction = toolInfo?.rawName || tc.name;
-      const args = toolArguments({ function: { arguments: tc.arguments } });
+      const mcpCalls = accumulatedToolCalls.filter((tc) => {
+        if (!tc || !tc.name) return false;
+        if (mcpToolRegistry.has(tc.name)) return true;
+        for (const [k, v] of mcpToolRegistry.entries()) {
+          if (k.endsWith(tc.name) || tc.name.endsWith(v.rawName)) return true;
+        }
+        return false;
+      });
 
-      if (isStream) {
+      if (mcpCalls.length === 0) {
+        clientResponse.write("data: [DONE]\n\n");
+        clientResponse.end();
+        return;
+      }
+
+      messages.push({
+        role: "assistant",
+        content: assistantContent || null,
+        tool_calls: mcpCalls.map((tc) => ({
+          id: tc.id || `call_${crypto.randomUUID()}`,
+          type: "function",
+          function: { name: tc.name, arguments: tc.arguments }
+        }))
+      });
+
+      for (const tc of mcpCalls) {
+        let toolInfo = mcpToolRegistry.get(tc.name);
+        if (!toolInfo) {
+          for (const [k, v] of mcpToolRegistry.entries()) {
+            if (k.endsWith(tc.name) || tc.name.endsWith(v.rawName)) {
+              toolInfo = v;
+              break;
+            }
+          }
+        }
+
+        const displayName = toolInfo?.serverName || "MCP";
+        const rawAction = toolInfo?.rawName || tc.name;
+        const args = toolArguments({ function: { arguments: tc.arguments } });
+
         sendReasoningChunk(
           clientResponse,
           `\n> 正在执行 ${displayName} [${rawAction}]...\n`,
           requestBody.model
         );
-      }
 
-      let result;
-      if (args === null) {
-        result = JSON.stringify({ error: "Invalid tool arguments" });
-      } else {
-        try {
-          result = await callMcpTool(tc.name, args);
-        } catch (err) {
-          result = JSON.stringify({ error: err instanceof Error ? err.message : "Tool execution failed" });
+        let result;
+        if (args === null) {
+          result = JSON.stringify({ error: "Invalid tool arguments" });
+        } else {
+          try {
+            result = await callMcpTool(tc.name, args);
+          } catch (err) {
+            result = JSON.stringify({ error: err instanceof Error ? err.message : "Tool execution failed" });
+          }
         }
-      }
 
-      if (isStream) {
         sendReasoningChunk(
           clientResponse,
           `> ${displayName} [${rawAction}] 完成\n\n`,
           requestBody.model
         );
+
+        messages.push({
+          role: "tool",
+          tool_call_id: tc.id || `call_${crypto.randomUUID()}`,
+          content: typeof result === "string" ? result : JSON.stringify(result)
+        });
       }
-
-      messages.push({
-        role: "tool",
-        tool_call_id: tc.id || `call_${crypto.randomUUID()}`,
-        content: typeof result === "string" ? result : JSON.stringify(result)
-      });
     }
-  }
 
-  throw new Error("工具调用轮数达到上限");
+    throw new Error("工具调用轮数达到上限");
+  } finally {
+    if (keepAliveTimer) clearInterval(keepAliveTimer);
+  }
 }
 
 function getLoginHtml() {
@@ -948,7 +975,11 @@ await initDatabase();
 await loadConfigFromStorage();
 await loadEnabledModelsFromStorage();
 
-const server = http.createServer(async (request, response) => {
+const server = http.createServer({
+  keepAlive: true,
+  keepAliveTimeout: 600000,
+  headersTimeout: 605000
+}, async (request, response) => {
   try {
     if (request.method === "OPTIONS") {
       setCorsHeaders(response);
