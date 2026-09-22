@@ -436,6 +436,7 @@ async function connectToMcpServer({ name, url, token }) {
   return serverInfo;
 }
 
+// 规范且深度解析 MCP 工具返回：支持 text、resource(text/blob base64) 等所有官方标准内容，彻底避免文件丢失
 function extractMcpResultContent(data) {
   if (!data) return "{}";
   if (typeof data === "string") return data;
@@ -443,13 +444,17 @@ function extractMcpResultContent(data) {
   const rawResult = data.result !== undefined ? data.result : data;
   if (!rawResult) return "{}";
 
+  // 标准 MCP 格式 content 数组
   if (Array.isArray(rawResult.content)) {
     const pieces = [];
     for (const item of rawResult.content) {
       if (!item) continue;
+      // 1. 普通文本
       if (item.type === "text" && item.text) {
         pieces.push(item.text);
-      } else if ((item.type === "resource" || item.type === "embedded_resource") && item.resource) {
+      }
+      // 2. 嵌入资源类型 (resource 或 embedded_resource)
+      else if ((item.type === "resource" || item.type === "embedded_resource") && item.resource) {
         if (item.resource.text) {
           pieces.push(item.resource.text);
         } else if (item.resource.blob) {
@@ -460,7 +465,9 @@ function extractMcpResultContent(data) {
             pieces.push(item.resource.blob);
           }
         }
-      } else if (item.text) {
+      }
+      // 3. 其他兜底字段
+      else if (item.text) {
         pieces.push(item.text);
       }
     }
@@ -469,6 +476,7 @@ function extractMcpResultContent(data) {
     }
   }
 
+  // 4. GitHub REST API 风格的 base64 内容兜底解析
   if (rawResult.content && rawResult.encoding === "base64" && typeof rawResult.content === "string") {
     try {
       return Buffer.from(rawResult.content, "base64").toString("utf8");
@@ -504,7 +512,7 @@ async function callMcpTool(toolKey, args) {
 
   if (!res.ok) {
     const txt = await res.text();
-    throw new Error(`执行失败 (${res.status}): ${txt.slice(0, 500)}`);
+    throw new Error(`执行失败 (${res.status}): ${txt.slice(0, 300)}`);
   }
 
   const data = await parseMcpResponse(res);
@@ -568,7 +576,7 @@ async function passThrough(requestBody, clientResponse) {
       "Content-Type": "application/json"
     },
     body: JSON.stringify(requestBody),
-    signal: AbortSignal.timeout(600000)
+    signal: AbortSignal.timeout(300000)
   });
 
   clientResponse.writeHead(upstreamResponse.status, {
@@ -680,7 +688,7 @@ async function runAgent(requestBody, clientResponse) {
           "Content-Type": "application/json"
         },
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(600000)
+        signal: AbortSignal.timeout(300000)
       });
 
       if (!upstreamResponse.ok) {
@@ -975,11 +983,7 @@ await initDatabase();
 await loadConfigFromStorage();
 await loadEnabledModelsFromStorage();
 
-const server = http.createServer({
-  keepAlive: true,
-  keepAliveTimeout: 600000,
-  headersTimeout: 605000
-}, async (request, response) => {
+const server = http.createServer(async (request, response) => {
   try {
     if (request.method === "OPTIONS") {
       setCorsHeaders(response);
