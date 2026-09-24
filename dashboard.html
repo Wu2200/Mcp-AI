@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>MCP 控制台</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -10,22 +10,22 @@
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
       background-color: #f8fafc;
       color: #1e293b;
-      padding: 24px 14px;
+      padding: 16px 12px;
       line-height: 1.5;
     }
     .container {
-      max-width: 860px;
+      max-width: 880px;
       margin: 0 auto;
     }
     .header {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      margin-bottom: 20px;
+      margin-bottom: 16px;
       gap: 12px;
     }
     .header h1 {
-      font-size: 20px;
+      font-size: 19px;
       font-weight: 700;
       color: #0f172a;
       letter-spacing: -0.02em;
@@ -57,24 +57,33 @@
       background: #ffffff;
       border: 1px solid #e2e8f0;
       border-radius: 12px;
-      padding: 20px;
-      margin-bottom: 16px;
+      padding: 16px;
+      margin-bottom: 14px;
       box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05);
     }
+    
+    /* 彻底重构标题栏排版：移动端友好，绝不产生单字竖排 */
     .card-title {
       font-size: 15px;
       font-weight: 600;
       color: #0f172a;
-      margin-bottom: 14px;
+      margin-bottom: 12px;
       display: flex;
+      flex-wrap: wrap;
       align-items: center;
       justify-content: space-between;
-      gap: 8px;
+      gap: 10px;
     }
     .card-title-left {
       display: flex;
       align-items: center;
       gap: 8px;
+      flex: 1 1 200px;
+      min-width: 0;
+    }
+    .card-title-left span {
+      white-space: normal;
+      word-break: break-word;
     }
     .badge {
       display: inline-flex;
@@ -139,7 +148,7 @@
       border: none;
       font-weight: 600;
       font-size: 14px;
-      padding: 10px 24px;
+      padding: 10px 20px;
       border-radius: 8px;
       cursor: pointer;
       white-space: nowrap;
@@ -153,28 +162,29 @@
       background: #f1f5f9;
       color: #334155;
       border: 1px solid #cbd5e1;
-      padding: 8px 16px;
+      padding: 8px 14px;
       font-size: 13px;
     }
     .btn-secondary:hover {
       background: #e2e8f0;
       color: #0f172a;
     }
+
+    /* 优化操作按钮条：手机端自动多行并列自适应 */
     .action-group {
       display: flex;
+      flex-wrap: wrap;
       gap: 6px;
       align-items: center;
-      flex-shrink: 0;
     }
     .btn-action {
       border: none;
-      padding: 5px 12px;
+      padding: 5px 10px;
       font-size: 12px;
       font-weight: 600;
       border-radius: 6px;
       cursor: pointer;
       white-space: nowrap;
-      flex-shrink: 0;
       transition: all 0.15s;
     }
     .btn-start {
@@ -211,9 +221,9 @@
     .server-item {
       background: #f8fafc;
       border: 1px solid #e2e8f0;
-      padding: 14px;
+      padding: 12px;
       border-radius: 10px;
-      margin-bottom: 12px;
+      margin-bottom: 10px;
     }
     .server-item:last-child {
       margin-bottom: 0;
@@ -224,20 +234,20 @@
     }
     .server-item-head {
       display: flex;
+      flex-wrap: wrap;
       justify-content: space-between;
       align-items: center;
-      margin-bottom: 8px;
+      margin-bottom: 6px;
       gap: 8px;
     }
     .server-item-title {
-      font-size: 15px;
+      font-size: 14px;
       font-weight: 600;
       color: #0f172a;
       display: flex;
       align-items: center;
       gap: 8px;
       min-width: 0;
-      overflow: hidden;
     }
     .server-name-text {
       white-space: nowrap;
@@ -247,12 +257,12 @@
     .server-item-url {
       font-size: 12px;
       color: #64748b;
-      margin-bottom: 8px;
+      margin-bottom: 6px;
       font-family: monospace;
       word-break: break-all;
     }
     .tool-toggle-bar {
-      font-size: 13px;
+      font-size: 12px;
       color: #475569;
       display: flex;
       align-items: center;
@@ -263,7 +273,7 @@
       background: none;
       border: none;
       color: #2563eb;
-      font-size: 13px;
+      font-size: 12px;
       cursor: pointer;
       padding: 0;
       font-weight: 500;
@@ -273,8 +283,8 @@
       text-decoration: underline;
     }
     .tools-container {
-      margin-top: 10px;
-      padding-top: 10px;
+      margin-top: 8px;
+      padding-top: 8px;
       border-top: 1px dashed #cbd5e1;
       display: none;
     }
@@ -284,7 +294,7 @@
       color: #334155;
       font-size: 11px;
       font-family: monospace;
-      padding: 3px 8px;
+      padding: 3px 6px;
       border-radius: 4px;
       margin: 2px 4px 4px 0;
       word-break: break-all;
@@ -298,9 +308,9 @@
       border: 1px solid #bbf7d0;
       font-size: 12px;
       font-family: monospace;
-      padding: 4px 10px;
+      padding: 3px 8px;
       border-radius: 6px;
-      margin: 4px 6px 4px 0;
+      margin: 3px 4px 3px 0;
     }
     .model-tag-del {
       cursor: pointer;
@@ -321,9 +331,9 @@
       border: 1px solid #cbd5e1;
       font-size: 12px;
       font-family: monospace;
-      padding: 4px 8px;
-      border-radius: 6px;
-      margin: 3px 4px;
+      padding: 3px 6px;
+      border-radius: 5px;
+      margin: 2px 3px;
       cursor: pointer;
       user-select: none;
       transition: all 0.15s;
@@ -334,40 +344,41 @@
       border-color: #86efac;
     }
     #conn-msg, #enable-msg, #log-msg {
-      margin-left: 12px;
-      font-size: 13px;
+      margin-left: 10px;
+      font-size: 12px;
       font-weight: 500;
     }
     .empty-state {
       text-align: center;
-      padding: 28px 14px;
+      padding: 24px 10px;
       color: #94a3b8;
       font-size: 13px;
     }
 
-    /* 日志控制台样式 */
+    /* 日志控制台样式：移动端完美展示 */
     .log-panel-container {
       background: #0f172a;
       border: 1px solid #334155;
       border-radius: 8px;
-      padding: 12px;
+      padding: 10px;
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-      font-size: 12px;
+      font-size: 11px;
       color: #f1f5f9;
       max-height: 480px;
       overflow-y: auto;
     }
     .log-item {
       border-bottom: 1px solid #1e293b;
-      padding: 8px 0;
+      padding: 7px 0;
     }
     .log-item:last-child {
       border-bottom: none;
     }
     .log-header {
       display: flex;
+      flex-wrap: wrap;
       align-items: center;
-      gap: 8px;
+      gap: 6px;
       cursor: pointer;
       user-select: none;
     }
@@ -376,13 +387,13 @@
     }
     .log-time {
       color: #64748b;
-      font-size: 11px;
+      font-size: 10px;
       white-space: nowrap;
     }
     .log-type-tag {
-      padding: 1px 6px;
-      border-radius: 4px;
-      font-size: 11px;
+      padding: 1px 5px;
+      border-radius: 3px;
+      font-size: 10px;
       font-weight: 600;
       white-space: nowrap;
     }
@@ -392,7 +403,8 @@
     .tag-tool { background: #059669; color: #ffffff; }
     .tag-error { background: #dc2626; color: #ffffff; }
     .log-summary {
-      flex: 1;
+      flex: 1 1 160px;
+      min-width: 0;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
@@ -400,7 +412,8 @@
     }
     .log-expand-icon {
       color: #64748b;
-      font-size: 11px;
+      font-size: 10px;
+      width: 12px;
     }
     .log-body {
       display: none;
@@ -411,9 +424,18 @@
       margin-top: 6px;
       white-space: pre-wrap;
       word-break: break-all;
-      color: #94a3b8;
-      max-height: 300px;
+      color: #cbd5e1;
+      max-height: 280px;
       overflow-y: auto;
+      font-size: 11px;
+    }
+
+    @media (max-width: 640px) {
+      body { padding: 10px 8px; }
+      .card { padding: 14px 12px; }
+      .card-title { margin-bottom: 10px; }
+      .action-group { width: 100%; justify-content: flex-start; }
+      .action-group .btn-action { flex: 1 1 calc(50% - 6px); text-align: center; }
     }
   </style>
 </head>
@@ -422,7 +444,7 @@
     <div class="header">
       <div>
         <h1>MCP 代理控制台</h1>
-        <p>为客户端提供多 MCP 工具接入与模型精准调度</p>
+        <p>多 MCP 工具接入与模型精准调度</p>
       </div>
       <button class="btn-logout" onclick="handleLogout()">退出登录</button>
     </div>
@@ -444,7 +466,7 @@
       </div>
     </div>
 
-    <!-- 调试抓包日志卡片 -->
+    <!-- 全链路调试抓包日志卡片 -->
     <div class="card">
       <div class="card-title">
         <div class="card-title-left">
@@ -458,11 +480,11 @@
           <button class="btn-action btn-start" onclick="loadLogs()">刷新</button>
         </div>
       </div>
-      <p style="font-size: 13px; color: #64748b; margin-bottom: 12px;">
-        自动捕获下游客户端请求、发往上游 Payload、上游返回内容及 MCP 工具执行明细。点击任意日志条目即可展开查看完整数据报文。
+      <p style="font-size: 12px; color: #64748b; margin-bottom: 10px;">
+        捕获下游客户端请求、上游响应状态、工具执行耗时与截断诊断。若因达到最大 Token 发生截断会在此特别标红展示。点击任意记录可展开完整报文。
       </p>
       <div id="log-panel" class="log-panel-container">
-        <div class="empty-state" style="color: #64748b;">暂无抓包记录</div>
+        <div class="empty-state" style="color: #64748b;">正在加载抓包记录...</div>
       </div>
       <span id="log-msg"></span>
     </div>
@@ -475,38 +497,39 @@
           <span class="badge badge-green">仅选中模型支持 MCP</span>
         </div>
       </div>
-      <p style="font-size: 13px; color: #64748b; margin-bottom: 14px;">
-        <strong>白名单规则</strong>：只有加入此列表的模型才会挂载 MCP 工具。未在此列表中的其他所有模型将<strong>完全纯净直通上游</strong>（绝不携带任何 tools 参数），从而 100% 触发上游网关自带的原生网络搜索，互不干扰。
+      <p style="font-size: 12px; color: #64748b; margin-bottom: 12px;">
+        <strong>白名单规则</strong>：只有加入此列表的模型才会挂载 MCP 工具。未在此列表中的其他所有模型将<strong>完全纯净直通上游</strong>（绝不携带任何 tools 参数），从而 100% 触发上游网关自带的原生网络搜索。
       </p>
 
       <div class="group">
         <label>当前支持 MCP 的模型列表（支持完全匹配或通配符，如 claude*、gpt-4o*）：</label>
-        <div id="enabled-tags" style="min-height: 38px; padding: 6px 0;">
-          <span style="font-size: 13px; color: #94a3b8;">暂未启用任何模型，所有请求默认直通上游网关。</span>
+        <div id="enabled-tags" style="min-height: 34px; padding: 4px 0;">
+          <span style="font-size: 12px; color: #94a3b8;">暂未启用任何模型，所有请求默认直通上游网关。</span>
         </div>
       </div>
 
-      <div class="group" style="display: flex; gap: 8px; margin-top: 10px;">
-        <input id="custom-model-input" placeholder="手动输入模型名称或通配符（如 claude*，回车添加）" onkeydown="if(event.key==='Enter')addCustomModel()">
+      <div class="group" style="display: flex; gap: 8px; margin-top: 8px;">
+        <input id="custom-model-input" placeholder="输入模型名称或通配符（如 claude*，回车添加）" onkeydown="if(event.key==='Enter')addCustomModel()">
         <button class="btn btn-secondary" onclick="addCustomModel()">添加</button>
       </div>
 
-      <div class="group" style="margin-top: 14px;">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+      <div class="group" style="margin-top: 12px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
           <label style="margin: 0;">从上游所有模型中选择（点击即可开启 MCP）：</label>
-          <button class="btn-action btn-start" onclick="fetchUpstreamModels()">刷新上游模型列表</button>
+          <button class="btn-action btn-start" onclick="fetchUpstreamModels()">刷新上游模型</button>
         </div>
-        <div id="upstream-candidates" style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px; max-height: 140px; overflow-y: auto;">
-          <span style="font-size: 12px; color: #94a3b8;">点击上方“刷新上游模型列表”按钮获取上游所有可用模型</span>
+        <div id="upstream-candidates" style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px; max-height: 120px; overflow-y: auto;">
+          <span style="font-size: 12px; color: #94a3b8;">点击上方“刷新上游模型”按钮获取上游所有可用模型</span>
         </div>
       </div>
 
-      <div style="display: flex; align-items: center; margin-top: 16px;">
+      <div style="display: flex; align-items: center; margin-top: 14px;">
         <button class="btn" onclick="saveEnabledModels()">保存启用配置</button>
         <span id="enable-msg"></span>
       </div>
     </div>
 
+    <!-- 手动挂载 MCP 服务卡片 -->
     <div class="card">
       <div class="card-title">
         <div class="card-title-left">
@@ -525,12 +548,13 @@
         <label>认证令牌 (Token，可选)</label>
         <input id="mcp-token" type="password" placeholder="如需认证请粘贴 Token（如 ghu_、ghp_）">
       </div>
-      <div style="display: flex; align-items: center; margin-top: 16px;">
-        <button id="btn-conn" class="btn" onclick="handleConnect()">添加</button>
+      <div style="display: flex; align-items: center; margin-top: 14px;">
+        <button id="btn-conn" class="btn" onclick="handleConnect()">添加服务</button>
         <span id="conn-msg"></span>
       </div>
     </div>
 
+    <!-- 已挂载 MCP 服务列表 -->
     <div class="card">
       <div class="card-title">
         <div class="card-title-left">
@@ -558,7 +582,7 @@
     function renderEnabledTags() {
       const container = document.getElementById("enabled-tags");
       if (!currentEnabledList || currentEnabledList.length === 0) {
-        container.innerHTML = '<span style="font-size: 13px; color: #94a3b8;">暂未启用任何模型，所有请求默认直通上游网关。</span>';
+        container.innerHTML = '<span style="font-size: 12px; color: #94a3b8;">暂未启用任何模型，所有请求默认直通上游网关。</span>';
         return;
       }
       container.innerHTML = currentEnabledList.map((m, idx) => `
@@ -703,11 +727,10 @@
 
         const panel = document.getElementById("log-panel");
         if (cachedLogs.length === 0) {
-          panel.innerHTML = '<div class="empty-state" style="color: #64748b;">暂无抓包记录</div>';
+          panel.innerHTML = '<div class="empty-state" style="color: #64748b;">暂无抓包记录。在客户端发起对话即可在此实时查看。</div>';
           return;
         }
 
-        // 倒序展示最新的在最前面
         const list = [...cachedLogs].reverse();
         panel.innerHTML = list.map(item => `
           <div class="log-item">
@@ -715,7 +738,7 @@
               <span class="log-expand-icon" id="log-icon-${item.id}">▶</span>
               <span class="log-time">${item.time}</span>
               <span class="log-type-tag ${getTagClass(item.type)}">${item.type}</span>
-              <span class="log-summary" title="${item.summary.replace(/"/g, '&quot;')}">${item.summary}</span>
+              <span class="log-summary" title="${escapeHtml(item.summary)}">${escapeHtml(item.summary)}</span>
             </div>
             <div class="log-body" id="log-detail-${item.id}">${escapeHtml(item.detail)}</div>
           </div>
@@ -765,7 +788,7 @@
       const text = cachedLogs.map(l => `[${l.time}] [${l.type}] ${l.summary}\n${l.detail}\n----------------------------------------`).join("\n\n");
       navigator.clipboard.writeText(text).then(() => {
         const msg = document.getElementById("log-msg");
-        msg.innerText = "已复制全量抓包日志到剪贴板！";
+        msg.innerText = "已复制全量抓包日志！";
         msg.style.color = "#16a34a";
         setTimeout(() => { msg.innerText = ""; }, 3000);
       }).catch(() => {
@@ -783,7 +806,7 @@
         const data = await res.json();
         const el = document.getElementById("mcp-list");
         if (!data.servers || data.servers.length === 0) {
-          el.innerHTML = '<div class="empty-state">尚未挂载任何远程 MCP 服务。直接透传上游模型配置与联网搜索。</div>';
+          el.innerHTML = '<div class="empty-state">尚未挂载任何远程 MCP 服务。未启用的模型将直接透传上游联网搜索。</div>';
           return;
         }
         let html = "";
@@ -880,7 +903,7 @@
     loadEnabledSettings();
     loadServers();
     loadLogs();
-    setInterval(loadLogs, 3000);
+    setInterval(loadLogs, 2500);
   </script>
 </body>
 </html>
