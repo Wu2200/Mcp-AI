@@ -1059,7 +1059,6 @@ function convertGeminiToOpenAiRequest(geminiBody, modelName, isStream) {
   delete openAiBody.systemInstruction;
   delete openAiBody.generationConfig;
 
-  // 保留原始 generationConfig，以便 cliproxyapi / 上游原生解析
   if (geminiBody.generationConfig) {
     openAiBody.generationConfig = geminiBody.generationConfig;
     const gc = geminiBody.generationConfig;
@@ -1068,13 +1067,23 @@ function convertGeminiToOpenAiRequest(geminiBody, modelName, isStream) {
     if (gc.topP !== undefined) openAiBody.top_p = gc.topP;
     if (gc.stopSequences && Array.isArray(gc.stopSequences)) openAiBody.stop = gc.stopSequences;
     
-    // 如果有 thinkingConfig，同时填充 OpenAI 标准 reasoning_effort 及 thinking 字段
     if (gc.thinkingConfig) {
       openAiBody.thinkingConfig = gc.thinkingConfig;
       const tb = Number(gc.thinkingConfig.thinkingBudget);
-      if (tb === 0) {
+      const level = String(gc.thinkingConfig.thinkingLevel || "").toLowerCase();
+
+      if (level === "off" || level === "none" || tb === 0) {
         openAiBody.reasoning_effort = "none";
         openAiBody.thinking = { type: "disabled" };
+      } else if (level === "low") {
+        openAiBody.reasoning_effort = "low";
+        openAiBody.thinking = { type: "enabled", budget_tokens: 2048 };
+      } else if (level === "medium") {
+        openAiBody.reasoning_effort = "medium";
+        openAiBody.thinking = { type: "enabled", budget_tokens: 8192 };
+      } else if (level === "high") {
+        openAiBody.reasoning_effort = "high";
+        openAiBody.thinking = { type: "enabled", budget_tokens: 32768 };
       } else if (tb > 0) {
         openAiBody.thinking = { type: "enabled", budget_tokens: tb };
         if (tb > 8192) openAiBody.reasoning_effort = "high";
