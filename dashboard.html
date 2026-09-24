@@ -62,22 +62,26 @@
       box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05);
     }
     
-    .card-title-box {
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
+    /* 彻底重构标题栏排版：移动端友好，绝不产生单字竖排 */
+    .card-title {
+      font-size: 15px;
+      font-weight: 600;
+      color: #0f172a;
       margin-bottom: 12px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
     }
-    .card-title-main {
+    .card-title-left {
       display: flex;
       align-items: center;
-      flex-wrap: wrap;
       gap: 8px;
+      flex: 1 1 200px;
+      min-width: 0;
     }
-    .card-title-text {
-      font-size: 16px;
-      font-weight: 700;
-      color: #0f172a;
+    .card-title-left span {
       white-space: normal;
       word-break: break-word;
     }
@@ -166,6 +170,7 @@
       color: #0f172a;
     }
 
+    /* 优化操作按钮条：手机端自动多行并列自适应 */
     .action-group {
       display: flex;
       flex-wrap: wrap;
@@ -174,7 +179,7 @@
     }
     .btn-action {
       border: none;
-      padding: 6px 12px;
+      padding: 5px 10px;
       font-size: 12px;
       font-weight: 600;
       border-radius: 6px;
@@ -229,9 +234,11 @@
     }
     .server-item-head {
       display: flex;
-      flex-direction: column;
-      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
       margin-bottom: 6px;
+      gap: 8px;
     }
     .server-item-title {
       font-size: 14px;
@@ -348,6 +355,7 @@
       font-size: 13px;
     }
 
+    /* 日志控制台样式：移动端完美展示 */
     .log-panel-container {
       background: #0f172a;
       border: 1px solid #334155;
@@ -422,24 +430,12 @@
       font-size: 11px;
     }
 
-    @media (min-width: 641px) {
-      .card-title-box {
-        flex-direction: row;
-        justify-content: space-between;
-        align-items: center;
-      }
-      .server-item-head {
-        flex-direction: row;
-        justify-content: space-between;
-        align-items: center;
-      }
-    }
-
     @media (max-width: 640px) {
       body { padding: 10px 8px; }
       .card { padding: 14px 12px; }
-      .action-group { width: 100%; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-      .action-group .btn-action { width: 100%; text-align: center; }
+      .card-title { margin-bottom: 10px; }
+      .action-group { width: 100%; justify-content: flex-start; }
+      .action-group .btn-action { flex: 1 1 calc(50% - 6px); text-align: center; }
     }
   </style>
 </head>
@@ -454,19 +450,15 @@
     </div>
 
     <div class="card">
-      <div class="card-title-box">
-        <div class="card-title-main">
-          <span class="card-title-text">客户端连接配置</span>
+      <div class="card-title">
+        <div class="card-title-left">
+          <span>客户端连接配置</span>
           <span class="badge badge-blue">Chatbox 专用</span>
         </div>
       </div>
       <div class="group">
         <label>API 域名 (Base URL)</label>
         <div class="box" id="proxy-url"></div>
-      </div>
-      <div class="group">
-        <label>API Key (密钥)</label>
-        <div class="box" id="proxy-key-tip">需与环境变量 PROXY_API_KEY 一致；若服务端未设置则填任意字符</div>
       </div>
       <div class="group">
         <label>模型 (Model)</label>
@@ -476,9 +468,9 @@
 
     <!-- 全链路调试抓包日志卡片 -->
     <div class="card">
-      <div class="card-title-box">
-        <div class="card-title-main">
-          <span class="card-title-text">全链路调试抓包日志</span>
+      <div class="card-title">
+        <div class="card-title-left">
+          <span>全链路调试抓包日志</span>
           <span id="log-status-badge" class="badge badge-green">抓取中</span>
         </div>
         <div class="action-group">
@@ -499,9 +491,9 @@
 
     <!-- 启用模型配置卡片（白名单模式） -->
     <div class="card">
-      <div class="card-title-box">
-        <div class="card-title-main">
-          <span class="card-title-text">启用 MCP 的模型设置（白名单模式）</span>
+      <div class="card-title">
+        <div class="card-title-left">
+          <span>启用 MCP 的模型设置（白名单模式）</span>
           <span class="badge badge-green">仅选中模型支持 MCP</span>
         </div>
       </div>
@@ -539,9 +531,9 @@
 
     <!-- 手动挂载 MCP 服务卡片 -->
     <div class="card">
-      <div class="card-title-box">
-        <div class="card-title-main">
-          <span class="card-title-text">手动挂载 MCP 服务（支持添加多个）</span>
+      <div class="card-title">
+        <div class="card-title-left">
+          <span>手动挂载 MCP 服务（支持添加多个）</span>
         </div>
       </div>
       <div class="group">
@@ -564,13 +556,13 @@
 
     <!-- 已挂载 MCP 服务列表 -->
     <div class="card">
-      <div class="card-title-box">
-        <div class="card-title-main">
-          <span class="card-title-text">已挂载 MCP 服务列表</span>
+      <div class="card-title">
+        <div class="card-title-left">
+          <span>已挂载 MCP 服务列表</span>
         </div>
       </div>
       <div id="mcp-list">
-        <div class="empty-state">尚未挂载任何远程 MCP 服务。未启用的模型将直接透传上游联网搜索。</div>
+        <div class="empty-state">正在加载服务列表...</div>
       </div>
     </div>
   </div>
@@ -581,7 +573,6 @@
     let currentEnabledList = [];
     let isLoggingActive = true;
     let cachedLogs = [];
-    let expandedLogIds = new Set();
 
     async function handleLogout() {
       await fetch("/api/panel/logout", { method: "POST" });
@@ -697,11 +688,9 @@
       if (bodyEl.style.display === "block") {
         bodyEl.style.display = "none";
         if (iconEl) iconEl.innerText = "▶";
-        expandedLogIds.delete(id);
       } else {
         bodyEl.style.display = "block";
         if (iconEl) iconEl.innerText = "▼";
-        expandedLogIds.add(id);
       }
     }
 
@@ -720,7 +709,7 @@
         if (!res.ok) return;
         const data = await res.json();
         isLoggingActive = !!data.enabled;
-        const newLogs = data.logs || [];
+        cachedLogs = data.logs || [];
 
         const badge = document.getElementById("log-status-badge");
         const toggleBtn = document.getElementById("btn-toggle-log");
@@ -737,32 +726,23 @@
         }
 
         const panel = document.getElementById("log-panel");
-        if (newLogs.length === 0) {
+        if (cachedLogs.length === 0) {
           panel.innerHTML = '<div class="empty-state" style="color: #64748b;">暂无抓包记录。在客户端发起对话即可在此实时查看。</div>';
-          cachedLogs = [];
           return;
         }
 
-        if (cachedLogs.length === newLogs.length && cachedLogs[cachedLogs.length - 1]?.id === newLogs[newLogs.length - 1]?.id) {
-          return;
-        }
-
-        cachedLogs = newLogs;
         const list = [...cachedLogs].reverse();
-        panel.innerHTML = list.map(item => {
-          const isExp = expandedLogIds.has(item.id);
-          return `
-            <div class="log-item">
-              <div class="log-header" onclick="toggleLogDetail('${item.id}')">
-                <span class="log-expand-icon" id="log-icon-${item.id}">${isExp ? '▼' : '▶'}</span>
-                <span class="log-time">${item.time}</span>
-                <span class="log-type-tag ${getTagClass(item.type)}">${item.type}</span>
-                <span class="log-summary" title="${escapeHtml(item.summary)}">${escapeHtml(item.summary)}</span>
-              </div>
-              <div class="log-body" id="log-detail-${item.id}" style="display: ${isExp ? 'block' : 'none'}">${escapeHtml(item.detail)}</div>
+        panel.innerHTML = list.map(item => `
+          <div class="log-item">
+            <div class="log-header" onclick="toggleLogDetail('${item.id}')">
+              <span class="log-expand-icon" id="log-icon-${item.id}">▶</span>
+              <span class="log-time">${item.time}</span>
+              <span class="log-type-tag ${getTagClass(item.type)}">${item.type}</span>
+              <span class="log-summary" title="${escapeHtml(item.summary)}">${escapeHtml(item.summary)}</span>
             </div>
-          `;
-        }).join("");
+            <div class="log-body" id="log-detail-${item.id}">${escapeHtml(item.detail)}</div>
+          </div>
+        `).join("");
       } catch {}
     }
 
