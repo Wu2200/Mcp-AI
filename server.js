@@ -13,6 +13,7 @@ const UPSTREAM_API_KEY = (process.env.UPSTREAM_API_KEY || "").trim();
 const PROXY_API_KEY = (process.env.PROXY_API_KEY || "").trim();
 const PANEL_PASSWORD = (process.env.PANEL_PASSWORD || "").trim();
 const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
+const MAX_ROUNDS = Number(process.env.MAX_ROUNDS || 100);
 
 const DATA_FILE = path.join(__dirname, "mcp-config.json");
 const SETTINGS_FILE = path.join(__dirname, "mcp-settings.json");
@@ -780,7 +781,6 @@ async function runAgent(requestBody, clientResponse, reqMeta) {
   }
 
   let finalFinishReason = null;
-  const MAX_ROUNDS = 15;
 
   try {
     for (let round = 0; round < MAX_ROUNDS; round += 1) {
