@@ -650,6 +650,8 @@ async function passThrough(requestBody, clientResponse) {
   appendLog("info", "PASS-THROUGH", `直通转发模型 [${requestBody.model}]`, {
     model: requestBody.model,
     reasoning_effort: requestBody.reasoning_effort,
+    thinking: requestBody.thinking,
+    generationConfig: requestBody.generationConfig,
     stream: requestBody.stream,
     incoming_keys: Object.keys(requestBody)
   });
@@ -704,6 +706,7 @@ async function runAgent(requestBody, clientResponse) {
   appendLog("info", "RUN-AGENT", `启动 MCP 调度 - 模型 [${requestBody.model}]`, {
     reasoning_effort: requestBody.reasoning_effort,
     thinking: requestBody.thinking,
+    generationConfig: requestBody.generationConfig,
     incoming_keys: Object.keys(requestBody)
   });
 
@@ -1056,17 +1059,24 @@ function convertGeminiToOpenAiRequest(geminiBody, modelName, isStream) {
   delete openAiBody.systemInstruction;
   delete openAiBody.generationConfig;
 
+  // 保留原始 generationConfig，以便 cliproxyapi / 上游原生解析
   if (geminiBody.generationConfig) {
+    openAiBody.generationConfig = geminiBody.generationConfig;
     const gc = geminiBody.generationConfig;
     if (gc.temperature !== undefined) openAiBody.temperature = gc.temperature;
     if (gc.maxOutputTokens !== undefined) openAiBody.max_tokens = gc.maxOutputTokens;
     if (gc.topP !== undefined) openAiBody.top_p = gc.topP;
     if (gc.stopSequences && Array.isArray(gc.stopSequences)) openAiBody.stop = gc.stopSequences;
+    
+    // 如果有 thinkingConfig，同时填充 OpenAI 标准 reasoning_effort 及 thinking 字段
     if (gc.thinkingConfig) {
+      openAiBody.thinkingConfig = gc.thinkingConfig;
       const tb = Number(gc.thinkingConfig.thinkingBudget);
       if (tb === 0) {
         openAiBody.reasoning_effort = "none";
+        openAiBody.thinking = { type: "disabled" };
       } else if (tb > 0) {
+        openAiBody.thinking = { type: "enabled", budget_tokens: tb };
         if (tb > 8192) openAiBody.reasoning_effort = "high";
         else if (tb > 2048) openAiBody.reasoning_effort = "medium";
         else openAiBody.reasoning_effort = "low";
@@ -1733,7 +1743,8 @@ const server = http.createServer(async (request, response) => {
       appendLog("info", "GEMINI-INCOMING", `接收 Gemini 请求 [${modelName}], stream=${isStream}`, {
         modelName,
         isStream,
-        mcpEnabled: isModelEnabledForMcp(modelName)
+        mcpEnabled: isModelEnabledForMcp(modelName),
+        generationConfig: geminiBody.generationConfig
       });
 
       if (!isModelEnabledForMcp(modelName) || mcpToolRegistry.size === 0) {
