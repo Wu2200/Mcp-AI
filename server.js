@@ -572,6 +572,15 @@ function sendReasoningChunk(clientResponse, text, model = "default") {
   sendSSEChunk(clientResponse, { reasoning_content: text }, model);
 }
 
+function extractReasoningText(delta) {
+  if (!delta) return "";
+  if (typeof delta.reasoning_content === "string") return delta.reasoning_content;
+  if (typeof delta.reasoning === "string") return delta.reasoning;
+  if (typeof delta.thought === "string") return delta.thought;
+  if (delta.reasoning && typeof delta.reasoning.content === "string") return delta.reasoning.content;
+  return "";
+}
+
 function normalizeReasoningPayload(rawPayload) {
   const payload = { ...rawPayload };
 
@@ -877,13 +886,14 @@ async function runAgent(requestBody, clientResponse) {
               }
             }
 
-            if (delta?.content) {
+            const reasoningPart = extractReasoningText(delta);
+            if (reasoningPart) {
+              clientResponse.write(`${line}\n\n`);
+            } else if (delta?.content) {
               assistantContent += delta.content;
               if (!hasToolCalls) {
                 clientResponse.write(`${line}\n\n`);
               }
-            } else if (delta?.reasoning_content || delta?.reasoning) {
-              clientResponse.write(`${line}\n\n`);
             } else if (delta && !hasToolCalls) {
               clientResponse.write(`${line}\n\n`);
             }
@@ -1074,7 +1084,7 @@ function convertGeminiToOpenAiRequest(geminiBody, modelName, isStream) {
 function convertOpenAiToGeminiResponse(openAiJson, modelName) {
   const choice = openAiJson.choices?.[0];
   const parts = [];
-  const reasoning = choice?.message?.reasoning_content || choice?.message?.reasoning;
+  const reasoning = choice?.message?.reasoning_content || choice?.message?.reasoning || choice?.message?.thought;
   if (reasoning) {
     parts.push({ text: reasoning, thought: true });
   }
@@ -1131,6 +1141,7 @@ function createGeminiStreamAdapter(clientResponse, modelName) {
   });
 
   let buffer = "";
+  let insideThoughtBlock = false;
 
   return {
     headersSent: true,
@@ -1171,9 +1182,10 @@ function createGeminiStreamAdapter(clientResponse, modelName) {
           const finishReason = parsed.choices?.[0]?.finish_reason;
           const parts = [];
 
-          if (delta?.reasoning_content || delta?.reasoning) {
+          const reasoningPart = extractReasoningText(delta);
+          if (reasoningPart) {
             parts.push({
-              text: delta.reasoning_content || delta.reasoning,
+              text: reasoningPart,
               thought: true
             });
           }
@@ -1183,9 +1195,27 @@ function createGeminiStreamAdapter(clientResponse, modelName) {
           }
 
           if (delta?.content) {
-            parts.push({
-              text: delta.content
-            });
+            let contentText = delta.content;
+
+            if (!insideThoughtBlock && contentText.includes("<thought>")) {
+              const [before, after] = contentText.split("<thought>");
+              if (before) parts.push({ text: before });
+              insideThoughtBlock = true;
+              contentText = after || "";
+            }
+
+            if (insideThoughtBlock) {
+              if (contentText.includes("</thought>")) {
+                const [thoughtPart, remaining] = contentText.split("</thought>");
+                if (thoughtPart) parts.push({ text: thoughtPart, thought: true });
+                insideThoughtBlock = false;
+                if (remaining) parts.push({ text: remaining });
+              } else {
+                if (contentText) parts.push({ text: contentText, thought: true });
+              }
+            } else {
+              if (contentText) parts.push({ text: contentText });
+            }
           }
 
           if (parts.length > 0 || finishReason) {
@@ -1346,6 +1376,44 @@ function getLoginHtml() {
   </script>
 </body>
 </html>`;
+}
+
+async function handleGeminiNativePassThrough(reqUrl, request, response) {
+  setCorsHeaders(response);
+  const upstreamBase = UPSTREAM_BASE_URL.replace(/\/v1$/, "");
+  const targetUrl = `${upstreamBase}${reqUrl.pathname}${reqUrl.search}`;
+
+  const headers = {
+    "Content-Type": request.headers["content-type"] || "application/json"
+  };
+  if (UPSTREAM_API_KEY) {
+    headers["Authorization"] = `Bearer ${UPSTREAM_API_KEY}`;
+    headers["x-goog-api-key"] = UPSTREAM_API_KEY;
+  }
+
+  const upstreamRes = await fetch(targetUrl, {
+    method: request.method,
+    headers,
+    body: ["POST", "PUT", "PATCH"].includes(request.method) ? request : undefined,
+    duplex: "half",
+    signal: AbortSignal.timeout(300000)
+  });
+
+  response.writeHead(upstreamRes.status, {
+    "Content-Type": upstreamRes.headers.get("Content-Type") || "application/json",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive"
+  });
+
+  if (upstreamRes.body) {
+    const reader = upstreamRes.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      response.write(value);
+    }
+  }
+  response.end();
 }
 
 await initDatabase();
@@ -1543,6 +1611,11 @@ const server = http.createServer(async (request, response) => {
         (reqUrl.pathname === "/v1/models" &&
           (request.headers["x-goog-api-key"] || reqUrl.searchParams.has("key"))))
     ) {
+      try {
+        await handleGeminiNativePassThrough(reqUrl, request, response);
+        return;
+      } catch {}
+
       let modelList = [];
       if (UPSTREAM_BASE_URL && UPSTREAM_API_KEY) {
         const modelsUrl = UPSTREAM_BASE_URL.endsWith("/v1")
@@ -1576,23 +1649,33 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    const geminiModelMatch = reqUrl.pathname.match(/^\/(?:v1beta|v1)\/models\/([^:/]+)$/);
-    if (request.method === "GET" && geminiModelMatch) {
-      const modelId = decodeURIComponent(geminiModelMatch[1]);
-      sendJson(response, 200, {
-        name: `models/${modelId}`,
-        version: "1.0",
-        displayName: modelId,
-        description: `Model ${modelId} via Mcp-AI Proxy`,
-        supportedGenerationMethods: ["generateContent", "streamGenerateContent", "countTokens"]
-      });
-      return;
-    }
-
     const countTokensMatch = reqUrl.pathname.match(/^\/(?:v1beta|v1)\/models\/([^:]+):countTokens$/);
     if (request.method === "POST" && countTokensMatch) {
-      sendJson(response, 200, { totalTokens: 100 });
-      return;
+      try {
+        await handleGeminiNativePassThrough(reqUrl, request, response);
+        return;
+      } catch {
+        sendJson(response, 200, { totalTokens: 100 });
+        return;
+      }
+    }
+
+    const geminiModelMatch = reqUrl.pathname.match(/^\/(?:v1beta|v1)\/models\/([^:/]+)$/);
+    if (request.method === "GET" && geminiModelMatch) {
+      try {
+        await handleGeminiNativePassThrough(reqUrl, request, response);
+        return;
+      } catch {
+        const modelId = decodeURIComponent(geminiModelMatch[1]);
+        sendJson(response, 200, {
+          name: `models/${modelId}`,
+          version: "1.0",
+          displayName: modelId,
+          description: `Model ${modelId} via Mcp-AI Proxy`,
+          supportedGenerationMethods: ["generateContent", "streamGenerateContent", "countTokens"]
+        });
+        return;
+      }
     }
 
     const geminiMatch = reqUrl.pathname.match(
@@ -1612,6 +1695,14 @@ const server = http.createServer(async (request, response) => {
 
       const rawModel = decodeURIComponent(geminiMatch[1]);
       const modelName = rawModel.replace(/^models\//, "");
+
+      if (!isModelEnabledForMcp(modelName) || mcpToolRegistry.size === 0) {
+        try {
+          await handleGeminiNativePassThrough(reqUrl, request, response);
+          return;
+        } catch {}
+      }
+
       const action = geminiMatch[2];
       const isStream = action === "streamGenerateContent";
 
