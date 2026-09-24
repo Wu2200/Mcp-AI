@@ -717,7 +717,7 @@ function isModelEnabledForMcp(modelName) {
   return false;
 }
 
-// Gemini 原生格式双向转换模块
+// Gemini 原生格式双向转换模块（全面支持文本与多模态图片）
 function convertGeminiToOpenAIMessages(body) {
   const messages = [];
   if (body.systemInstruction?.parts) {
@@ -728,11 +728,34 @@ function convertGeminiToOpenAIMessages(body) {
     for (const c of body.contents) {
       const role = c.role === "model" ? "assistant" : "user";
       const parts = Array.isArray(c.parts) ? c.parts : [];
-      let textContent = "";
+      const contentItems = [];
       const toolCalls = [];
+      let hasImage = false;
 
       for (const p of parts) {
-        if (p.text) textContent += p.text;
+        if (p.text) {
+          contentItems.push({ type: "text", text: p.text });
+        }
+        const idata = p.inlineData || p.inline_data;
+        if (idata) {
+          hasImage = true;
+          const mime = idata.mimeType || idata.mime_type || "image/jpeg";
+          const b64 = idata.data || "";
+          const url = b64.startsWith("data:") ? b64 : `data:${mime};base64,${b64}`;
+          contentItems.push({
+            type: "image_url",
+            image_url: { url }
+          });
+        }
+        const fdata = p.fileData || p.file_data;
+        if (fdata) {
+          hasImage = true;
+          const uri = fdata.fileUri || fdata.file_uri || "";
+          contentItems.push({
+            type: "image_url",
+            image_url: { url: uri }
+          });
+        }
         if (p.functionCall) {
           toolCalls.push({
             id: `call_${crypto.randomUUID()}`,
@@ -752,8 +775,15 @@ function convertGeminiToOpenAIMessages(body) {
         }
       }
 
-      if (textContent || toolCalls.length > 0) {
-        const msg = { role, content: textContent || null };
+      let finalContent = null;
+      if (hasImage) {
+        finalContent = contentItems;
+      } else if (contentItems.length > 0) {
+        finalContent = contentItems.map(item => item.text).join("");
+      }
+
+      if (finalContent !== null || toolCalls.length > 0) {
+        const msg = { role, content: finalContent };
         if (toolCalls.length > 0) msg.tool_calls = toolCalls;
         messages.push(msg);
       }
@@ -899,45 +929,43 @@ async function handleGeminiGenerateContent(modelName, isStream, geminiBody, clie
     return;
   }
 
-  // 流式转换
-  setCorsHeaders(clientResponse);
-  clientResponse.writeHead(200, {
-    "Content-Type": "text/event-stream; charset=utf-8",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive"
-  });
-
-  let buffer = "";
-  const fakeStreamClientResponse = {
-    _headers: {},
-    setHeader(k, v) { this._headers[k] = v; },
-    writeHead(code, headers) { Object.assign(this._headers, headers); },
-    write(chunk) {
-      buffer += chunk.toString();
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith("data:")) continue;
-        const dataStr = trimmed.slice(5).trim();
-        if (dataStr === "[DONE]") {
-          clientResponse.write("data: [DONE]\n\n");
-          continue;
-        }
-        try {
-          const parsed = JSON.parse(dataStr);
-          const geminiChunk = convertOpenAiChunkToGemini(parsed);
-          clientResponse.write(`data: ${JSON.stringify(geminiChunk)}\n\n`);
-        } catch {}
-      }
-    },
-    end() {
-      clientResponse.end();
-    }
-  };
-
   if (mcpEnabled) {
+    setCorsHeaders(clientResponse);
+    clientResponse.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive"
+    });
+
+    let buffer = "";
+    const fakeStreamClientResponse = {
+      _headers: {},
+      setHeader(k, v) { this._headers[k] = v; },
+      writeHead(code, headers) { Object.assign(this._headers, headers); },
+      write(chunk) {
+        buffer += chunk.toString();
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith("data:")) continue;
+          const dataStr = trimmed.slice(5).trim();
+          if (dataStr === "[DONE]") {
+            clientResponse.write("data: [DONE]\n\n");
+            continue;
+          }
+          try {
+            const parsed = JSON.parse(dataStr);
+            const geminiChunk = convertOpenAiChunkToGemini(parsed);
+            clientResponse.write(`data: ${JSON.stringify(geminiChunk)}\n\n`);
+          } catch {}
+        }
+      },
+      end() {
+        clientResponse.end();
+      }
+    };
     await runAgent(openAiBody, fakeStreamClientResponse, reqMeta);
   } else {
     await passThroughAndTransformGemini(openAiBody, clientResponse, true);
@@ -946,7 +974,6 @@ async function handleGeminiGenerateContent(modelName, isStream, geminiBody, clie
 
 async function passThroughAndTransformGemini(requestBody, clientResponse, isStream) {
   const startTime = Date.now();
-  setCorsHeaders(clientResponse);
 
   addDebugLog("UPSTREAM", `[Gemini 直通模式] 转发转换至上游: ${requestBody.model || "default"}`, {
     url: upstreamChatCompletionsUrl(),
@@ -998,6 +1025,13 @@ async function passThroughAndTransformGemini(requestBody, clientResponse, isStre
     sendJson(clientResponse, 200, geminiResp);
     return;
   }
+
+  setCorsHeaders(clientResponse);
+  clientResponse.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive"
+  });
 
   let buffer = "";
   const reader = upstreamResponse.body.getReader();
