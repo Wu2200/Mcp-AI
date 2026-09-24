@@ -653,7 +653,7 @@ function sendReasoningChunk(clientResponse, text, model = "default") {
   sendSSEChunk(clientResponse, { reasoning_content: text }, model);
 }
 
-async function passThrough(requestBody, clientResponse, reqMeta) {
+async function passThrough(requestBody, clientResponse, reqMeta, abortSignal) {
   const startTime = Date.now();
   setCorsHeaders(clientResponse);
 
@@ -669,20 +669,32 @@ async function passThrough(requestBody, clientResponse, reqMeta) {
     }
   });
 
-  const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${UPSTREAM_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(requestBody)
-  });
+  let upstreamResponse;
+  try {
+    upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${UPSTREAM_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(requestBody),
+      signal: abortSignal
+    });
+  } catch (err) {
+    if (abortSignal?.aborted || err.name === "AbortError") {
+      addDebugLog("UPSTREAM", `[直通模式] 客户端已断开，请求已中止`);
+      return;
+    }
+    throw err;
+  }
 
   const duration = Date.now() - startTime;
   addDebugLog("UPSTREAM", `[直通模式] 上游响应状态: ${upstreamResponse.status} - 耗时 ${duration}ms`, {
     status: upstreamResponse.status,
     contentType: upstreamResponse.headers.get("Content-Type")
   });
+
+  if (abortSignal?.aborted || clientResponse.destroyed) return;
 
   clientResponse.writeHead(upstreamResponse.status, {
     "Content-Type": upstreamResponse.headers.get("Content-Type") || "application/json",
@@ -692,13 +704,24 @@ async function passThrough(requestBody, clientResponse, reqMeta) {
 
   if (upstreamResponse.body) {
     const reader = upstreamResponse.body.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      clientResponse.write(value);
+    try {
+      while (true) {
+        if (abortSignal?.aborted || clientResponse.destroyed) {
+          await reader.cancel().catch(() => {});
+          break;
+        }
+        const { done, value } = await reader.read();
+        if (done) break;
+        clientResponse.write(value);
+      }
+    } catch (err) {
+      if (abortSignal?.aborted || err.name === "AbortError") return;
+      throw err;
     }
   }
-  clientResponse.end();
+  if (!clientResponse.writableEnded) {
+    clientResponse.end();
+  }
 }
 
 function isModelEnabledForMcp(modelName) {
@@ -828,7 +851,7 @@ function convertOpenAiChunkToGemini(parsedChunk) {
   };
 }
 
-async function handleGeminiGenerateContent(modelName, isStream, geminiBody, clientResponse, reqMeta) {
+async function handleGeminiGenerateContent(modelName, isStream, geminiBody, clientResponse, reqMeta, abortSignal) {
   const openAiMessages = convertGeminiToOpenAIMessages(geminiBody);
   const openAiBody = {
     model: modelName,
@@ -898,6 +921,7 @@ async function handleGeminiGenerateContent(modelName, isStream, geminiBody, clie
       writeHead(code, headers) { this.statusCode = code; Object.assign(this._headers, headers); },
       write(chunk) { this._body += chunk.toString(); },
       end(chunk) {
+        if (abortSignal?.aborted || clientResponse.destroyed) return;
         if (chunk) this._body += chunk.toString();
         try {
           const json = JSON.parse(this._body);
@@ -922,9 +946,9 @@ async function handleGeminiGenerateContent(modelName, isStream, geminiBody, clie
       }
     };
     if (mcpEnabled) {
-      await runAgent(openAiBody, fakeClientResponse, reqMeta);
+      await runAgent(openAiBody, fakeClientResponse, reqMeta, abortSignal);
     } else {
-      await passThroughAndTransformGemini(openAiBody, clientResponse, false);
+      await passThroughAndTransformGemini(openAiBody, clientResponse, false, abortSignal);
     }
     return;
   }
@@ -940,9 +964,11 @@ async function handleGeminiGenerateContent(modelName, isStream, geminiBody, clie
     let buffer = "";
     const fakeStreamClientResponse = {
       _headers: {},
+      get destroyed() { return clientResponse.destroyed; },
       setHeader(k, v) { this._headers[k] = v; },
       writeHead(code, headers) { Object.assign(this._headers, headers); },
       write(chunk) {
+        if (abortSignal?.aborted || clientResponse.destroyed) return;
         buffer += chunk.toString();
         const lines = buffer.split("\n");
         buffer = lines.pop() || "";
@@ -952,27 +978,29 @@ async function handleGeminiGenerateContent(modelName, isStream, geminiBody, clie
           if (!trimmed || !trimmed.startsWith("data:")) continue;
           const dataStr = trimmed.slice(5).trim();
           if (dataStr === "[DONE]") {
-            clientResponse.write("data: [DONE]\n\n");
+            if (!clientResponse.writableEnded) clientResponse.write("data: [DONE]\n\n");
             continue;
           }
           try {
             const parsed = JSON.parse(dataStr);
             const geminiChunk = convertOpenAiChunkToGemini(parsed);
-            clientResponse.write(`data: ${JSON.stringify(geminiChunk)}\n\n`);
+            if (!clientResponse.writableEnded) clientResponse.write(`data: ${JSON.stringify(geminiChunk)}\n\n`);
           } catch {}
         }
       },
       end() {
-        clientResponse.end();
+        if (!clientResponse.writableEnded) {
+          clientResponse.end();
+        }
       }
     };
-    await runAgent(openAiBody, fakeStreamClientResponse, reqMeta);
+    await runAgent(openAiBody, fakeStreamClientResponse, reqMeta, abortSignal);
   } else {
-    await passThroughAndTransformGemini(openAiBody, clientResponse, true);
+    await passThroughAndTransformGemini(openAiBody, clientResponse, true, abortSignal);
   }
 }
 
-async function passThroughAndTransformGemini(requestBody, clientResponse, isStream) {
+async function passThroughAndTransformGemini(requestBody, clientResponse, isStream, abortSignal) {
   const startTime = Date.now();
 
   addDebugLog("UPSTREAM", `[Gemini 直通模式] 转发转换至上游: ${requestBody.model || "default"}`, {
@@ -988,23 +1016,40 @@ async function passThroughAndTransformGemini(requestBody, clientResponse, isStre
   let hasInitiatedStream = false;
 
   while (continueRound <= MAX_AUTO_CONTINUES) {
-    const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${UPSTREAM_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        ...requestBody,
-        messages: currentMessages
-      })
-    });
+    if (abortSignal?.aborted || clientResponse.destroyed) {
+      addDebugLog("AGENT", `[Gemini 直通模式] 客户端已断开，终止续接`);
+      break;
+    }
+
+    let upstreamResponse;
+    try {
+      upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${UPSTREAM_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          ...requestBody,
+          messages: currentMessages
+        }),
+        signal: abortSignal
+      });
+    } catch (err) {
+      if (abortSignal?.aborted || err.name === "AbortError") {
+        addDebugLog("UPSTREAM", `[Gemini 直通模式] 客户端已中止请求`);
+        return;
+      }
+      throw err;
+    }
 
     const duration = Date.now() - startTime;
     addDebugLog("UPSTREAM", `[Gemini 直通模式] 上游响应状态: ${upstreamResponse.status} - 耗时 ${duration}ms`, {
       status: upstreamResponse.status,
       contentType: upstreamResponse.headers.get("Content-Type")
     });
+
+    if (abortSignal?.aborted || clientResponse.destroyed) return;
 
     if (!upstreamResponse.ok) {
       const errTxt = await upstreamResponse.text();
@@ -1016,6 +1061,7 @@ async function passThroughAndTransformGemini(requestBody, clientResponse, isStre
 
     if (!isStream) {
       const json = await upstreamResponse.json();
+      if (abortSignal?.aborted || clientResponse.destroyed) return;
       const choice = json.choices?.[0];
       const candidateText = choice?.message?.content || "";
       const reasoning = choice?.message?.reasoning_content || "";
@@ -1052,45 +1098,59 @@ async function passThroughAndTransformGemini(requestBody, clientResponse, isStre
     const reader = upstreamResponse.body.getReader();
     const decoder = new TextDecoder();
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+    try {
+      while (true) {
+        if (abortSignal?.aborted || clientResponse.destroyed) {
+          await reader.cancel().catch(() => {});
+          break;
+        }
+        const { done, value } = await reader.read();
+        if (done) break;
 
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
 
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith("data:")) continue;
-        const dataStr = trimmed.slice(5).trim();
-        if (dataStr === "[DONE]") continue;
-        try {
-          const parsed = JSON.parse(dataStr);
-          const choice = parsed.choices?.[0];
-          if (choice?.finish_reason) {
-            lastFinishReason = choice.finish_reason;
-          }
-          if (choice?.delta?.content) {
-            accumulatedContent += choice.delta.content;
-          }
-          // 如果因达到上限被截断，先不发截断的结束状态，准备自动续接
-          if (choice?.finish_reason === "length") {
-            const geminiChunk = convertOpenAiChunkToGemini({
-              ...parsed,
-              choices: [{ ...choice, finish_reason: null }]
-            });
-            clientResponse.write(`data: ${JSON.stringify(geminiChunk)}\n\n`);
-          } else {
-            const geminiChunk = convertOpenAiChunkToGemini(parsed);
-            clientResponse.write(`data: ${JSON.stringify(geminiChunk)}\n\n`);
-          }
-        } catch {}
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith("data:")) continue;
+          const dataStr = trimmed.slice(5).trim();
+          if (dataStr === "[DONE]") continue;
+          try {
+            const parsed = JSON.parse(dataStr);
+            const choice = parsed.choices?.[0];
+            if (choice?.finish_reason) {
+              lastFinishReason = choice.finish_reason;
+            }
+            if (choice?.delta?.content) {
+              accumulatedContent += choice.delta.content;
+            }
+            // 如果因达到上限被截断，先不发截断的结束状态，准备自动续接
+            if (choice?.finish_reason === "length") {
+              const geminiChunk = convertOpenAiChunkToGemini({
+                ...parsed,
+                choices: [{ ...choice, finish_reason: null }]
+              });
+              clientResponse.write(`data: ${JSON.stringify(geminiChunk)}\n\n`);
+            } else {
+              const geminiChunk = convertOpenAiChunkToGemini(parsed);
+              clientResponse.write(`data: ${JSON.stringify(geminiChunk)}\n\n`);
+            }
+          } catch {}
+        }
       }
+    } catch (err) {
+      if (abortSignal?.aborted || err.name === "AbortError") return;
+      throw err;
+    }
+
+    if (abortSignal?.aborted || clientResponse.destroyed) {
+      addDebugLog("AGENT", `[Gemini 直通模式] 客户端已断开，终止自动续接`);
+      break;
     }
 
     // 准确检测是否被上游截断（finish_reason === "length"）
-    if (lastFinishReason === "length" && accumulatedContent) {
+    if (lastFinishReason === "length" && accumulatedContent && !abortSignal?.aborted && !clientResponse.destroyed) {
       continueRound += 1;
       addDebugLog("AGENT", `⚠️ [抗截断触发] 检测到上游返回 length 截断！正在自动进行第 ${continueRound} 次无感断点续接...`, {
         round: continueRound,
@@ -1107,11 +1167,13 @@ async function passThroughAndTransformGemini(requestBody, clientResponse, isStre
     break;
   }
 
-  clientResponse.write("data: [DONE]\n\n");
-  clientResponse.end();
+  if (!abortSignal?.aborted && !clientResponse.destroyed) {
+    clientResponse.write("data: [DONE]\n\n");
+    clientResponse.end();
+  }
 }
 
-async function runAgent(requestBody, clientResponse, reqMeta) {
+async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
   if (!Array.isArray(requestBody.messages) || requestBody.messages.length === 0) {
     throw new Error("messages 必须是非空数组");
   }
@@ -1147,6 +1209,10 @@ async function runAgent(requestBody, clientResponse, reqMeta) {
   let keepAliveTimer = null;
   if (isStream) {
     keepAliveTimer = setInterval(() => {
+      if (abortSignal?.aborted || clientResponse.destroyed) {
+        clearInterval(keepAliveTimer);
+        return;
+      }
       try {
         clientResponse.write(": keep-alive\n\n");
       } catch {}
@@ -1157,6 +1223,11 @@ async function runAgent(requestBody, clientResponse, reqMeta) {
 
   try {
     for (let round = 0; ; round += 1) {
+      if (abortSignal?.aborted || clientResponse.destroyed) {
+        addDebugLog("AGENT", `客户端已断开，终止 MCP 调度循环`);
+        break;
+      }
+
       const payload = {
         ...requestBody,
         messages,
@@ -1180,16 +1251,28 @@ async function runAgent(requestBody, clientResponse, reqMeta) {
         }
       });
 
-      const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${UPSTREAM_API_KEY}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify(payload)
-      });
+      let upstreamResponse;
+      try {
+        upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${UPSTREAM_API_KEY}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(payload),
+          signal: abortSignal
+        });
+      } catch (err) {
+        if (abortSignal?.aborted || err.name === "AbortError") {
+          addDebugLog("AGENT", `第 ${round + 1} 轮上游请求被客户端中止`);
+          return;
+        }
+        throw err;
+      }
 
       const roundDuration = Date.now() - roundStartTime;
+
+      if (abortSignal?.aborted || clientResponse.destroyed) return;
 
       if (!upstreamResponse.ok) {
         const errText = await upstreamResponse.text();
@@ -1209,9 +1292,11 @@ async function runAgent(requestBody, clientResponse, reqMeta) {
               }
             ]
           };
-          clientResponse.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
-          clientResponse.write("data: [DONE]\n\n");
-          clientResponse.end();
+          if (!clientResponse.destroyed && !abortSignal?.aborted) {
+            clientResponse.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
+            clientResponse.write("data: [DONE]\n\n");
+            clientResponse.end();
+          }
           return;
         }
         throw new Error(`上游接口返回错误 (${upstreamResponse.status})：${errText.slice(0, 500)}`);
@@ -1219,6 +1304,7 @@ async function runAgent(requestBody, clientResponse, reqMeta) {
 
       if (!isStream) {
         const json = await upstreamResponse.json();
+        if (abortSignal?.aborted || clientResponse.destroyed) return;
         const choice = json.choices?.[0];
         const message = choice?.message;
         const toolCalls = message?.tool_calls || [];
@@ -1246,6 +1332,7 @@ async function runAgent(requestBody, clientResponse, reqMeta) {
         messages.push(message);
 
         for (const tc of mcpCalls) {
+          if (abortSignal?.aborted || clientResponse.destroyed) break;
           let toolInfo = mcpToolRegistry.get(tc.function.name);
           if (!toolInfo) {
             for (const [k, v] of mcpToolRegistry.entries()) {
@@ -1280,58 +1367,74 @@ async function runAgent(requestBody, clientResponse, reqMeta) {
       let hasToolCalls = false;
       let roundFinishReason = null;
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+      try {
+        while (true) {
+          if (abortSignal?.aborted || clientResponse.destroyed) {
+            await reader.cancel().catch(() => {});
+            break;
+          }
+          const { done, value } = await reader.read();
+          if (done) break;
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
 
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || !trimmed.startsWith("data:")) continue;
-          const dataStr = trimmed.slice(5).trim();
-          if (dataStr === "[DONE]") continue;
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || !trimmed.startsWith("data:")) continue;
+            const dataStr = trimmed.slice(5).trim();
+            if (dataStr === "[DONE]") continue;
 
-          try {
-            const parsed = JSON.parse(dataStr);
-            const choice = parsed.choices?.[0];
-            const delta = choice?.delta;
-            if (choice?.finish_reason) {
-              roundFinishReason = choice.finish_reason;
-            }
+            try {
+              const parsed = JSON.parse(dataStr);
+              const choice = parsed.choices?.[0];
+              const delta = choice?.delta;
+              if (choice?.finish_reason) {
+                roundFinishReason = choice.finish_reason;
+              }
 
-            if (delta?.tool_calls) {
-              hasToolCalls = true;
-              for (const tc of delta.tool_calls) {
-                const index = tc.index ?? 0;
-                if (!accumulatedToolCalls[index]) {
-                  accumulatedToolCalls[index] = {
-                    id: tc.id || `call_${crypto.randomUUID()}`,
-                    name: tc.function?.name || "",
-                    arguments: ""
-                  };
+              if (delta?.tool_calls) {
+                hasToolCalls = true;
+                for (const tc of delta.tool_calls) {
+                  const index = tc.index ?? 0;
+                  if (!accumulatedToolCalls[index]) {
+                    accumulatedToolCalls[index] = {
+                      id: tc.id || `call_${crypto.randomUUID()}`,
+                      name: tc.function?.name || "",
+                      arguments: ""
+                    };
+                  }
+                  if (tc.id) accumulatedToolCalls[index].id = tc.id;
+                  if (tc.function?.name) accumulatedToolCalls[index].name = tc.function.name;
+                  if (tc.function?.arguments) accumulatedToolCalls[index].arguments += tc.function.arguments;
                 }
-                if (tc.id) accumulatedToolCalls[index].id = tc.id;
-                if (tc.function?.name) accumulatedToolCalls[index].name = tc.function.name;
-                if (tc.function?.arguments) accumulatedToolCalls[index].arguments += tc.function.arguments;
               }
-            }
 
-            // 遇到正文内容：累计内容
-            if (delta?.content) {
-              assistantContent += delta.content;
-              // 关键保护：若本轮检测到工具调用，严禁透传草稿正文，防止下游误判提前截断；只有确定无工具调用时直接流式推送
-              if (!hasToolCalls) {
-                clientResponse.write(`${line}\n\n`);
+              // 遇到正文内容：累计内容
+              if (delta?.content) {
+                assistantContent += delta.content;
+                // 关键保护：若本轮检测到工具调用，严禁透传草稿正文，防止下游误判提前截断；只有确定无工具调用时直接流式推送
+                if (!hasToolCalls && !clientResponse.destroyed && !abortSignal?.aborted) {
+                  clientResponse.write(`${line}\n\n`);
+                }
+              } else if (delta?.reasoning_content) {
+                // 深度思考原生内容透传
+                if (!clientResponse.destroyed && !abortSignal?.aborted) {
+                  clientResponse.write(`${line}\n\n`);
+                }
               }
-            } else if (delta?.reasoning_content) {
-              // 深度思考原生内容透传
-              clientResponse.write(`${line}\n\n`);
-            }
-          } catch {}
+            } catch {}
+          }
         }
+      } catch (err) {
+        if (abortSignal?.aborted || err.name === "AbortError") return;
+        throw err;
+      }
+
+      if (abortSignal?.aborted || clientResponse.destroyed) {
+        addDebugLog("AGENT", `客户端已断开，终止后续 MCP 处理与续接`);
+        break;
       }
 
       const mcpCalls = accumulatedToolCalls.filter((tc) => {
@@ -1343,9 +1446,9 @@ async function runAgent(requestBody, clientResponse, reqMeta) {
         return false;
       });
 
-      // 没有工具调用，检查是否达到 Token 上限截断：若是则进行自动无感断点续接
+      // 没有工具调用，检查是否达到 Token 上限截断：若是且客户端未断开则进行自动无感断点续接
       if (mcpCalls.length === 0) {
-        if (roundFinishReason === "length" && assistantContent) {
+        if (roundFinishReason === "length" && assistantContent && !abortSignal?.aborted && !clientResponse.destroyed) {
           addDebugLog("AGENT", `⚠️ [抗截断触发] MCP 调度检测到 length 截断！正在自动进行无感断点续接...`, {
             round: round + 1,
             accumulatedLength: assistantContent.length
@@ -1355,8 +1458,10 @@ async function runAgent(requestBody, clientResponse, reqMeta) {
           continue;
         }
 
-        clientResponse.write("data: [DONE]\n\n");
-        clientResponse.end();
+        if (!abortSignal?.aborted && !clientResponse.destroyed) {
+          clientResponse.write("data: [DONE]\n\n");
+          clientResponse.end();
+        }
         addDebugLog("AGENT", `第 ${round + 1} 轮流式完成输出 - 结束原因: ${roundFinishReason || "stop"}`, {
           round: round + 1,
           finishReason: roundFinishReason,
@@ -1377,6 +1482,7 @@ async function runAgent(requestBody, clientResponse, reqMeta) {
       });
 
       for (const tc of mcpCalls) {
+        if (abortSignal?.aborted || clientResponse.destroyed) break;
         let toolInfo = mcpToolRegistry.get(tc.name);
         if (!toolInfo) {
           for (const [k, v] of mcpToolRegistry.entries()) {
@@ -1391,11 +1497,13 @@ async function runAgent(requestBody, clientResponse, reqMeta) {
         const rawAction = toolInfo?.rawName || tc.name;
         const args = toolArguments({ function: { arguments: tc.arguments } });
 
-        sendReasoningChunk(
-          clientResponse,
-          `\n> 正在执行 ${displayName} [${rawAction}]...\n`,
-          requestBody.model
-        );
+        if (!abortSignal?.aborted && !clientResponse.destroyed) {
+          sendReasoningChunk(
+            clientResponse,
+            `\n> 正在执行 ${displayName} [${rawAction}]...\n`,
+            requestBody.model
+          );
+        }
 
         let result;
         if (args === null) {
@@ -1408,11 +1516,13 @@ async function runAgent(requestBody, clientResponse, reqMeta) {
           }
         }
 
-        sendReasoningChunk(
-          clientResponse,
-          `> ${displayName} [${rawAction}] 完成\n\n`,
-          requestBody.model
-        );
+        if (!abortSignal?.aborted && !clientResponse.destroyed) {
+          sendReasoningChunk(
+            clientResponse,
+            `> ${displayName} [${rawAction}] 完成\n\n`,
+            requestBody.model
+          );
+        }
 
         messages.push({
           role: "tool",
@@ -1742,7 +1852,19 @@ const server = http.createServer(async (request, response) => {
       const isStream = action === "streamGenerateContent" || reqUrl.searchParams.get("alt") === "sse";
       const body = await readRequestBody(request);
 
-      await handleGeminiGenerateContent(modelName, isStream, body, response, { ip: request.socket.remoteAddress });
+      const abortController = new AbortController();
+      const onClientClose = () => {
+        if (!response.writableEnded) abortController.abort();
+      };
+      request.on("close", onClientClose);
+      response.on("close", onClientClose);
+
+      try {
+        await handleGeminiGenerateContent(modelName, isStream, body, response, { ip: request.socket.remoteAddress }, abortController.signal);
+      } finally {
+        request.off("close", onClientClose);
+        response.off("close", onClientClose);
+      }
       return;
     }
 
@@ -1807,10 +1929,22 @@ const server = http.createServer(async (request, response) => {
           lastUserMessagePreview: typeof lastMsg?.content === "string" ? lastMsg.content.slice(0, 300) : "[非纯文本内容]"
         });
 
-        if (mcpEnabled) {
-          await runAgent(body, response, { ip: request.socket.remoteAddress });
-        } else {
-          await passThrough(body, response, { ip: request.socket.remoteAddress });
+        const abortController = new AbortController();
+        const onClientClose = () => {
+          if (!response.writableEnded) abortController.abort();
+        };
+        request.on("close", onClientClose);
+        response.on("close", onClientClose);
+
+        try {
+          if (mcpEnabled) {
+            await runAgent(body, response, { ip: request.socket.remoteAddress }, abortController.signal);
+          } else {
+            await passThrough(body, response, { ip: request.socket.remoteAddress }, abortController.signal);
+          }
+        } finally {
+          request.off("close", onClientClose);
+          response.off("close", onClientClose);
         }
         return;
       }
@@ -1818,6 +1952,9 @@ const server = http.createServer(async (request, response) => {
 
     sendOpenAIError(response, 404, "接口不存在");
   } catch (err) {
+    if (err.name === "AbortError") {
+      return;
+    }
     addDebugLog("ERROR", `全局服务未捕获异常: ${err.message}`, err.stack || err);
     if (response.headersSent) {
       try {
