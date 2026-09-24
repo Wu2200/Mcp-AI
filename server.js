@@ -572,15 +572,59 @@ function sendReasoningChunk(clientResponse, text, model = "default") {
   sendSSEChunk(clientResponse, { reasoning_content: text }, model);
 }
 
+function normalizeReasoningPayload(rawPayload) {
+  const payload = { ...rawPayload };
+  const rawEffort = payload.reasoning_effort || payload.reasoningEffort;
+
+  if (typeof rawEffort === "string") {
+    const val = rawEffort.trim().toLowerCase();
+    if (val === "off" || val === "none") {
+      payload.reasoning_effort = "none";
+      payload.thinking = { type: "disabled" };
+      payload.enable_thinking = false;
+    } else if (val === "low") {
+      payload.reasoning_effort = "low";
+      payload.thinking = { type: "enabled", budget_tokens: 1024 };
+      payload.enable_thinking = true;
+    } else if (val === "medium") {
+      payload.reasoning_effort = "medium";
+      payload.thinking = { type: "enabled", budget_tokens: 4096 };
+      payload.enable_thinking = true;
+    } else if (val === "high") {
+      payload.reasoning_effort = "high";
+      payload.thinking = { type: "enabled", budget_tokens: 16384 };
+      payload.enable_thinking = true;
+    }
+  }
+
+  if (payload.thinking && typeof payload.thinking === "object") {
+    if (payload.thinking.type === "disabled") {
+      payload.reasoning_effort = "none";
+      payload.enable_thinking = false;
+    } else if (payload.thinking.type === "enabled") {
+      payload.enable_thinking = true;
+      if (!payload.reasoning_effort) {
+        const budget = Number(payload.thinking.budget_tokens || 0);
+        if (budget > 8192) payload.reasoning_effort = "high";
+        else if (budget > 2048) payload.reasoning_effort = "medium";
+        else payload.reasoning_effort = "low";
+      }
+    }
+  }
+
+  return payload;
+}
+
 async function passThrough(requestBody, clientResponse) {
   setCorsHeaders(clientResponse);
+  const normalized = normalizeReasoningPayload(requestBody);
   const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
     method: "POST",
     headers: {
       Authorization: `Bearer ${UPSTREAM_API_KEY}`,
       "Content-Type": "application/json"
     },
-    body: JSON.stringify(requestBody),
+    body: JSON.stringify(normalized),
     signal: AbortSignal.timeout(300000)
   });
 
@@ -675,11 +719,11 @@ async function runAgent(requestBody, clientResponse) {
 
   try {
     for (let round = 0; round < 100; round += 1) {
-      const payload = {
+      const payload = normalizeReasoningPayload({
         ...requestBody,
         messages,
         stream: isStream
-      };
+      });
 
       if (tools.length > 0) {
         payload.tools = tools;
@@ -814,7 +858,7 @@ async function runAgent(requestBody, clientResponse) {
               if (!hasToolCalls) {
                 clientResponse.write(`${line}\n\n`);
               }
-            } else if (delta?.reasoning_content) {
+            } else if (delta?.reasoning_content || delta?.reasoning) {
               clientResponse.write(`${line}\n\n`);
             } else if (delta && !hasToolCalls) {
               clientResponse.write(`${line}\n\n`);
@@ -915,7 +959,7 @@ function convertGeminiToOpenAiRequest(geminiBody, modelName, isStream) {
 
   if (Array.isArray(geminiBody.contents)) {
     for (const c of geminiBody.contents) {
-      const role = c.role === "model" ? "assistant" : "user";
+      const role = c.role === "model" ? "assistant" : (c.role === "function" ? "tool" : "user");
       if (!Array.isArray(c.parts)) continue;
 
       const textParts = [];
@@ -933,13 +977,35 @@ function convertGeminiToOpenAiRequest(geminiBody, modelName, isStream) {
             type: "image_url",
             image_url: { url: `data:${mimeType};base64,${p.inlineData.data}` }
           });
+        } else if (p.functionCall) {
+          messages.push({
+            role: "assistant",
+            tool_calls: [
+              {
+                id: `call_${crypto.randomUUID()}`,
+                type: "function",
+                function: {
+                  name: p.functionCall.name,
+                  arguments: JSON.stringify(p.functionCall.args || {})
+                }
+              }
+            ]
+          });
+        } else if (p.functionResponse) {
+          messages.push({
+            role: "tool",
+            tool_call_id: `call_${crypto.randomUUID()}`,
+            content: JSON.stringify(p.functionResponse.response || {})
+          });
         }
       }
 
-      if (hasMultiModal) {
-        messages.push({ role, content: contentArray });
-      } else {
-        messages.push({ role, content: textParts.join("\n") });
+      if (textParts.length > 0 || hasMultiModal) {
+        if (hasMultiModal) {
+          messages.push({ role, content: contentArray });
+        } else {
+          messages.push({ role, content: textParts.join("\n") });
+        }
       }
     }
   }
@@ -961,27 +1027,57 @@ function convertGeminiToOpenAiRequest(geminiBody, modelName, isStream) {
     if (gc.topP !== undefined) openAiBody.top_p = gc.topP;
     if (gc.stopSequences && Array.isArray(gc.stopSequences)) openAiBody.stop = gc.stopSequences;
     if (gc.thinkingConfig) {
-      if (gc.thinkingConfig.thinkingBudget !== undefined) {
-        openAiBody.thinking = { type: "enabled", budget_tokens: gc.thinkingConfig.thinkingBudget };
+      const tb = Number(gc.thinkingConfig.thinkingBudget);
+      if (tb === 0) {
+        openAiBody.reasoning_effort = "none";
+        openAiBody.thinking = { type: "disabled" };
+      } else if (tb > 0) {
+        openAiBody.thinking = { type: "enabled", budget_tokens: tb };
+        if (tb > 8192) openAiBody.reasoning_effort = "high";
+        else if (tb > 2048) openAiBody.reasoning_effort = "medium";
+        else openAiBody.reasoning_effort = "low";
       }
     }
   }
 
-  return openAiBody;
+  return normalizeReasoningPayload(openAiBody);
 }
 
 function convertOpenAiToGeminiResponse(openAiJson, modelName) {
   const choice = openAiJson.choices?.[0];
-  const contentText = choice?.message?.content || "";
+  const parts = [];
+  const reasoning = choice?.message?.reasoning_content || choice?.message?.reasoning;
+  if (reasoning) {
+    parts.push({ text: reasoning, thought: true });
+  }
+
+  if (choice?.message?.tool_calls && choice.message.tool_calls.length > 0) {
+    for (const tc of choice.message.tool_calls) {
+      let args = {};
+      try {
+        args = typeof tc.function?.arguments === "string" ? JSON.parse(tc.function.arguments) : (tc.function?.arguments || {});
+      } catch {}
+      parts.push({
+        functionCall: {
+          name: tc.function?.name || "",
+          args
+        }
+      });
+    }
+  } else if (choice?.message?.content) {
+    parts.push({ text: choice.message.content });
+  }
+
   const finishReason = choice?.finish_reason;
   let geminiFinishReason = "STOP";
   if (finishReason === "length") geminiFinishReason = "MAX_TOKENS";
+  if (finishReason === "tool_calls") geminiFinishReason = "STOP";
 
   return {
     candidates: [
       {
         content: {
-          parts: [{ text: contentText }],
+          parts,
           role: "model"
         },
         finishReason: geminiFinishReason,
@@ -1044,15 +1140,35 @@ function createGeminiStreamAdapter(clientResponse, modelName) {
         try {
           const parsed = JSON.parse(dataStr);
           const delta = parsed.choices?.[0]?.delta;
-          const content = delta?.content || delta?.reasoning_content || "";
-          if (content) {
+          const finishReason = parsed.choices?.[0]?.finish_reason;
+          const parts = [];
+
+          if (delta?.reasoning_content || delta?.reasoning) {
+            parts.push({
+              text: delta.reasoning_content || delta.reasoning,
+              thought: true
+            });
+          }
+
+          if (delta?.tool_calls) {
+            continue;
+          }
+
+          if (delta?.content) {
+            parts.push({
+              text: delta.content
+            });
+          }
+
+          if (parts.length > 0 || finishReason) {
             const geminiChunk = {
               candidates: [
                 {
                   content: {
-                    parts: [{ text: content }],
+                    parts,
                     role: "model"
                   },
+                  finishReason: finishReason === "length" ? "MAX_TOKENS" : (finishReason ? "STOP" : undefined),
                   index: 0
                 }
               ],
@@ -1522,11 +1638,12 @@ const server = http.createServer(async (request, response) => {
       }
 
       const body = await readRequestBody(request);
+      const normalizedBody = normalizeReasoningPayload(body);
 
-      if (isModelEnabledForMcp(body.model) && mcpToolRegistry.size > 0) {
-        await runAgent(body, response);
+      if (isModelEnabledForMcp(normalizedBody.model) && mcpToolRegistry.size > 0) {
+        await runAgent(normalizedBody, response);
       } else {
-        await passThrough(body, response);
+        await passThrough(normalizedBody, response);
       }
       return;
     }
