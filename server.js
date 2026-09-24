@@ -582,6 +582,7 @@ function extractReasoningText(delta) {
 }
 
 async function passThrough(requestBody, clientResponse) {
+  console.log(`[PASS-THROUGH] Forwarding request to upstream. Model: ${requestBody.model}, reasoning_effort: ${requestBody.reasoning_effort}, stream: ${requestBody.stream}`);
   setCorsHeaders(clientResponse);
   const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
     method: "POST",
@@ -627,6 +628,10 @@ function isModelEnabledForMcp(modelName) {
 }
 
 async function runAgent(requestBody, clientResponse) {
+  console.log(`[RUN-AGENT] Start MCP loop for model: ${requestBody.model}`);
+  console.log(`[RUN-AGENT] Client incoming keys:`, Object.keys(requestBody));
+  console.log(`[RUN-AGENT] Reasoning fields: reasoning_effort=${requestBody.reasoning_effort}, thinking=${JSON.stringify(requestBody.thinking)}, max_tokens=${requestBody.max_tokens}, max_completion_tokens=${requestBody.max_completion_tokens}`);
+
   if (!Array.isArray(requestBody.messages) || requestBody.messages.length === 0) {
     throw new Error("messages 必须是非空数组");
   }
@@ -639,6 +644,7 @@ async function runAgent(requestBody, clientResponse) {
     : [];
   const mcpTools = getAllTools();
   const tools = [...clientTools, ...mcpTools];
+  console.log(`[RUN-AGENT] Injected MCP tools count: ${mcpTools.length}, Total tools: ${tools.length}`);
 
   if (isStream) {
     setCorsHeaders(clientResponse);
@@ -661,6 +667,7 @@ async function runAgent(requestBody, clientResponse) {
 
   try {
     for (let round = 0; round < 100; round += 1) {
+      console.log(`[RUN-AGENT] Round ${round + 1} sending payload to upstream`);
       const payload = {
         ...requestBody,
         messages,
@@ -672,6 +679,8 @@ async function runAgent(requestBody, clientResponse) {
         payload.tool_choice = "auto";
       }
 
+      console.log(`[RUN-AGENT] Round ${round + 1} payload keys:`, Object.keys(payload));
+
       const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
         method: "POST",
         headers: {
@@ -682,8 +691,11 @@ async function runAgent(requestBody, clientResponse) {
         signal: AbortSignal.timeout(300000)
       });
 
+      console.log(`[RUN-AGENT] Round ${round + 1} upstream status:`, upstreamResponse.status);
+
       if (!upstreamResponse.ok) {
         const err = await upstreamResponse.text();
+        console.error(`[RUN-AGENT] Round ${round + 1} upstream error:`, err);
         if (isStream) {
           const errorChunk = {
             id: `chatcmpl-${Date.now()}`,
@@ -738,6 +750,7 @@ async function runAgent(requestBody, clientResponse) {
             }
           }
           const args = toolArguments(tc);
+          console.log(`[RUN-AGENT] Non-stream executing tool: ${tc.function.name}`);
           let result;
           try {
             result = await callMcpTool(tc.function.name, args);
@@ -849,6 +862,8 @@ async function runAgent(requestBody, clientResponse) {
         const displayName = toolInfo?.serverName || "MCP";
         const rawAction = toolInfo?.rawName || tc.name;
         const args = toolArguments({ function: { arguments: tc.arguments } });
+
+        console.log(`[RUN-AGENT] Executing tool: ${tc.name} via ${displayName}`);
 
         sendReasoningChunk(
           clientResponse,
@@ -1341,6 +1356,7 @@ const server = http.createServer(async (request, response) => {
     }
 
     const reqUrl = new URL(request.url, `http://${request.headers.host || "localhost"}`);
+    console.log(`[REQUEST] ${request.method} ${reqUrl.pathname}`);
 
     if (request.method === "GET" && (reqUrl.pathname === "/" || reqUrl.pathname === "")) {
       setCorsHeaders(response);
@@ -1610,6 +1626,8 @@ const server = http.createServer(async (request, response) => {
       const isStream = action === "streamGenerateContent";
       const geminiBody = await readRequestBody(request);
 
+      console.log(`[GEMINI-REQ] Model: ${modelName}, isStream: ${isStream}, MCP Enabled: ${isModelEnabledForMcp(modelName)}`);
+
       if (!isModelEnabledForMcp(modelName) || mcpToolRegistry.size === 0) {
         try {
           await handleGeminiNativePassThrough(reqUrl, request, response, geminiBody);
@@ -1667,6 +1685,8 @@ const server = http.createServer(async (request, response) => {
       }
 
       const body = await readRequestBody(request);
+      console.log(`[CHAT-COMPLETIONS] Request body keys:`, Object.keys(body));
+      console.log(`[CHAT-COMPLETIONS] model=${body.model}, reasoning_effort=${body.reasoning_effort}, thinking=${JSON.stringify(body.thinking)}`);
 
       if (isModelEnabledForMcp(body.model) && mcpToolRegistry.size > 0) {
         await runAgent(body, response);
@@ -1678,6 +1698,7 @@ const server = http.createServer(async (request, response) => {
 
     sendOpenAIError(response, 404, "接口不存在");
   } catch (err) {
+    console.error(`[SERVER-ERROR]`, err);
     if (response.headersSent) {
       try {
         const errChunk = {
