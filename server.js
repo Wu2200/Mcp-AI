@@ -1543,8 +1543,8 @@ const server = http.createServer(async (request, response) => {
       }
     }
 
-    // Google Gemini 官方格式路由: /v1beta/models/...
-    const geminiMatch = reqUrl.pathname.match(/^\/v1beta\/models\/([^:]+):(generateContent|streamGenerateContent)$/);
+    // Google Gemini 官方格式路由: /(v1|v1beta)/models/...
+    const geminiMatch = reqUrl.pathname.match(/^\/(?:v1|v1beta)\/models\/(.+):(generateContent|streamGenerateContent)$/);
     if (geminiMatch) {
       if (!isProxyAuthorized(request)) {
         const authHeader = request.headers.authorization || request.headers["x-goog-api-key"] || reqUrl.searchParams.get("key") || "(无 Auth 凭证)";
@@ -1557,7 +1557,8 @@ const server = http.createServer(async (request, response) => {
         return;
       }
 
-      const modelName = decodeURIComponent(geminiMatch[1]);
+      const rawModel = geminiMatch[1];
+      const modelName = decodeURIComponent(rawModel).replace(/^models\//, "");
       const action = geminiMatch[2];
       const isStream = action === "streamGenerateContent" || reqUrl.searchParams.get("alt") === "sse";
       const body = await readRequestBody(request);
