@@ -327,8 +327,8 @@ function sendJson(response, statusCode, body) {
   response.end(JSON.stringify(body));
 }
 
-function sendOpenAIError(response, statusCode, message, type = "invalid_request_error") {
-  addDebugLog("ERROR", `返回客户端错误 (${statusCode}): ${message}`, { statusCode, message, type });
+function sendOpenAIError(response, statusCode, message, type = "invalid_request_error", extraInfo = {}) {
+  addDebugLog("ERROR", `返回客户端错误 (${statusCode}): ${message}`, { statusCode, message, type, ...extraInfo });
   sendJson(response, statusCode, { error: { message, type, code: null } });
 }
 
@@ -1357,7 +1357,14 @@ const server = http.createServer(async (request, response) => {
     }
 
     if (!isProxyAuthorized(request)) {
-      sendOpenAIError(response, 401, "API Key 错误", "authentication_error");
+      const authHeader = request.headers.authorization || "(无 Authorization 请求头)";
+      const clientIp = request.headers["x-forwarded-for"] || request.socket.remoteAddress;
+      sendOpenAIError(response, 401, "API Key 错误", "authentication_error", {
+        path: reqUrl.pathname,
+        method: request.method,
+        clientIp,
+        receivedAuth: authHeader.length > 20 ? authHeader.slice(0, 15) + "..." : authHeader
+      });
       return;
     }
 
