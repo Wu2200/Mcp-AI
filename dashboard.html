@@ -577,6 +577,7 @@
     let currentEnabledList = [];
     let isLoggingActive = true;
     let cachedLogs = [];
+    let expandedLogIds = new Set();
 
     async function handleLogout() {
       await fetch("/api/panel/logout", { method: "POST" });
@@ -692,9 +693,11 @@
       if (bodyEl.style.display === "block") {
         bodyEl.style.display = "none";
         if (iconEl) iconEl.innerText = "▶";
+        expandedLogIds.delete(id);
       } else {
         bodyEl.style.display = "block";
         if (iconEl) iconEl.innerText = "▼";
+        expandedLogIds.add(id);
       }
     }
 
@@ -713,7 +716,7 @@
         if (!res.ok) return;
         const data = await res.json();
         isLoggingActive = !!data.enabled;
-        cachedLogs = data.logs || [];
+        const newLogs = data.logs || [];
 
         const badge = document.getElementById("log-status-badge");
         const toggleBtn = document.getElementById("btn-toggle-log");
@@ -730,23 +733,32 @@
         }
 
         const panel = document.getElementById("log-panel");
-        if (cachedLogs.length === 0) {
+        if (newLogs.length === 0) {
           panel.innerHTML = '<div class="empty-state" style="color: #64748b;">暂无抓包记录。在客户端发起对话即可在此实时查看。</div>';
+          cachedLogs = [];
           return;
         }
 
+        if (cachedLogs.length === newLogs.length && cachedLogs[cachedLogs.length - 1]?.id === newLogs[newLogs.length - 1]?.id) {
+          return;
+        }
+
+        cachedLogs = newLogs;
         const list = [...cachedLogs].reverse();
-        panel.innerHTML = list.map(item => `
-          <div class="log-item">
-            <div class="log-header" onclick="toggleLogDetail('${item.id}')">
-              <span class="log-expand-icon" id="log-icon-${item.id}">▶</span>
-              <span class="log-time">${item.time}</span>
-              <span class="log-type-tag ${getTagClass(item.type)}">${item.type}</span>
-              <span class="log-summary" title="${escapeHtml(item.summary)}">${escapeHtml(item.summary)}</span>
+        panel.innerHTML = list.map(item => {
+          const isExp = expandedLogIds.has(item.id);
+          return `
+            <div class="log-item">
+              <div class="log-header" onclick="toggleLogDetail('${item.id}')">
+                <span class="log-expand-icon" id="log-icon-${item.id}">${isExp ? '▼' : '▶'}</span>
+                <span class="log-time">${item.time}</span>
+                <span class="log-type-tag ${getTagClass(item.type)}">${item.type}</span>
+                <span class="log-summary" title="${escapeHtml(item.summary)}">${escapeHtml(item.summary)}</span>
+              </div>
+              <div class="log-body" id="log-detail-${item.id}" style="display: ${isExp ? 'block' : 'none'}">${escapeHtml(item.detail)}</div>
             </div>
-            <div class="log-body" id="log-detail-${item.id}">${escapeHtml(item.detail)}</div>
-          </div>
-        `).join("");
+          `;
+        }).join("");
       } catch {}
     }
 
