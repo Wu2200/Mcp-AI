@@ -506,7 +506,6 @@ async function connectToMcpServer({ name, url, token }) {
 
   mcpServers.set(serverId, serverInfo);
   await saveServerToStorage(serverInfo);
-  appendLog("info", "MCP-INIT", `成功挂载 MCP: ${name}, 工具数量: ${registeredTools.length}`);
   return serverInfo;
 }
 
@@ -553,8 +552,8 @@ function extractMcpResultContent(data) {
     contentStr = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult, null, 2);
   }
 
-  if (contentStr.length > 8000) {
-    contentStr = contentStr.slice(0, 8000) + "\n\n[提示：工具输出内容过长，已截断保留前 8000 字符，避免超出模型上下文限制]";
+  if (contentStr.length > 3000) {
+    contentStr = contentStr.slice(0, 3000) + "\n\n[提示：工具输出内容过长，已截断保留前 3000 字符]";
   }
 
   return contentStr;
@@ -655,15 +654,6 @@ function extractReasoningText(delta) {
 }
 
 async function passThrough(requestBody, clientResponse) {
-  appendLog("info", "PASS-THROUGH", `直通转发模型 [${requestBody.model}]`, {
-    model: requestBody.model,
-    reasoning_effort: requestBody.reasoning_effort,
-    thinking: requestBody.thinking,
-    generationConfig: requestBody.generationConfig,
-    stream: requestBody.stream,
-    incoming_keys: Object.keys(requestBody)
-  });
-
   setCorsHeaders(clientResponse);
   const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
     method: "POST",
@@ -674,8 +664,6 @@ async function passThrough(requestBody, clientResponse) {
     body: JSON.stringify(requestBody),
     signal: AbortSignal.timeout(300000)
   });
-
-  appendLog("info", "PASS-THROUGH", `上游响应状态码: ${upstreamResponse.status}`);
 
   clientResponse.writeHead(upstreamResponse.status, {
     "Content-Type": upstreamResponse.headers.get("Content-Type") || "application/json",
@@ -710,7 +698,12 @@ function isModelEnabledForMcp(modelName) {
   return false;
 }
 
-const MCP_DISPATCH_PROMPT = `【工具调用准则】仅在用户明确需要查询、操作特定平台外部数据时才调用对应工具。对于解答配置、分析代码或图片、回答常规问题，必须直接生成正文回复，严禁无故乱调无关工具。`;
+const MCP_DISPATCH_PROMPT = `【核心执行准则】你接入了部分外部系统工具，但你必须极其谨慎克制：
+1. 仅当用户明确要求你查询外部仓库、管理部署等外部真实服务时，才调用对应工具。
+2. 对于解答技术配置疑问、分析用户上传的截图/图片、审查代码或回答常规问题，必须直接在正文中给出详细解答，严禁擅自调用任何工具！
+3. 若执行了工具，必须在获得结果后立即根据数据总结并输出最终正文，不得循环调用无关工具。`;
+
+const MAX_TOOL_ROUNDS = 3;
 
 async function runAgent(requestBody, clientResponse) {
   appendLog("info", "RUN-AGENT", `启动 MCP 调度 - 模型 [${requestBody.model}]`, {
@@ -741,7 +734,7 @@ async function runAgent(requestBody, clientResponse) {
     ? requestBody.tools.filter((t) => t && t.type === "function")
     : [];
   const mcpTools = getAllTools();
-  const tools = [...clientTools, ...mcpTools];
+  const allTools = [...clientTools, ...mcpTools];
 
   appendLog("info", "RUN-AGENT", `注入工具: MCP工具=${mcpTools.length}, 客户端工具=${clientTools.length}`);
 
@@ -765,21 +758,28 @@ async function runAgent(requestBody, clientResponse) {
   }
 
   try {
-    for (let round = 0; round < 100; round += 1) {
+    let toolRoundCount = 0;
+
+    for (let round = 0; round < 20; round += 1) {
       const payload = {
         ...requestBody,
         messages,
         stream: isStream
       };
 
-      if (tools.length > 0) {
-        payload.tools = tools;
+      const allowMoreTools = toolRoundCount < MAX_TOOL_ROUNDS;
+
+      if (allTools.length > 0 && allowMoreTools) {
+        payload.tools = allTools;
         payload.tool_choice = "auto";
+      } else {
+        delete payload.tools;
+        delete payload.tool_choice;
       }
 
       appendLog("info", "RUN-AGENT", `第 ${round + 1} 轮请求上游`, {
         payload_keys: Object.keys(payload),
-        has_tools: Boolean(payload.tools?.length)
+        has_tools: Boolean(payload.tools)
       });
 
       const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
@@ -796,7 +796,7 @@ async function runAgent(requestBody, clientResponse) {
 
       if (!upstreamResponse.ok) {
         const err = await upstreamResponse.text();
-        appendLog("error", "RUN-AGENT", `第 ${round + 1} 轮上游错误: ${err}`);
+        appendLog("error", "RUN-AGENT", `第 ${round + 1} 轮上游报错 (${upstreamResponse.status})`, err.slice(0, 500));
         if (isStream) {
           const errorChunk = {
             id: `chatcmpl-${Date.now()}`,
@@ -833,11 +833,12 @@ async function runAgent(requestBody, clientResponse) {
           return false;
         });
 
-        if (mcpCalls.length === 0) {
+        if (mcpCalls.length === 0 || !allowMoreTools) {
           sendJson(clientResponse, 200, json);
           return;
         }
 
+        toolRoundCount += 1;
         messages.push(message);
 
         for (const tc of mcpCalls) {
@@ -915,8 +916,6 @@ async function runAgent(requestBody, clientResponse) {
               if (!hasToolCalls) {
                 clientResponse.write(`${line}\n\n`);
               }
-            } else if (delta && !hasToolCalls) {
-              clientResponse.write(`${line}\n\n`);
             }
           } catch {}
         }
@@ -933,11 +932,15 @@ async function runAgent(requestBody, clientResponse) {
         return false;
       });
 
-      if (mcpCalls.length === 0) {
-        clientResponse.write("data: [DONE]\n\n");
-        clientResponse.end();
+      if (mcpCalls.length === 0 || !allowMoreTools) {
+        if (isStream) {
+          clientResponse.write("data: [DONE]\n\n");
+          clientResponse.end();
+        }
         return;
       }
+
+      toolRoundCount += 1;
 
       messages.push({
         role: "assistant",
@@ -959,35 +962,23 @@ async function runAgent(requestBody, clientResponse) {
             }
           }
         }
+        const serverName = toolInfo ? toolInfo.serverName : "未知";
+        appendLog("info", "RUN-AGENT", `触发执行工具: ${tc.name} (${serverName})`);
 
-        const displayName = toolInfo?.serverName || "MCP";
-        const rawAction = toolInfo?.rawName || tc.name;
-        const args = toolArguments({ function: { arguments: tc.arguments } });
-
-        appendLog("info", "RUN-AGENT", `触发执行工具: ${tc.name} (${displayName})`);
-
-        sendReasoningChunk(
-          clientResponse,
-          `\n> 正在执行 ${displayName} [${rawAction}]...\n`,
-          requestBody.model
-        );
-
-        let result;
-        if (args === null) {
-          result = JSON.stringify({ error: "Invalid tool arguments" });
-        } else {
-          try {
-            result = await callMcpTool(tc.name, args);
-          } catch (err) {
-            result = JSON.stringify({ error: err instanceof Error ? err.message : "Tool execution failed" });
-          }
+        let parsedArgs = {};
+        try {
+          parsedArgs = JSON.parse(tc.arguments || "{}");
+        } catch {
+          parsedArgs = {};
         }
 
-        sendReasoningChunk(
-          clientResponse,
-          `> ${displayName} [${rawAction}] 完成\n\n`,
-          requestBody.model
-        );
+        let result;
+        try {
+          result = await callMcpTool(tc.name, parsedArgs);
+        } catch (err) {
+          appendLog("error", "RUN-AGENT", `工具执行失败: ${tc.name}`, err.message);
+          result = JSON.stringify({ error: err.message });
+        }
 
         messages.push({
           role: "tool",
@@ -997,7 +988,10 @@ async function runAgent(requestBody, clientResponse) {
       }
     }
 
-    throw new Error("工具调用轮数达到上限");
+    if (isStream) {
+      clientResponse.write("data: [DONE]\n\n");
+      clientResponse.end();
+    }
   } finally {
     if (keepAliveTimer) clearInterval(keepAliveTimer);
   }
@@ -1018,25 +1012,14 @@ function convertGeminiToOpenAiRequest(geminiBody, modelName, isStream) {
 
   if (Array.isArray(geminiBody.contents)) {
     for (const c of geminiBody.contents) {
-      const role = c.role === "model" ? "assistant" : (c.role === "function" ? "tool" : "user");
+      const role = c.role === "model" ? "assistant" : "user";
       if (!Array.isArray(c.parts)) continue;
 
-      const textParts = [];
       const contentArray = [];
       let hasMultiModal = false;
 
       for (const p of c.parts) {
-        if (p.text) {
-          textParts.push(p.text);
-          contentArray.push({ type: "text", text: p.text });
-        } else if (p.inlineData && p.inlineData.data) {
-          hasMultiModal = true;
-          const mimeType = p.inlineData.mimeType || "image/jpeg";
-          contentArray.push({
-            type: "image_url",
-            image_url: { url: `data:${mimeType};base64,${p.inlineData.data}` }
-          });
-        } else if (p.functionCall) {
+        if (p.functionCall) {
           messages.push({
             role: "assistant",
             tool_calls: [
@@ -1056,14 +1039,24 @@ function convertGeminiToOpenAiRequest(geminiBody, modelName, isStream) {
             tool_call_id: `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`,
             content: JSON.stringify(p.functionResponse.response || {})
           });
+        } else if (p.inlineData && p.inlineData.data) {
+          hasMultiModal = true;
+          const mimeType = p.inlineData.mimeType || "image/jpeg";
+          contentArray.push({
+            type: "image_url",
+            image_url: { url: `data:${mimeType};base64,${p.inlineData.data}` }
+          });
+        } else if (p.text) {
+          contentArray.push({ type: "text", text: p.text });
         }
       }
 
-      if (textParts.length > 0 || hasMultiModal) {
+      if (contentArray.length > 0) {
         if (hasMultiModal) {
           messages.push({ role, content: contentArray });
         } else {
-          messages.push({ role, content: textParts.join("\n") });
+          const allText = contentArray.map(item => item.text).join("\n");
+          messages.push({ role, content: allText });
         }
       }
     }
@@ -1075,6 +1068,7 @@ function convertGeminiToOpenAiRequest(geminiBody, modelName, isStream) {
     messages,
     stream: isStream
   };
+
   delete openAiBody.contents;
   delete openAiBody.systemInstruction;
   delete openAiBody.generationConfig;
@@ -1086,7 +1080,7 @@ function convertGeminiToOpenAiRequest(geminiBody, modelName, isStream) {
     if (gc.maxOutputTokens !== undefined) openAiBody.max_tokens = gc.maxOutputTokens;
     if (gc.topP !== undefined) openAiBody.top_p = gc.topP;
     if (gc.stopSequences && Array.isArray(gc.stopSequences)) openAiBody.stop = gc.stopSequences;
-    
+
     if (gc.thinkingConfig) {
       openAiBody.thinkingConfig = gc.thinkingConfig;
       const tb = Number(gc.thinkingConfig.thinkingBudget);
@@ -1124,21 +1118,9 @@ function convertOpenAiToGeminiResponse(openAiJson, modelName) {
     parts.push({ text: reasoning, thought: true });
   }
 
-  if (choice?.message?.tool_calls && choice.message.tool_calls.length > 0) {
-    for (const tc of choice.message.tool_calls) {
-      let args = {};
-      try {
-        args = typeof tc.function?.arguments === "string" ? JSON.parse(tc.function.arguments) : (tc.function?.arguments || {});
-      } catch {}
-      parts.push({
-        functionCall: {
-          name: tc.function?.name || "",
-          args
-        }
-      });
-    }
-  } else if (choice?.message?.content) {
-    parts.push({ text: choice.message.content });
+  const contentText = choice?.message?.content || "";
+  if (contentText) {
+    parts.push({ text: contentText });
   }
 
   const finishReason = choice?.finish_reason;
@@ -1198,6 +1180,20 @@ function createGeminiStreamAdapter(clientResponse, modelName) {
         if (!trimmed || !trimmed.startsWith("data:")) continue;
         const dataStr = trimmed.slice(5).trim();
         if (dataStr === "[DONE]") {
+          const geminiFinishChunk = {
+            candidates: [
+              {
+                content: {
+                  parts: [{ text: "" }],
+                  role: "model"
+                },
+                finishReason: "STOP",
+                index: 0
+              }
+            ],
+            modelVersion: modelName
+          };
+          clientResponse.write(`data: ${JSON.stringify(geminiFinishChunk)}\n\n`);
           continue;
         }
 
@@ -1215,46 +1211,29 @@ function createGeminiStreamAdapter(clientResponse, modelName) {
             });
           }
 
-          if (delta?.tool_calls) {
-            continue;
-          }
-
           if (delta?.content) {
-            parts.push({ text: delta.content });
+            parts.push({
+              text: delta.content
+            });
           }
 
-          if (parts.length > 0) {
-            const geminiChunk = {
-              candidates: [
-                {
-                  content: {
-                    parts,
-                    role: "model"
-                  },
-                  index: 0
-                }
-              ],
-              modelVersion: modelName
+          let geminiFinishReason = finishReason ? (finishReason === "length" ? "MAX_TOKENS" : "STOP") : undefined;
+
+          if (parts.length > 0 || geminiFinishReason) {
+            const candidate = {
+              index: 0
             };
-            if (finishReason) {
-              geminiChunk.candidates[0].finishReason = finishReason === "length" ? "MAX_TOKENS" : "STOP";
+            if (parts.length > 0) {
+              candidate.content = { parts, role: "model" };
             }
-            clientResponse.write(`data: ${JSON.stringify(geminiChunk)}\n\n`);
-          } else if (finishReason) {
-            const geminiFinishChunk = {
-              candidates: [
-                {
-                  content: {
-                    parts: [{ text: "" }],
-                    role: "model"
-                  },
-                  finishReason: finishReason === "length" ? "MAX_TOKENS" : "STOP",
-                  index: 0
-                }
-              ],
+            if (geminiFinishReason) {
+              candidate.finishReason = geminiFinishReason;
+            }
+            const geminiChunk = {
+              candidates: [candidate],
               modelVersion: modelName
             };
-            clientResponse.write(`data: ${JSON.stringify(geminiFinishChunk)}\n\n`);
+            clientResponse.write(`data: ${JSON.stringify(geminiChunk)}\n\n`);
           }
         } catch {}
       }
@@ -1264,69 +1243,7 @@ function createGeminiStreamAdapter(clientResponse, modelName) {
       if (chunk) {
         this.write(chunk);
       }
-      if (buffer.trim()) {
-        const line = buffer.trim();
-        if (line.startsWith("data:") && !line.includes("[DONE]")) {
-          try {
-            const parsed = JSON.parse(line.slice(5).trim());
-            const delta = parsed.choices?.[0]?.delta;
-            if (delta?.content) {
-              const geminiChunk = {
-                candidates: [
-                  {
-                    content: { parts: [{ text: delta.content }], role: "model" },
-                    index: 0
-                  }
-                ],
-                modelVersion: modelName
-              };
-              clientResponse.write(`data: ${JSON.stringify(geminiChunk)}\n\n`);
-            }
-          } catch {}
-        }
-      }
       clientResponse.end();
-    }
-  };
-}
-
-function createGeminiNonStreamAdapter(clientResponse, modelName) {
-  let accumulatedBody = "";
-  let statusCode = 200;
-
-  return {
-    headersSent: false,
-    setHeader(name, value) {
-      setCorsHeaders(clientResponse);
-    },
-    writeHead(code, headers) {
-      statusCode = code;
-    },
-    write(chunk) {
-      accumulatedBody += typeof chunk === "string" ? chunk : chunk.toString("utf8");
-      return true;
-    },
-    end(chunk) {
-      if (chunk) accumulatedBody += typeof chunk === "string" ? chunk : chunk.toString("utf8");
-      try {
-        const openAiJson = JSON.parse(accumulatedBody);
-        if (openAiJson.error) {
-          sendJson(clientResponse, statusCode, {
-            error: {
-              code: statusCode,
-              message: openAiJson.error.message || "Request failed",
-              status: "INVALID_ARGUMENT"
-            }
-          });
-          return;
-        }
-        const geminiJson = convertOpenAiToGeminiResponse(openAiJson, modelName);
-        sendJson(clientResponse, 200, geminiJson);
-      } catch (e) {
-        sendJson(clientResponse, statusCode, {
-          error: { code: statusCode, message: accumulatedBody || e.message, status: "INTERNAL" }
-        });
-      }
     }
   };
 }
@@ -1337,31 +1254,29 @@ function getLoginHtml() {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>MCP 控制台 - 登录认证</title>
+  <title>MCP 控制台登录</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       background: #f8fafc;
-      color: #0f172a;
       min-height: 100vh;
       display: flex;
       align-items: center;
       justify-content: center;
-      padding: 16px;
+      padding: 20px;
     }
     .card {
       background: #ffffff;
       border: 1px solid #e2e8f0;
       border-radius: 12px;
-      padding: 32px 24px;
+      padding: 32px 28px;
       width: 100%;
       max-width: 360px;
       box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
-      text-align: center;
     }
-    h1 { font-size: 18px; font-weight: 700; margin-bottom: 8px; }
-    p { font-size: 13px; color: #64748b; margin-bottom: 20px; }
+    h2 { font-size: 20px; font-weight: 700; color: #0f172a; margin-bottom: 8px; }
+    p { font-size: 13px; color: #64748b; margin-bottom: 24px; }
     input {
       width: 100%;
       background: #ffffff;
@@ -1369,8 +1284,9 @@ function getLoginHtml() {
       padding: 10px 14px;
       border-radius: 8px;
       font-size: 14px;
+      color: #0f172a;
       outline: none;
-      margin-bottom: 14px;
+      margin-bottom: 16px;
     }
     input:focus { border-color: #2563eb; }
     button {
@@ -1378,45 +1294,25 @@ function getLoginHtml() {
       background: #2563eb;
       color: #ffffff;
       border: none;
-      font-weight: 600;
-      font-size: 14px;
       padding: 10px;
       border-radius: 8px;
+      font-weight: 600;
+      font-size: 14px;
       cursor: pointer;
     }
     button:hover { background: #1d4ed8; }
-    #err-msg { color: #dc2626; font-size: 13px; margin-top: 10px; }
+    .err { color: #dc2626; font-size: 13px; margin-top: 12px; text-align: center; }
   </style>
 </head>
 <body>
   <div class="card">
-    <h1>MCP 控制台认证</h1>
-    <p>请输入后台管理密码以进入面板</p>
-    <input id="pwd" type="password" placeholder="输入管理密码" onkeydown="if(event.key==='Enter')login()">
-    <button onclick="login()">验证并进入</button>
-    <div id="err-msg"></div>
+    <h2>MCP 控制台</h2>
+    <p>请输入面板密码继续</p>
+    <form method="POST" action="/login">
+      <input type="password" name="password" placeholder="面板密码" required autofocus />
+      <button type="submit">登 录</button>
+    </form>
   </div>
-  <script>
-    async function login() {
-      const pwd = document.getElementById("pwd").value.trim();
-      const err = document.getElementById("err-msg");
-      if (!pwd) { err.innerText = "请输入管理密码"; return; }
-      try {
-        const res = await fetch("/api/panel/login", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ password: pwd })
-        });
-        if (res.ok) {
-          location.reload();
-        } else {
-          err.innerText = "密码错误，请重新输入";
-        }
-      } catch (e) {
-        err.innerText = e.message;
-      }
-    }
-  </script>
 </body>
 </html>`;
 }
@@ -1429,8 +1325,6 @@ async function handleGeminiNativePassThrough(reqUrl, request, response, customBo
   setCorsHeaders(response);
   const upstreamBase = resolveUpstreamBase();
   const targetUrl = `${upstreamBase}${reqUrl.pathname}${reqUrl.search}`;
-
-  appendLog("info", "GEMINI-PASS", `原生直通 Gemini 上游: ${reqUrl.pathname}`);
 
   const headers = {
     "Content-Type": request.headers["content-type"] || "application/json"
@@ -1475,6 +1369,9 @@ await loadSettingsFromStorage();
 
 const server = http.createServer(async (request, response) => {
   try {
+    const reqUrl = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+    appendLog("info", "REQUEST", `${request.method} ${reqUrl.pathname}`);
+
     if (request.method === "OPTIONS") {
       setCorsHeaders(response);
       response.writeHead(204);
@@ -1482,17 +1379,42 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    const reqUrl = new URL(request.url, `http://${request.headers.host || "localhost"}`);
+    if (request.method === "GET" && reqUrl.pathname === "/login") {
+      response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      response.end(getLoginHtml());
+      return;
+    }
 
-    if (request.method === "GET" && (reqUrl.pathname === "/" || reqUrl.pathname === "")) {
-      setCorsHeaders(response);
-      if (PANEL_PASSWORD) {
-        const cookies = parseCookies(request);
-        if (!verifySessionToken(cookies.panel_auth)) {
-          response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-          response.end(getLoginHtml());
-          return;
-        }
+    if (request.method === "POST" && reqUrl.pathname === "/login") {
+      const body = await readRequestBody(request);
+      if (!PANEL_PASSWORD || body.password === PANEL_PASSWORD) {
+        const token = generateSessionToken();
+        response.writeHead(302, {
+          "Set-Cookie": `panel_auth=${token}; Path=/; HttpOnly; SameSite=Lax`,
+          Location: "/"
+        });
+        response.end();
+        return;
+      }
+      response.writeHead(401, { "Content-Type": "text/html; charset=utf-8" });
+      response.end(getLoginHtml());
+      return;
+    }
+
+    if (request.method === "POST" && reqUrl.pathname === "/logout") {
+      response.writeHead(302, {
+        "Set-Cookie": "panel_auth=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+        Location: "/login"
+      });
+      response.end();
+      return;
+    }
+
+    if (request.method === "GET" && reqUrl.pathname === "/") {
+      if (!isPanelAuthorized(request)) {
+        response.writeHead(302, { Location: "/login" });
+        response.end();
+        return;
       }
       const htmlPath = path.join(__dirname, "dashboard.html");
       const htmlContent = fs.readFileSync(htmlPath, "utf8");
@@ -1501,40 +1423,9 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    if (request.method === "GET" && reqUrl.pathname === "/health") {
-      sendJson(response, 200, { status: "ok" });
-      return;
-    }
-
-    if (request.method === "POST" && reqUrl.pathname === "/api/panel/login") {
-      const body = await readRequestBody(request);
-      if (!PANEL_PASSWORD || body.password === PANEL_PASSWORD) {
-        const token = generateSessionToken();
-        setCorsHeaders(response);
-        response.writeHead(200, {
-          "Content-Type": "application/json",
-          "Set-Cookie": `panel_auth=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`
-        });
-        response.end(JSON.stringify({ success: true }));
-      } else {
-        sendJson(response, 401, { error: "密码错误" });
-      }
-      return;
-    }
-
-    if (request.method === "POST" && reqUrl.pathname === "/api/panel/logout") {
-      setCorsHeaders(response);
-      response.writeHead(200, {
-        "Content-Type": "application/json",
-        "Set-Cookie": `panel_auth=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`
-      });
-      response.end(JSON.stringify({ success: true }));
-      return;
-    }
-
     if (reqUrl.pathname.startsWith("/api/")) {
       if (!isPanelAuthorized(request)) {
-        sendJson(response, 401, { error: "控制台未授权，请输入管理密码" });
+        sendJson(response, 401, { error: "无权访问面板 API" });
         return;
       }
 
@@ -1548,144 +1439,107 @@ const server = http.createServer(async (request, response) => {
 
       if (request.method === "POST" && reqUrl.pathname === "/api/logs/toggle") {
         const body = await readRequestBody(request);
-        const enabled = Boolean(body.enabled);
-        await saveLoggingConfigToStorage(enabled);
-        if (!enabled) {
-          recentLogs.length = 0;
-        }
+        const newStatus = typeof body.enabled === "boolean" ? body.enabled : !loggingEnabled;
+        await saveLoggingConfigToStorage(newStatus);
         sendJson(response, 200, { success: true, enabled: loggingEnabled });
         return;
       }
 
       if (request.method === "POST" && reqUrl.pathname === "/api/logs/clear") {
         recentLogs.length = 0;
+        sendJson(response, 200, { success: true, logs: [] });
+        return;
+      }
+
+      if (request.method === "GET" && reqUrl.pathname === "/api/servers") {
+        sendJson(response, 200, Array.from(mcpServers.values()));
+        return;
+      }
+
+      if (request.method === "POST" && reqUrl.pathname === "/api/servers") {
+        const body = await readRequestBody(request);
+        if (!body.name || !body.url) {
+          sendJson(response, 400, { error: "缺少必要字段 name 或 url" });
+          return;
+        }
+        try {
+          const s = await connectToMcpServer({ name: body.name, url: body.url, token: body.token });
+          sendJson(response, 200, { success: true, server: s });
+        } catch (err) {
+          sendJson(response, 500, { error: err.message });
+        }
+        return;
+      }
+
+      if (request.method === "POST" && reqUrl.pathname.startsWith("/api/servers/") && reqUrl.pathname.endsWith("/toggle")) {
+        const id = reqUrl.pathname.split("/")[3];
+        const s = mcpServers.get(id);
+        if (!s) {
+          sendJson(response, 404, { error: "未找到该服务器" });
+          return;
+        }
+        s.status = s.status === "active" ? "inactive" : "active";
+        if (s.status === "inactive") {
+          for (const t of s.tools) mcpToolRegistry.delete(t.key);
+        } else {
+          for (const t of s.tools) {
+            mcpToolRegistry.set(t.key, {
+              serverId: s.id,
+              serverName: s.name,
+              rawName: t.rawName,
+              postEndpoint: s.postEndpoint,
+              headers: s.headers
+            });
+          }
+        }
+        await saveServerToStorage(s);
+        sendJson(response, 200, { success: true, server: s });
+        return;
+      }
+
+      if (request.method === "DELETE" && reqUrl.pathname.startsWith("/api/servers/")) {
+        const id = reqUrl.pathname.split("/")[3];
+        const s = mcpServers.get(id);
+        if (s) {
+          for (const t of s.tools) mcpToolRegistry.delete(t.key);
+          mcpServers.delete(id);
+          await deleteServerFromStorage(id);
+        }
         sendJson(response, 200, { success: true });
         return;
       }
 
-      if (request.method === "GET" && reqUrl.pathname === "/api/settings/enabled-models") {
-        sendJson(response, 200, { enabledModels: Array.from(enabledModels) });
+      if (request.method === "GET" && reqUrl.pathname === "/api/models") {
+        sendJson(response, 200, {
+          enabledModels: Array.from(enabledModels)
+        });
         return;
       }
 
-      if (request.method === "POST" && reqUrl.pathname === "/api/settings/enabled-models") {
+      if (request.method === "POST" && reqUrl.pathname === "/api/models") {
         const body = await readRequestBody(request);
-        const models = Array.isArray(body.models) ? body.models : [];
-        await saveEnabledModelsToStorage(models);
+        if (!Array.isArray(body.models)) {
+          sendJson(response, 400, { error: "models 必须是数组" });
+          return;
+        }
+        await saveEnabledModelsToStorage(body.models);
         sendJson(response, 200, { success: true, enabledModels: Array.from(enabledModels) });
         return;
       }
 
-      if (request.method === "GET" && reqUrl.pathname === "/api/upstream/models") {
-        if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
-          sendJson(response, 200, { models: [] });
-          return;
-        }
-        const modelsUrl = UPSTREAM_BASE_URL.endsWith("/v1")
-          ? `${UPSTREAM_BASE_URL}/models`
-          : `${UPSTREAM_BASE_URL}/v1/models`;
-
-        try {
-          const upstreamResponse = await fetch(modelsUrl, {
-            headers: { Authorization: `Bearer ${UPSTREAM_API_KEY}` },
-            signal: AbortSignal.timeout(10000)
-          });
-          const data = await upstreamResponse.json();
-          const list = Array.isArray(data.data) ? data.data.map(m => m.id).filter(Boolean) : [];
-          sendJson(response, 200, { models: list });
-        } catch (e) {
-          sendJson(response, 500, { error: e.message, models: [] });
-        }
-        return;
-      }
-
-      if (request.method === "GET" && reqUrl.pathname === "/api/mcp/servers") {
-        sendJson(response, 200, { servers: Array.from(mcpServers.values()) });
-        return;
-      }
-
-      if (request.method === "POST" && reqUrl.pathname === "/api/mcp/connect") {
-        const body = await readRequestBody(request);
-        const serverInfo = await connectToMcpServer(body);
-        sendJson(response, 200, { toolCount: serverInfo.toolCount });
-        return;
-      }
-
-      const matchStart = reqUrl.pathname.match(/^\/api\/mcp\/servers\/([^/]+)\/start$/);
-      if (request.method === "POST" && matchStart) {
-        const id = decodeURIComponent(matchStart[1]);
-        const s = mcpServers.get(id);
-        if (!s) {
-          sendJson(response, 404, { error: "未找到该服务" });
-          return;
-        }
-        s.status = "active";
-        for (const t of s.tools) {
-          mcpToolRegistry.set(t.key, {
-            serverId: s.id,
-            serverName: s.name,
-            rawName: t.rawName,
-            postEndpoint: s.postEndpoint,
-            headers: s.headers
-          });
-        }
-        await saveServerToStorage(s);
-        sendJson(response, 200, { success: true, status: "active" });
-        return;
-      }
-
-      const matchStop = reqUrl.pathname.match(/^\/api\/mcp\/servers\/([^/]+)\/stop$/);
-      if (request.method === "POST" && matchStop) {
-        const id = decodeURIComponent(matchStop[1]);
-        const s = mcpServers.get(id);
-        if (!s) {
-          sendJson(response, 404, { error: "未找到该服务" });
-          return;
-        }
-        s.status = "disabled";
-        for (const [key, val] of mcpToolRegistry.entries()) {
-          if (val.serverId === id) {
-            mcpToolRegistry.delete(key);
-          }
-        }
-        await saveServerToStorage(s);
-        sendJson(response, 200, { success: true, status: "disabled" });
-        return;
-      }
-
-      const matchDelete = reqUrl.pathname.match(/^\/api\/mcp\/servers\/([^/]+)$/);
-      if (request.method === "DELETE" && matchDelete) {
-        const id = decodeURIComponent(matchDelete[1]);
-        mcpServers.delete(id);
-        for (const [key, val] of mcpToolRegistry.entries()) {
-          if (val.serverId === id) {
-            mcpToolRegistry.delete(key);
-          }
-        }
-        await deleteServerFromStorage(id);
-        sendJson(response, 200, { success: true });
-        return;
-      }
+      sendJson(response, 404, { error: "API 路径不存在" });
+      return;
     }
 
     if (!isProxyAuthorized(request, reqUrl)) {
-      if (
-        reqUrl.pathname.startsWith("/v1beta/") ||
-        reqUrl.pathname.includes(":generateContent") ||
-        reqUrl.pathname.includes(":streamGenerateContent")
-      ) {
-        sendJson(response, 401, {
-          error: { code: 401, message: "API key not valid", status: "UNAUTHENTICATED" }
-        });
-      } else {
-        sendOpenAIError(response, 401, "API Key 错误", "authentication_error");
-      }
+      sendOpenAIError(response, 401, "API Key 无效或未提供", "invalid_api_key");
       return;
     }
 
     if (
       request.method === "GET" &&
       (reqUrl.pathname === "/v1beta/models" ||
+        reqUrl.pathname === "/v1/models" ||
         (reqUrl.pathname === "/v1/models" &&
           (request.headers["x-goog-api-key"] || reqUrl.searchParams.has("key"))))
     ) {
@@ -1699,31 +1553,34 @@ const server = http.createServer(async (request, response) => {
         const modelsUrl = UPSTREAM_BASE_URL.endsWith("/v1")
           ? `${UPSTREAM_BASE_URL}/models`
           : `${UPSTREAM_BASE_URL}/v1/models`;
-
         try {
-          const upstreamResponse = await fetch(modelsUrl, {
+          const uRes = await fetch(modelsUrl, {
             headers: { Authorization: `Bearer ${UPSTREAM_API_KEY}` },
-            signal: AbortSignal.timeout(10000)
+            signal: AbortSignal.timeout(5000)
           });
-          const data = await upstreamResponse.json();
-          if (Array.isArray(data.data)) {
-            modelList = data.data.map((m) => m.id).filter(Boolean);
+          if (uRes.ok) {
+            const data = await uRes.json();
+            modelList = Array.isArray(data.data) ? data.data : (Array.isArray(data.models) ? data.models : []);
           }
         } catch {}
       }
-      if (modelList.length === 0) {
-        modelList = ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-1.5-pro", "gemini-1.5-flash", "default"];
+
+      if (reqUrl.pathname.startsWith("/v1beta/models")) {
+        const geminiModels = modelList.map((m) => {
+          const id = m.id || m.name || "unknown";
+          return {
+            name: `models/${id}`,
+            version: "1.0",
+            displayName: id,
+            description: `Model ${id} via Mcp-AI Proxy`,
+            supportedGenerationMethods: ["generateContent", "streamGenerateContent", "countTokens"]
+          };
+        });
+        sendJson(response, 200, { models: geminiModels });
+        return;
       }
 
-      const geminiModels = modelList.map((id) => ({
-        name: id.startsWith("models/") ? id : `models/${id}`,
-        version: "1.0",
-        displayName: id.replace(/^models\//, ""),
-        description: `Model ${id} via Mcp-AI Proxy`,
-        supportedGenerationMethods: ["generateContent", "streamGenerateContent", "countTokens"]
-      }));
-
-      sendJson(response, 200, { models: geminiModels });
+      sendJson(response, 200, { object: "list", data: modelList });
       return;
     }
 
@@ -1738,39 +1595,8 @@ const server = http.createServer(async (request, response) => {
       }
     }
 
-    const geminiModelMatch = reqUrl.pathname.match(/^\/(?:v1beta|v1)\/models\/([^:/]+)$/);
-    if (request.method === "GET" && geminiModelMatch) {
-      try {
-        await handleGeminiNativePassThrough(reqUrl, request, response);
-        return;
-      } catch {
-        const modelId = decodeURIComponent(geminiModelMatch[1]);
-        sendJson(response, 200, {
-          name: `models/${modelId}`,
-          version: "1.0",
-          displayName: modelId,
-          description: `Model ${modelId} via Mcp-AI Proxy`,
-          supportedGenerationMethods: ["generateContent", "streamGenerateContent", "countTokens"]
-        });
-        return;
-      }
-    }
-
-    const geminiMatch = reqUrl.pathname.match(
-      /^\/(?:v1beta|v1)\/models\/([^:]+):(generateContent|streamGenerateContent)$/
-    );
+    const geminiMatch = reqUrl.pathname.match(/^\/(?:v1beta|v1)\/models\/([^:]+):(generateContent|streamGenerateContent)$/);
     if (request.method === "POST" && geminiMatch) {
-      if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
-        sendJson(response, 500, {
-          error: {
-            code: 500,
-            message: "服务端未配置环境变量：UPSTREAM_BASE_URL 或 UPSTREAM_API_KEY",
-            status: "INTERNAL"
-          }
-        });
-        return;
-      }
-
       const rawModel = decodeURIComponent(geminiMatch[1]);
       const modelName = rawModel.replace(/^models\//, "");
       const action = geminiMatch[2];
@@ -1795,60 +1621,31 @@ const server = http.createServer(async (request, response) => {
 
       const targetAdapter = isStream
         ? createGeminiStreamAdapter(response, modelName)
-        : createGeminiNonStreamAdapter(response, modelName);
+        : {
+            headersSent: false,
+            writeHead: (code, headers) => response.writeHead(code, headers),
+            end: (payload) => {
+              try {
+                const openAiJson = JSON.parse(payload);
+                const geminiJson = convertOpenAiToGeminiResponse(openAiJson, modelName);
+                sendJson(response, 200, geminiJson);
+              } catch {
+                response.end(payload);
+              }
+            }
+          };
 
-      if (isModelEnabledForMcp(modelName) && mcpToolRegistry.size > 0) {
-        await runAgent(openAiBody, targetAdapter);
-      } else {
-        await passThrough(openAiBody, targetAdapter);
-      }
+      await runAgent(openAiBody, targetAdapter);
       return;
     }
 
-    if (request.method === "GET" && reqUrl.pathname === "/v1/models") {
-      if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
-        sendJson(response, 200, {
-          object: "list",
-          data: [{ id: "default", object: "model", created: 0, owned_by: "proxy" }]
-        });
-        return;
-      }
-
-      const modelsUrl = UPSTREAM_BASE_URL.endsWith("/v1")
-        ? `${UPSTREAM_BASE_URL}/models`
-        : `${UPSTREAM_BASE_URL}/v1/models`;
-
-      try {
-        const upstreamResponse = await fetch(modelsUrl, {
-          headers: { Authorization: `Bearer ${UPSTREAM_API_KEY}` },
-          signal: AbortSignal.timeout(10000)
-        });
-        const data = await upstreamResponse.json();
-        sendJson(response, 200, data);
-      } catch {
-        sendJson(response, 200, {
-          object: "list",
-          data: [{ id: "default", object: "model", created: 0, owned_by: "proxy" }]
-        });
-      }
-      return;
-    }
-
-    if (request.method === "POST" && reqUrl.pathname === "/v1/chat/completions") {
-      if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
-        sendOpenAIError(response, 500, "服务端未配置环境变量：UPSTREAM_BASE_URL 或 UPSTREAM_API_KEY");
+    if (request.method === "POST" && (reqUrl.pathname === "/chat/completions" || reqUrl.pathname === "/v1/chat/completions")) {
+      if (!UPSTREAM_BASE_URL) {
+        sendOpenAIError(response, 500, "未配置 UPSTREAM_BASE_URL 环境变量");
         return;
       }
 
       const body = await readRequestBody(request);
-
-      appendLog("info", "CHAT-INCOMING", `接收客户端调用 [${body.model}]`, {
-        model: body.model,
-        reasoning_effort: body.reasoning_effort,
-        thinking: body.thinking,
-        stream: body.stream,
-        keys: Object.keys(body)
-      });
 
       if (isModelEnabledForMcp(body.model) && mcpToolRegistry.size > 0) {
         await runAgent(body, response);
@@ -1858,36 +1655,15 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    sendOpenAIError(response, 404, "接口不存在");
+    sendOpenAIError(response, 404, "接口不存在", "not_found");
   } catch (err) {
-    appendLog("error", "SERVER-ERROR", err.message, err.stack);
-    if (response.headersSent) {
-      try {
-        const errChunk = {
-          id: `chatcmpl-${Date.now()}`,
-          object: "chat.completion.chunk",
-          created: Math.floor(Date.now() / 1000),
-          choices: [
-            {
-              index: 0,
-              delta: { content: `\n\n[代理服务错误]: ${err instanceof Error ? err.message : "未知错误"}` },
-              finish_reason: "stop"
-            }
-          ]
-        };
-        response.write(`data: ${JSON.stringify(errChunk)}\n\n`);
-        response.write("data: [DONE]\n\n");
-        response.end();
-      } catch {}
-      return;
+    appendLog("error", "SERVER", "全局捕获错误", err.message);
+    if (!response.headersSent) {
+      sendOpenAIError(response, 500, `代理服务器内部错误: ${err.message}`, "internal_error");
     }
-
-    sendJson(response, 500, { error: err.message });
   }
 });
 
-server.keepAliveTimeout = 600000;
-server.requestTimeout = 600000;
-server.headersTimeout = 600000;
-
-server.listen(PORT, "0.0.0.0");
+server.listen(PORT, () => {
+  console.log(`[MCP-AI] 服务已在端口 ${PORT} 启动`);
+});
