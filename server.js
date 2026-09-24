@@ -315,7 +315,7 @@ async function loadConfigFromStorage() {
 function setCorsHeaders(response) {
   response.setHeader("Access-Control-Allow-Origin", "*");
   response.setHeader("Access-Control-Allow-Headers", "*");
-  response.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  response.setHeader("Access-Control-Allow-Methods", "GET, HEAD, POST, DELETE, OPTIONS");
 }
 
 function sendJson(response, statusCode, body) {
@@ -1174,25 +1174,34 @@ const server = http.createServer(async (request, response) => {
 
     const reqUrl = new URL(request.url, `http://${request.headers.host || "localhost"}`);
 
-    if (request.method === "GET" && (reqUrl.pathname === "/" || reqUrl.pathname === "")) {
+    if ((request.method === "GET" || request.method === "HEAD") && (reqUrl.pathname === "/" || reqUrl.pathname === "")) {
       setCorsHeaders(response);
       if (PANEL_PASSWORD) {
         const cookies = parseCookies(request);
         if (!verifySessionToken(cookies.panel_auth)) {
           response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-          response.end(getLoginHtml());
+          response.end(request.method === "HEAD" ? "" : getLoginHtml());
           return;
         }
       }
       const htmlPath = path.join(__dirname, "dashboard.html");
       const htmlContent = fs.readFileSync(htmlPath, "utf8");
       response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      response.end(htmlContent);
+      response.end(request.method === "HEAD" ? "" : htmlContent);
       return;
     }
 
-    if (request.method === "GET" && reqUrl.pathname === "/health") {
-      sendJson(response, 200, { status: "ok" });
+    if ((request.method === "GET" || request.method === "HEAD") && reqUrl.pathname === "/health") {
+      setCorsHeaders(response);
+      response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      response.end(request.method === "HEAD" ? "" : JSON.stringify({ status: "ok" }));
+      return;
+    }
+
+    if (reqUrl.pathname === "/favicon.ico") {
+      setCorsHeaders(response);
+      response.writeHead(204);
+      response.end();
       return;
     }
 
@@ -1356,71 +1365,74 @@ const server = http.createServer(async (request, response) => {
       }
     }
 
-    if (!isProxyAuthorized(request)) {
-      const authHeader = request.headers.authorization || "(无 Authorization 请求头)";
-      const clientIp = request.headers["x-forwarded-for"] || request.socket.remoteAddress;
-      sendOpenAIError(response, 401, "API Key 错误", "authentication_error", {
-        path: reqUrl.pathname,
-        method: request.method,
-        clientIp,
-        receivedAuth: authHeader.length > 20 ? authHeader.slice(0, 15) + "..." : authHeader
-      });
-      return;
-    }
-
-    if (request.method === "GET" && reqUrl.pathname === "/v1/models") {
-      if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
-        sendJson(response, 200, {
-          object: "list",
-          data: [{ id: "default", object: "model", created: 0, owned_by: "proxy" }]
+    // 只有 /v1/ 下的 OpenAI 客户端接口才进行 PROXY_API_KEY 校验
+    if (reqUrl.pathname.startsWith("/v1/")) {
+      if (!isProxyAuthorized(request)) {
+        const authHeader = request.headers.authorization || "(无 Authorization 请求头)";
+        const clientIp = request.headers["x-forwarded-for"] || request.socket.remoteAddress;
+        sendOpenAIError(response, 401, "API Key 错误", "authentication_error", {
+          path: reqUrl.pathname,
+          method: request.method,
+          clientIp,
+          receivedAuth: authHeader.length > 20 ? authHeader.slice(0, 15) + "..." : authHeader
         });
         return;
       }
 
-      const modelsUrl = UPSTREAM_BASE_URL.endsWith("/v1")
-        ? `${UPSTREAM_BASE_URL}/models`
-        : `${UPSTREAM_BASE_URL}/v1/models`;
+      if (request.method === "GET" && reqUrl.pathname === "/v1/models") {
+        if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
+          sendJson(response, 200, {
+            object: "list",
+            data: [{ id: "default", object: "model", created: 0, owned_by: "proxy" }]
+          });
+          return;
+        }
 
-      try {
-        const upstreamResponse = await fetch(modelsUrl, {
-          headers: { Authorization: `Bearer ${UPSTREAM_API_KEY}` },
-          signal: AbortSignal.timeout(10000)
-        });
-        const data = await upstreamResponse.json();
-        sendJson(response, 200, data);
-      } catch {
-        sendJson(response, 200, {
-          object: "list",
-          data: [{ id: "default", object: "model", created: 0, owned_by: "proxy" }]
-        });
-      }
-      return;
-    }
+        const modelsUrl = UPSTREAM_BASE_URL.endsWith("/v1")
+          ? `${UPSTREAM_BASE_URL}/models`
+          : `${UPSTREAM_BASE_URL}/v1/models`;
 
-    if (request.method === "POST" && reqUrl.pathname === "/v1/chat/completions") {
-      if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
-        sendOpenAIError(response, 500, "服务端未配置环境变量：UPSTREAM_BASE_URL 或 UPSTREAM_API_KEY");
+        try {
+          const upstreamResponse = await fetch(modelsUrl, {
+            headers: { Authorization: `Bearer ${UPSTREAM_API_KEY}` },
+            signal: AbortSignal.timeout(10000)
+          });
+          const data = await upstreamResponse.json();
+          sendJson(response, 200, data);
+        } catch {
+          sendJson(response, 200, {
+            object: "list",
+            data: [{ id: "default", object: "model", created: 0, owned_by: "proxy" }]
+          });
+        }
         return;
       }
 
-      const body = await readRequestBody(request);
-      const mcpEnabled = isModelEnabledForMcp(body.model) && mcpToolRegistry.size > 0;
-      const lastMsg = Array.isArray(body.messages) ? body.messages[body.messages.length - 1] : null;
+      if (request.method === "POST" && reqUrl.pathname === "/v1/chat/completions") {
+        if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
+          sendOpenAIError(response, 500, "服务端未配置环境变量：UPSTREAM_BASE_URL 或 UPSTREAM_API_KEY");
+          return;
+        }
 
-      addDebugLog("DOWNSTREAM", `收到客户端请求 [${body.model || "default"}] - stream=${body.stream === true}`, {
-        model: body.model,
-        stream: body.stream,
-        mcpEnabled,
-        messagesCount: body.messages?.length || 0,
-        lastUserMessagePreview: typeof lastMsg?.content === "string" ? lastMsg.content.slice(0, 300) : "[非纯文本内容]"
-      });
+        const body = await readRequestBody(request);
+        const mcpEnabled = isModelEnabledForMcp(body.model) && mcpToolRegistry.size > 0;
+        const lastMsg = Array.isArray(body.messages) ? body.messages[body.messages.length - 1] : null;
 
-      if (mcpEnabled) {
-        await runAgent(body, response, { ip: request.socket.remoteAddress });
-      } else {
-        await passThrough(body, response, { ip: request.socket.remoteAddress });
+        addDebugLog("DOWNSTREAM", `收到客户端请求 [${body.model || "default"}] - stream=${body.stream === true}`, {
+          model: body.model,
+          stream: body.stream,
+          mcpEnabled,
+          messagesCount: body.messages?.length || 0,
+          lastUserMessagePreview: typeof lastMsg?.content === "string" ? lastMsg.content.slice(0, 300) : "[非纯文本内容]"
+        });
+
+        if (mcpEnabled) {
+          await runAgent(body, response, { ip: request.socket.remoteAddress });
+        } else {
+          await passThrough(body, response, { ip: request.socket.remoteAddress });
+        }
+        return;
       }
-      return;
     }
 
     sendOpenAIError(response, 404, "接口不存在");
