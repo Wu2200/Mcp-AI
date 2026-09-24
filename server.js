@@ -725,9 +725,7 @@ async function runAgent(requestBody, clientResponse, reqMeta) {
   const isStream = requestBody.stream === true;
   let messages = [...requestBody.messages];
 
-  const clientTools = Array.isArray(requestBody.tools)
-    ? requestBody.tools.filter((t) => t && t.type === "function")
-    : [];
+  const clientTools = Array.isArray(requestBody.tools) ? requestBody.tools : [];
   const mcpTools = getAllTools();
   const tools = [...clientTools, ...mcpTools];
 
@@ -771,7 +769,10 @@ async function runAgent(requestBody, clientResponse, reqMeta) {
 
       if (tools.length > 0) {
         payload.tools = tools;
-        payload.tool_choice = "auto";
+        // 如果客户端传了 tool_choice 就保留，没传则不强行指定 auto，防止上游无法按默认规则注入
+        if (requestBody.tool_choice !== undefined) {
+          payload.tool_choice = requestBody.tool_choice;
+        }
       }
 
       const roundStartTime = Date.now();
