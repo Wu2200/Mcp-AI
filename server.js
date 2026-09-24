@@ -13,8 +13,6 @@ const UPSTREAM_API_KEY = (process.env.UPSTREAM_API_KEY || "").trim();
 const PROXY_API_KEY = (process.env.PROXY_API_KEY || "").trim();
 const PANEL_PASSWORD = (process.env.PANEL_PASSWORD || "").trim();
 const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
-const MAX_ROUNDS = Number(process.env.MAX_ROUNDS || 100);
-const MAX_TOOL_CHARS = Number(process.env.MAX_TOOL_CHARS || 200000);
 
 const DATA_FILE = path.join(__dirname, "mcp-config.json");
 const SETTINGS_FILE = path.join(__dirname, "mcp-settings.json");
@@ -548,16 +546,6 @@ function extractMcpResultContent(data) {
     contentStr = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult, null, 2);
   }
 
-  // 关键保护：单次工具输出最大限制（默认 200,000 字符，支持通过 MAX_TOOL_CHARS 环境变量调整或设为 0 关闭截断）
-  if (MAX_TOOL_CHARS > 0 && contentStr.length > MAX_TOOL_CHARS) {
-    const headLen = Math.floor(MAX_TOOL_CHARS * 0.8);
-    const tailLen = Math.floor(MAX_TOOL_CHARS * 0.2);
-    const head = contentStr.slice(0, headLen);
-    const tail = contentStr.slice(-tailLen);
-    const originLen = contentStr.length;
-    contentStr = `${head}\n\n[⚠️ 系统截断提示：工具返回内容过大(共 ${originLen} 字符)，已智能保留前 ${headLen} 和后 ${tailLen} 字符]\n\n${tail}`;
-  }
-
   return contentStr;
 }
 
@@ -582,8 +570,7 @@ async function callMcpTool(toolKey, args) {
       id: Date.now(),
       method: "tools/call",
       params: { name: info.rawName, arguments: args }
-    }),
-    signal: AbortSignal.timeout(60000)
+    })
   });
 
   const duration = Date.now() - startTime;
@@ -674,8 +661,7 @@ async function passThrough(requestBody, clientResponse, reqMeta) {
       Authorization: `Bearer ${UPSTREAM_API_KEY}`,
       "Content-Type": "application/json"
     },
-    body: JSON.stringify(requestBody),
-    signal: AbortSignal.timeout(300000)
+    body: JSON.stringify(requestBody)
   });
 
   const duration = Date.now() - startTime;
@@ -762,7 +748,7 @@ async function runAgent(requestBody, clientResponse, reqMeta) {
   let finalFinishReason = null;
 
   try {
-    for (let round = 0; round < MAX_ROUNDS; round += 1) {
+    for (let round = 0; ; round += 1) {
       const payload = {
         ...requestBody,
         messages,
@@ -787,8 +773,7 @@ async function runAgent(requestBody, clientResponse, reqMeta) {
           Authorization: `Bearer ${UPSTREAM_API_KEY}`,
           "Content-Type": "application/json"
         },
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(300000)
+        body: JSON.stringify(payload)
       });
 
       const roundDuration = Date.now() - roundStartTime;
@@ -825,10 +810,6 @@ async function runAgent(requestBody, clientResponse, reqMeta) {
         const message = choice?.message;
         const toolCalls = message?.tool_calls || [];
         finalFinishReason = choice?.finish_reason;
-
-        if (finalFinishReason === "length") {
-          addDebugLog("ERROR", `⚠️ [截断诊断] 上游因达到最大输出 Token 上限被截断 (finish_reason: length)`, json);
-        }
 
         const mcpCalls = toolCalls.filter((tc) => {
           if (!tc || !tc.function?.name) return false;
@@ -940,14 +921,6 @@ async function runAgent(requestBody, clientResponse, reqMeta) {
         }
       }
 
-      if (roundFinishReason === "length") {
-        addDebugLog("ERROR", `⚠️ [截断诊断] 第 ${round + 1} 轮上游因达到最大输出 Token 上限被强制截断！(finish_reason: length)`, {
-          round: round + 1,
-          finishReason: roundFinishReason,
-          assistantContentLength: assistantContent.length
-        });
-      }
-
       const mcpCalls = accumulatedToolCalls.filter((tc) => {
         if (!tc || !tc.name) return false;
         if (mcpToolRegistry.has(tc.name)) return true;
@@ -959,23 +932,6 @@ async function runAgent(requestBody, clientResponse, reqMeta) {
 
       // 没有工具调用，说明本轮为最终回答轮，正常终结流
       if (mcpCalls.length === 0) {
-        if (roundFinishReason === "length") {
-          const warningChunk = {
-            id: `chatcmpl-${Date.now()}`,
-            object: "chat.completion.chunk",
-            created: Math.floor(Date.now() / 1000),
-            model: requestBody.model || "default",
-            choices: [
-              {
-                index: 0,
-                delta: { content: "\n\n⚠️ [代理提示: 上游模型回复因达到最大输出 Token 限制被截断，可输入“继续”]" },
-                finish_reason: "length"
-              }
-            ]
-          };
-          clientResponse.write(`data: ${JSON.stringify(warningChunk)}\n\n`);
-        }
-
         clientResponse.write("data: [DONE]\n\n");
         clientResponse.end();
         addDebugLog("AGENT", `第 ${round + 1} 轮流式完成输出 - 结束原因: ${roundFinishReason || "stop"}`, {
@@ -1042,28 +998,6 @@ async function runAgent(requestBody, clientResponse, reqMeta) {
         });
       }
     }
-
-    addDebugLog("ERROR", `工具调用轮数达到上限 (${MAX_ROUNDS})，防止死循环而终止`);
-    if (isStream) {
-      const limitChunk = {
-        id: `chatcmpl-${Date.now()}`,
-        object: "chat.completion.chunk",
-        created: Math.floor(Date.now() / 1000),
-        model: requestBody.model || "default",
-        choices: [
-          {
-            index: 0,
-            delta: { content: "\n\n⚠️ [代理提示: 工具调用轮数达到系统上限，已安全中止]" },
-            finish_reason: "stop"
-          }
-        ]
-      };
-      clientResponse.write(`data: ${JSON.stringify(limitChunk)}\n\n`);
-      clientResponse.write("data: [DONE]\n\n");
-      clientResponse.end();
-      return;
-    }
-    throw new Error("工具调用轮数达到上限");
   } finally {
     if (keepAliveTimer) clearInterval(keepAliveTimer);
   }
