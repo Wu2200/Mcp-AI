@@ -982,84 +982,132 @@ async function passThroughAndTransformGemini(requestBody, clientResponse, isStre
     messagesCount: requestBody.messages?.length || 0
   });
 
-  const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${UPSTREAM_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(requestBody)
-  });
+  let currentMessages = [...requestBody.messages];
+  let continueRound = 0;
+  const MAX_AUTO_CONTINUES = 10;
+  let hasInitiatedStream = false;
 
-  const duration = Date.now() - startTime;
-  addDebugLog("UPSTREAM", `[Gemini 直通模式] 上游响应状态: ${upstreamResponse.status} - 耗时 ${duration}ms`, {
-    status: upstreamResponse.status,
-    contentType: upstreamResponse.headers.get("Content-Type")
-  });
-
-  if (!upstreamResponse.ok) {
-    const errTxt = await upstreamResponse.text();
-    sendJson(clientResponse, upstreamResponse.status, {
-      error: { code: upstreamResponse.status, message: errTxt }
+  while (continueRound <= MAX_AUTO_CONTINUES) {
+    const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${UPSTREAM_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        ...requestBody,
+        messages: currentMessages
+      })
     });
-    return;
-  }
 
-  if (!isStream) {
-    const json = await upstreamResponse.json();
-    const candidateText = json.choices?.[0]?.message?.content || "";
-    const reasoning = json.choices?.[0]?.message?.reasoning_content || "";
-    const parts = [];
-    if (reasoning) parts.push({ thought: true, text: reasoning });
-    if (candidateText) parts.push({ text: candidateText });
+    const duration = Date.now() - startTime;
+    addDebugLog("UPSTREAM", `[Gemini 直通模式] 上游响应状态: ${upstreamResponse.status} - 耗时 ${duration}ms`, {
+      status: upstreamResponse.status,
+      contentType: upstreamResponse.headers.get("Content-Type")
+    });
 
-    const geminiResp = {
-      candidates: [
-        {
-          content: { parts: parts.length > 0 ? parts : [{ text: "" }], role: "model" },
-          finishReason: "STOP",
-          index: 0
-        }
-      ]
-    };
-    sendJson(clientResponse, 200, geminiResp);
-    return;
-  }
-
-  setCorsHeaders(clientResponse);
-  clientResponse.writeHead(200, {
-    "Content-Type": "text/event-stream; charset=utf-8",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive"
-  });
-
-  let buffer = "";
-  const reader = upstreamResponse.body.getReader();
-  const decoder = new TextDecoder();
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || !trimmed.startsWith("data:")) continue;
-      const dataStr = trimmed.slice(5).trim();
-      if (dataStr === "[DONE]") {
-        clientResponse.write("data: [DONE]\n\n");
-        continue;
-      }
-      try {
-        const parsed = JSON.parse(dataStr);
-        const geminiChunk = convertOpenAiChunkToGemini(parsed);
-        clientResponse.write(`data: ${JSON.stringify(geminiChunk)}\n\n`);
-      } catch {}
+    if (!upstreamResponse.ok) {
+      const errTxt = await upstreamResponse.text();
+      sendJson(clientResponse, upstreamResponse.status, {
+        error: { code: upstreamResponse.status, message: errTxt }
+      });
+      return;
     }
+
+    if (!isStream) {
+      const json = await upstreamResponse.json();
+      const choice = json.choices?.[0];
+      const candidateText = choice?.message?.content || "";
+      const reasoning = choice?.message?.reasoning_content || "";
+      const parts = [];
+      if (reasoning) parts.push({ thought: true, text: reasoning });
+      if (candidateText) parts.push({ text: candidateText });
+
+      const geminiResp = {
+        candidates: [
+          {
+            content: { parts: parts.length > 0 ? parts : [{ text: "" }], role: "model" },
+            finishReason: choice?.finish_reason === "length" ? "MAX_TOKENS" : "STOP",
+            index: 0
+          }
+        ]
+      };
+      sendJson(clientResponse, 200, geminiResp);
+      return;
+    }
+
+    if (!hasInitiatedStream) {
+      setCorsHeaders(clientResponse);
+      clientResponse.writeHead(200, {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive"
+      });
+      hasInitiatedStream = true;
+    }
+
+    let buffer = "";
+    let accumulatedContent = "";
+    let lastFinishReason = null;
+    const reader = upstreamResponse.body.getReader();
+    const decoder = new TextDecoder();
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith("data:")) continue;
+        const dataStr = trimmed.slice(5).trim();
+        if (dataStr === "[DONE]") continue;
+        try {
+          const parsed = JSON.parse(dataStr);
+          const choice = parsed.choices?.[0];
+          if (choice?.finish_reason) {
+            lastFinishReason = choice.finish_reason;
+          }
+          if (choice?.delta?.content) {
+            accumulatedContent += choice.delta.content;
+          }
+          // 如果因达到上限被截断，先不发截断的结束状态，准备自动续接
+          if (choice?.finish_reason === "length") {
+            const geminiChunk = convertOpenAiChunkToGemini({
+              ...parsed,
+              choices: [{ ...choice, finish_reason: null }]
+            });
+            clientResponse.write(`data: ${JSON.stringify(geminiChunk)}\n\n`);
+          } else {
+            const geminiChunk = convertOpenAiChunkToGemini(parsed);
+            clientResponse.write(`data: ${JSON.stringify(geminiChunk)}\n\n`);
+          }
+        } catch {}
+      }
+    }
+
+    // 准确检测是否被上游截断（finish_reason === "length"）
+    if (lastFinishReason === "length" && accumulatedContent) {
+      continueRound += 1;
+      addDebugLog("AGENT", `⚠️ [抗截断触发] 检测到上游返回 length 截断！正在自动进行第 ${continueRound} 次无感断点续接...`, {
+        round: continueRound,
+        accumulatedLength: accumulatedContent.length
+      });
+      currentMessages = [
+        ...currentMessages,
+        { role: "assistant", content: accumulatedContent },
+        { role: "user", content: "请紧接着上一句未说完的内容继续输出，不要重复前面已输出的任何字，不要有任何多余的开场白。" }
+      ];
+      continue;
+    }
+
+    break;
   }
+
+  clientResponse.write("data: [DONE]\n\n");
   clientResponse.end();
 }
 
@@ -1295,8 +1343,18 @@ async function runAgent(requestBody, clientResponse, reqMeta) {
         return false;
       });
 
-      // 没有工具调用，说明本轮为最终回答轮，正常终结流
+      // 没有工具调用，检查是否达到 Token 上限截断：若是则进行自动无感断点续接
       if (mcpCalls.length === 0) {
+        if (roundFinishReason === "length" && assistantContent) {
+          addDebugLog("AGENT", `⚠️ [抗截断触发] MCP 调度检测到 length 截断！正在自动进行无感断点续接...`, {
+            round: round + 1,
+            accumulatedLength: assistantContent.length
+          });
+          messages.push({ role: "assistant", content: assistantContent });
+          messages.push({ role: "user", content: "请紧接着上一句未说完的内容继续输出，不要重复前面已输出的任何字，不要有任何多余的开场白。" });
+          continue;
+        }
+
         clientResponse.write("data: [DONE]\n\n");
         clientResponse.end();
         addDebugLog("AGENT", `第 ${round + 1} 轮流式完成输出 - 结束原因: ${roundFinishReason || "stop"}`, {
