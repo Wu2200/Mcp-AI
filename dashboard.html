@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>MCP 控制台</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -10,7 +10,7 @@
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
       background-color: #f8fafc;
       color: #1e293b;
-      padding: 24px 14px;
+      padding: 20px 14px;
       line-height: 1.5;
     }
     .container {
@@ -69,12 +69,21 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 8px;
+      gap: 10px;
+      flex-wrap: wrap;
     }
     .card-title-left {
       display: flex;
       align-items: center;
       gap: 8px;
+      flex-wrap: wrap;
+      min-width: 0;
+    }
+    .card-title-text {
+      font-size: 15px;
+      font-weight: 600;
+      color: #0f172a;
+      white-space: nowrap;
     }
     .badge {
       display: inline-flex;
@@ -138,7 +147,7 @@
       border: none;
       font-weight: 600;
       font-size: 14px;
-      padding: 10px 24px;
+      padding: 10px 20px;
       border-radius: 8px;
       cursor: pointer;
       white-space: nowrap;
@@ -163,11 +172,11 @@
       display: flex;
       gap: 6px;
       align-items: center;
-      flex-shrink: 0;
+      flex-wrap: wrap;
     }
     .btn-action {
       border: none;
-      padding: 5px 12px;
+      padding: 6px 12px;
       font-size: 12px;
       font-weight: 600;
       border-radius: 6px;
@@ -227,6 +236,7 @@
       align-items: center;
       margin-bottom: 8px;
       gap: 8px;
+      flex-wrap: wrap;
     }
     .server-item-title {
       font-size: 15px;
@@ -375,6 +385,59 @@
       color: #cbd5e1;
       font-size: 11px;
     }
+
+    /* 手机端响应式优化 */
+    @media (max-width: 640px) {
+      body {
+        padding: 12px 10px;
+      }
+      .card {
+        padding: 14px 12px;
+        border-radius: 10px;
+      }
+      .header {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 10px;
+      }
+      .header .btn-logout {
+        align-self: flex-start;
+      }
+      .card-title {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 10px;
+      }
+      .card-title-left {
+        width: 100%;
+        justify-content: space-between;
+      }
+      .action-group {
+        width: 100%;
+        display: grid;
+        grid-template-columns: 1.4fr 1fr 1fr;
+        gap: 6px;
+      }
+      .action-group .btn-action {
+        width: 100%;
+        text-align: center;
+        padding: 7px 4px;
+        font-size: 11px;
+      }
+      .server-item-head {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 8px;
+      }
+      .server-item-head .action-group {
+        width: 100%;
+        display: flex;
+        justify-content: flex-end;
+      }
+      .server-item-head .action-group .btn-action {
+        flex: 1;
+      }
+    }
   </style>
 </head>
 <body>
@@ -390,7 +453,7 @@
     <div class="card">
       <div class="card-title">
         <div class="card-title-left">
-          <span>客户端连接配置</span>
+          <span class="card-title-text">客户端连接配置</span>
           <span class="badge badge-blue">Chatbox 专用</span>
         </div>
       </div>
@@ -412,7 +475,7 @@
     <div class="card">
       <div class="card-title">
         <div class="card-title-left">
-          <span>请求与调度日志监控</span>
+          <span class="card-title-text">请求与调度日志监控</span>
           <span id="log-status-badge" class="badge badge-green">监听中</span>
         </div>
         <div class="action-group">
@@ -433,7 +496,7 @@
     <div class="card">
       <div class="card-title">
         <div class="card-title-left">
-          <span>启用 MCP 的模型设置（白名单模式）</span>
+          <span class="card-title-text">启用 MCP 的模型设置（白名单模式）</span>
           <span class="badge badge-green">仅选中模型支持 MCP</span>
         </div>
       </div>
@@ -472,7 +535,7 @@
     <div class="card">
       <div class="card-title">
         <div class="card-title-left">
-          <span>手动挂载 MCP 服务（支持添加多个）</span>
+          <span class="card-title-text">手动挂载 MCP 服务（支持添加多个）</span>
         </div>
       </div>
       <div class="group">
@@ -496,7 +559,7 @@
     <div class="card">
       <div class="card-title">
         <div class="card-title-left">
-          <span>已挂载 MCP 服务列表</span>
+          <span class="card-title-text">已挂载 MCP 服务列表</span>
         </div>
       </div>
       <div id="mcp-list">
