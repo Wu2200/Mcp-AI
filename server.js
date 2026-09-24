@@ -758,9 +758,20 @@ function convertGeminiToOpenAIMessages(body) {
 function convertOpenAiChunkToGemini(parsedChunk) {
   const choice = parsedChunk.choices?.[0];
   const delta = choice?.delta;
-  const text = delta?.content || "";
-  const reasoning = delta?.reasoning_content || "";
-  const fullText = reasoning ? `> 正在思考...\n${reasoning}\n\n${text}` : text;
+  const parts = [];
+
+  if (delta?.reasoning_content) {
+    parts.push({
+      thought: true,
+      text: delta.reasoning_content
+    });
+  }
+
+  if (delta?.content) {
+    parts.push({
+      text: delta.content
+    });
+  }
 
   let finishReason = undefined;
   if (choice?.finish_reason === "stop") finishReason = "STOP";
@@ -770,7 +781,7 @@ function convertOpenAiChunkToGemini(parsedChunk) {
     candidates: [
       {
         content: {
-          parts: [{ text: fullText }],
+          parts: parts.length > 0 ? parts : [{ text: "" }],
           role: "model"
         },
         finishReason,
@@ -790,13 +801,35 @@ async function handleGeminiGenerateContent(modelName, isStream, geminiBody, clie
     max_tokens: geminiBody.generationConfig?.maxOutputTokens
   };
 
+  // 100% 完整透传 Chatbox 设置的 Gemini 思考配置 (thinkingConfig / reasoning / reasoning_effort 等)
+  if (geminiBody.generationConfig?.thinkingConfig) {
+    openAiBody.thinkingConfig = geminiBody.generationConfig.thinkingConfig;
+    const budget = geminiBody.generationConfig.thinkingConfig.thinkingBudget;
+    if (typeof budget === "number") {
+      openAiBody.thinking_budget = budget;
+      if (budget <= 0) openAiBody.reasoning_effort = "off";
+      else if (budget < 2048) openAiBody.reasoning_effort = "low";
+      else if (budget < 8192) openAiBody.reasoning_effort = "medium";
+      else openAiBody.reasoning_effort = "high";
+    }
+  }
+
+  if (geminiBody.generationConfig) {
+    for (const [k, v] of Object.entries(geminiBody.generationConfig)) {
+      if (!["temperature", "maxOutputTokens"].includes(k)) {
+        openAiBody[k] = v;
+      }
+    }
+  }
+
   const mcpEnabled = isModelEnabledForMcp(modelName) && mcpToolRegistry.size > 0;
 
   addDebugLog("DOWNSTREAM", `收到 Gemini 格式请求 [${modelName}] - stream=${isStream}`, {
     model: modelName,
     stream: isStream,
     mcpEnabled,
-    messagesCount: openAiMessages.length
+    messagesCount: openAiMessages.length,
+    thinkingConfig: geminiBody.generationConfig?.thinkingConfig || null
   });
 
   if (!isStream) {
@@ -812,10 +845,14 @@ async function handleGeminiGenerateContent(modelName, isStream, geminiBody, clie
         try {
           const json = JSON.parse(this._body);
           const candidateText = json.choices?.[0]?.message?.content || "";
+          const reasoning = json.choices?.[0]?.message?.reasoning_content || "";
+          const parts = [];
+          if (reasoning) parts.push({ thought: true, text: reasoning });
+          if (candidateText) parts.push({ text: candidateText });
           const geminiResp = {
             candidates: [
               {
-                content: { parts: [{ text: candidateText }], role: "model" },
+                content: { parts: parts.length > 0 ? parts : [{ text: "" }], role: "model" },
                 finishReason: "STOP",
                 index: 0
               }
