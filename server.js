@@ -20,29 +20,6 @@ const SETTINGS_FILE = path.join(__dirname, "mcp-settings.json");
 const mcpServers = new Map();
 const mcpToolRegistry = new Map();
 let enabledModels = new Set();
-let loggingEnabled = true;
-
-const recentLogs = [];
-const MAX_LOG_COUNT = 300;
-
-function appendLog(level, tag, message, data = null) {
-  const time = new Date().toLocaleTimeString("zh-CN", { hour12: false });
-  const entry = {
-    id: Date.now() + Math.random(),
-    time,
-    level,
-    tag,
-    message,
-    data: data ? (typeof data === "string" ? data : JSON.stringify(data, null, 2)) : null
-  };
-  console.log(`[${time}] [${tag}] ${message}`, data ? JSON.stringify(data) : "");
-  if (loggingEnabled) {
-    recentLogs.push(entry);
-    if (recentLogs.length > MAX_LOG_COUNT) {
-      recentLogs.shift();
-    }
-  }
-}
 
 const SESSION_SECRET = PANEL_PASSWORD
   ? crypto.createHash("sha256").update(`mcp-proxy-session:${PANEL_PASSWORD}`).digest("hex")
@@ -116,32 +93,6 @@ async function initDatabase() {
   }
 }
 
-async function saveLoggingConfigToStorage(enabled) {
-  loggingEnabled = enabled;
-  if (pgPool) {
-    try {
-      await pgPool.query(
-        `INSERT INTO mcp_settings (key, value, updated_at)
-         VALUES ('logging_enabled', $1, CURRENT_TIMESTAMP)
-         ON CONFLICT (key) DO UPDATE SET
-           value = EXCLUDED.value,
-           updated_at = CURRENT_TIMESTAMP`,
-        [JSON.stringify(enabled)]
-      );
-    } catch {}
-  }
-  try {
-    let current = {};
-    if (fs.existsSync(SETTINGS_FILE)) {
-      try {
-        current = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf8"));
-      } catch {}
-    }
-    current.loggingEnabled = enabled;
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(current, null, 2), "utf8");
-  } catch {}
-}
-
 async function saveEnabledModelsToStorage(modelsArray) {
   enabledModels = new Set(modelsArray);
   if (pgPool) {
@@ -157,30 +108,18 @@ async function saveEnabledModelsToStorage(modelsArray) {
     } catch {}
   }
   try {
-    let current = {};
-    if (fs.existsSync(SETTINGS_FILE)) {
-      try {
-        current = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf8"));
-      } catch {}
-    }
-    current.enabledModels = modelsArray;
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(current, null, 2), "utf8");
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify({ enabledModels: modelsArray }, null, 2), "utf8");
   } catch {}
 }
 
-async function loadSettingsFromStorage() {
+async function loadEnabledModelsFromStorage() {
   if (pgPool) {
     try {
-      const res = await pgPool.query("SELECT key, value FROM mcp_settings WHERE key IN ('enabled_models', 'logging_enabled')");
+      const res = await pgPool.query("SELECT value FROM mcp_settings WHERE key = 'enabled_models' LIMIT 1");
       if (res.rows && res.rows.length > 0) {
-        for (const r of res.rows) {
-          if (r.key === "enabled_models") {
-            const list = Array.isArray(r.value) ? r.value : (typeof r.value === "string" ? JSON.parse(r.value) : []);
-            enabledModels = new Set(list);
-          } else if (r.key === "logging_enabled") {
-            loggingEnabled = r.value !== false && r.value !== "false";
-          }
-        }
+        const val = res.rows[0].value;
+        const list = Array.isArray(val) ? val : (typeof val === "string" ? JSON.parse(val) : []);
+        enabledModels = new Set(list);
         return;
       }
     } catch {}
@@ -192,9 +131,6 @@ async function loadSettingsFromStorage() {
       const data = JSON.parse(raw);
       if (Array.isArray(data.enabledModels)) {
         enabledModels = new Set(data.enabledModels);
-      }
-      if (data.loggingEnabled !== undefined) {
-        loggingEnabled = data.loggingEnabled === true;
       }
     } catch {}
   }
@@ -328,22 +264,13 @@ function sendOpenAIError(response, statusCode, message, type = "invalid_request_
   sendJson(response, statusCode, { error: { message, type, code: null } });
 }
 
-function isProxyAuthorized(request, reqUrl) {
+function isProxyAuthorized(request) {
   if (!PROXY_API_KEY) return true;
   const authorization = request.headers.authorization || "";
   const token = authorization.startsWith("Bearer ")
     ? authorization.slice(7).trim()
     : authorization.trim();
-  if (token === PROXY_API_KEY) return true;
-
-  const googApiKey = (request.headers["x-goog-api-key"] || "").trim();
-  if (googApiKey === PROXY_API_KEY) return true;
-
-  if (reqUrl) {
-    const queryKey = (reqUrl.searchParams.get("key") || "").trim();
-    if (queryKey === PROXY_API_KEY) return true;
-  }
-  return false;
+  return token === PROXY_API_KEY;
 }
 
 function isPanelAuthorized(request) {
@@ -511,7 +438,7 @@ async function connectToMcpServer({ name, url, token }) {
 
 function extractMcpResultContent(data) {
   if (!data) return "{}";
-  let contentStr = "";
+  if (typeof data === "string") return data;
 
   const rawResult = data.result !== undefined ? data.result : data;
   if (!rawResult) return "{}";
@@ -538,25 +465,17 @@ function extractMcpResultContent(data) {
       }
     }
     if (pieces.length > 0) {
-      contentStr = pieces.join("\n\n");
+      return pieces.join("\n\n");
     }
   }
 
-  if (!contentStr && rawResult.content && rawResult.encoding === "base64" && typeof rawResult.content === "string") {
+  if (rawResult.content && rawResult.encoding === "base64" && typeof rawResult.content === "string") {
     try {
-      contentStr = Buffer.from(rawResult.content, "base64").toString("utf8");
+      return Buffer.from(rawResult.content, "base64").toString("utf8");
     } catch {}
   }
 
-  if (!contentStr) {
-    contentStr = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult, null, 2);
-  }
-
-  if (contentStr.length > 3000) {
-    contentStr = contentStr.slice(0, 3000) + "\n\n[提示：工具输出内容过长，已截断保留前 3000 字符]";
-  }
-
-  return contentStr;
+  return typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult, null, 2);
 }
 
 async function callMcpTool(toolKey, args) {
@@ -623,6 +542,7 @@ function toolArguments(toolCall) {
   }
 }
 
+// 统一包装为 Chatbox / OpenAI 客户端可安全解析的标准 SSE Chunk
 function sendSSEChunk(clientResponse, delta, model = "default") {
   const chunk = {
     id: `chatcmpl-${Date.now()}`,
@@ -642,15 +562,6 @@ function sendSSEChunk(clientResponse, delta, model = "default") {
 
 function sendReasoningChunk(clientResponse, text, model = "default") {
   sendSSEChunk(clientResponse, { reasoning_content: text }, model);
-}
-
-function extractReasoningText(delta) {
-  if (!delta) return "";
-  if (typeof delta.reasoning_content === "string") return delta.reasoning_content;
-  if (typeof delta.reasoning === "string") return delta.reasoning;
-  if (typeof delta.thought === "string") return delta.thought;
-  if (delta.reasoning && typeof delta.reasoning.content === "string") return delta.reasoning.content;
-  return "";
 }
 
 async function passThrough(requestBody, clientResponse) {
@@ -698,45 +609,42 @@ function isModelEnabledForMcp(modelName) {
   return false;
 }
 
-const MCP_DISPATCH_PROMPT = `【核心执行准则】你接入了部分外部系统工具，但你必须极其谨慎克制：
-1. 仅当用户明确要求你查询外部仓库、管理部署等外部真实服务时，才调用对应工具。
-2. 对于解答技术配置疑问、分析用户上传的截图/图片、审查代码或回答常规问题，必须直接在正文中给出详细解答，严禁擅自调用任何工具！
-3. 若执行了工具，必须在获得结果后立即根据数据总结并输出最终正文，不得循环调用无关工具。`;
-
-const MAX_TOOL_ROUNDS = 3;
+function buildHostEnvironmentSystemMessage() {
+  const now = new Date();
+  const beijingTime = now.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
+  return [
+    `[System Environment] Current Time: ${beijingTime} (UTC+8).`,
+    `Tool Usage Rule: Strictly execute tools relevant to the target platform (e.g. use GitHub tools only for GitHub repositories). Never attempt workarounds or execute unrelated tools.`
+  ].join("\n");
+}
 
 async function runAgent(requestBody, clientResponse) {
-  appendLog("info", "RUN-AGENT", `启动 MCP 调度 - 模型 [${requestBody.model}]`, {
-    reasoning_effort: requestBody.reasoning_effort,
-    thinking: requestBody.thinking,
-    generationConfig: requestBody.generationConfig,
-    incoming_keys: Object.keys(requestBody)
-  });
-
   if (!Array.isArray(requestBody.messages) || requestBody.messages.length === 0) {
     throw new Error("messages 必须是非空数组");
   }
 
   const isStream = requestBody.stream === true;
-  let messages = [...requestBody.messages];
+  const rawMessages = requestBody.messages;
+  const hostMeta = buildHostEnvironmentSystemMessage();
 
-  const firstMsg = messages[0];
-  if (firstMsg && firstMsg.role === "system") {
-    messages[0] = {
-      ...firstMsg,
-      content: `${firstMsg.content || ""}\n\n${MCP_DISPATCH_PROMPT}`
-    };
+  let messages;
+  const existingSystemIdx = rawMessages.findIndex((m) => m.role === "system");
+  if (existingSystemIdx >= 0) {
+    messages = rawMessages.map((m, idx) => {
+      if (idx === existingSystemIdx) {
+        return { role: "system", content: `${hostMeta}\n${m.content || ""}` };
+      }
+      return m;
+    });
   } else {
-    messages.unshift({ role: "system", content: MCP_DISPATCH_PROMPT });
+    messages = [{ role: "system", content: hostMeta }, ...rawMessages];
   }
 
   const clientTools = Array.isArray(requestBody.tools)
     ? requestBody.tools.filter((t) => t && t.type === "function")
     : [];
   const mcpTools = getAllTools();
-  const allTools = [...clientTools, ...mcpTools];
-
-  appendLog("info", "RUN-AGENT", `注入工具: MCP工具=${mcpTools.length}, 客户端工具=${clientTools.length}`);
+  const tools = [...clientTools, ...mcpTools];
 
   if (isStream) {
     setCorsHeaders(clientResponse);
@@ -748,39 +656,28 @@ async function runAgent(requestBody, clientResponse) {
     });
   }
 
+  // 客户端兼容的合法 SSE 保活心跳：输出空 delta，所有客户端均合法兼容且永不掐线
   let keepAliveTimer = null;
   if (isStream) {
     keepAliveTimer = setInterval(() => {
       try {
-        clientResponse.write(": keep-alive\n\n");
+        sendSSEChunk(clientResponse, {}, requestBody.model || "default");
       } catch {}
     }, 5000);
   }
 
   try {
-    let toolRoundCount = 0;
-
-    for (let round = 0; round < 20; round += 1) {
+    for (let round = 0; round < 100; round += 1) {
       const payload = {
         ...requestBody,
         messages,
         stream: isStream
       };
 
-      const allowMoreTools = toolRoundCount < MAX_TOOL_ROUNDS;
-
-      if (allTools.length > 0 && allowMoreTools) {
-        payload.tools = allTools;
+      if (tools.length > 0) {
+        payload.tools = tools;
         payload.tool_choice = "auto";
-      } else {
-        delete payload.tools;
-        delete payload.tool_choice;
       }
-
-      appendLog("info", "RUN-AGENT", `第 ${round + 1} 轮请求上游`, {
-        payload_keys: Object.keys(payload),
-        has_tools: Boolean(payload.tools)
-      });
 
       const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
         method: "POST",
@@ -792,11 +689,8 @@ async function runAgent(requestBody, clientResponse) {
         signal: AbortSignal.timeout(300000)
       });
 
-      appendLog("info", "RUN-AGENT", `第 ${round + 1} 轮上游状态: ${upstreamResponse.status}`);
-
       if (!upstreamResponse.ok) {
         const err = await upstreamResponse.text();
-        appendLog("error", "RUN-AGENT", `第 ${round + 1} 轮上游报错 (${upstreamResponse.status})`, err.slice(0, 500));
         if (isStream) {
           const errorChunk = {
             id: `chatcmpl-${Date.now()}`,
@@ -833,19 +727,24 @@ async function runAgent(requestBody, clientResponse) {
           return false;
         });
 
-        if (mcpCalls.length === 0 || !allowMoreTools) {
+        if (mcpCalls.length === 0) {
           sendJson(clientResponse, 200, json);
           return;
         }
 
-        toolRoundCount += 1;
         messages.push(message);
 
         for (const tc of mcpCalls) {
-          const callId = tc.id || `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
-          tc.id = callId;
+          let toolInfo = mcpToolRegistry.get(tc.function.name);
+          if (!toolInfo) {
+            for (const [k, v] of mcpToolRegistry.entries()) {
+              if (k.endsWith(tc.function.name) || tc.function.name.endsWith(v.rawName)) {
+                toolInfo = v;
+                break;
+              }
+            }
+          }
           const args = toolArguments(tc);
-          appendLog("info", "RUN-AGENT", `非流式执行工具: ${tc.function.name}`);
           let result;
           try {
             result = await callMcpTool(tc.function.name, args);
@@ -854,7 +753,7 @@ async function runAgent(requestBody, clientResponse) {
           }
           messages.push({
             role: "tool",
-            tool_call_id: callId,
+            tool_call_id: tc.id,
             content: typeof result === "string" ? result : JSON.stringify(result)
           });
         }
@@ -867,8 +766,6 @@ async function runAgent(requestBody, clientResponse) {
       let accumulatedToolCalls = [];
       let assistantContent = "";
       let hasToolCalls = false;
-      let roundReasoningText = "";
-      let roundContentText = "";
 
       while (true) {
         const { done, value } = await reader.read();
@@ -893,9 +790,8 @@ async function runAgent(requestBody, clientResponse) {
               for (const tc of delta.tool_calls) {
                 const index = tc.index ?? 0;
                 if (!accumulatedToolCalls[index]) {
-                  const fallbackId = `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
                   accumulatedToolCalls[index] = {
-                    id: tc.id || fallbackId,
+                    id: tc.id || `call_${crypto.randomUUID()}`,
                     name: tc.function?.name || "",
                     arguments: ""
                   };
@@ -906,22 +802,19 @@ async function runAgent(requestBody, clientResponse) {
               }
             }
 
-            const reasoningPart = extractReasoningText(delta);
-            if (reasoningPart) {
-              roundReasoningText += reasoningPart;
-              clientResponse.write(`${line}\n\n`);
-            } else if (delta?.content) {
+            // 遇到普通正文内容：实时推给客户端，避免任何超时；若本轮是工具调用，正文不透传以免污染
+            if (delta?.content) {
               assistantContent += delta.content;
-              roundContentText += delta.content;
               if (!hasToolCalls) {
                 clientResponse.write(`${line}\n\n`);
               }
+            } else if (delta?.reasoning_content) {
+              // 推送模型原生思考过程给客户端（Chatbox 深度思考展示）
+              clientResponse.write(`${line}\n\n`);
             }
           } catch {}
         }
       }
-
-      appendLog("info", "RUN-AGENT", `第 ${round + 1} 轮传输结束: 正文=${roundContentText.length}字, 思考=${roundReasoningText.length}字, 是否有工具调用=${hasToolCalls}`);
 
       const mcpCalls = accumulatedToolCalls.filter((tc) => {
         if (!tc || !tc.name) return false;
@@ -932,21 +825,17 @@ async function runAgent(requestBody, clientResponse) {
         return false;
       });
 
-      if (mcpCalls.length === 0 || !allowMoreTools) {
-        if (isStream) {
-          clientResponse.write("data: [DONE]\n\n");
-          clientResponse.end();
-        }
+      if (mcpCalls.length === 0) {
+        clientResponse.write("data: [DONE]\n\n");
+        clientResponse.end();
         return;
       }
-
-      toolRoundCount += 1;
 
       messages.push({
         role: "assistant",
         content: assistantContent || null,
         tool_calls: mcpCalls.map((tc) => ({
-          id: tc.id,
+          id: tc.id || `call_${crypto.randomUUID()}`,
           type: "function",
           function: { name: tc.name, arguments: tc.arguments }
         }))
@@ -962,290 +851,46 @@ async function runAgent(requestBody, clientResponse) {
             }
           }
         }
-        const serverName = toolInfo ? toolInfo.serverName : "未知";
-        appendLog("info", "RUN-AGENT", `触发执行工具: ${tc.name} (${serverName})`);
 
-        let parsedArgs = {};
-        try {
-          parsedArgs = JSON.parse(tc.arguments || "{}");
-        } catch {
-          parsedArgs = {};
-        }
+        const displayName = toolInfo?.serverName || "MCP";
+        const rawAction = toolInfo?.rawName || tc.name;
+        const args = toolArguments({ function: { arguments: tc.arguments } });
+
+        sendReasoningChunk(
+          clientResponse,
+          `\n> 正在执行 ${displayName} [${rawAction}]...\n`,
+          requestBody.model
+        );
 
         let result;
-        try {
-          result = await callMcpTool(tc.name, parsedArgs);
-        } catch (err) {
-          appendLog("error", "RUN-AGENT", `工具执行失败: ${tc.name}`, err.message);
-          result = JSON.stringify({ error: err.message });
+        if (args === null) {
+          result = JSON.stringify({ error: "Invalid tool arguments" });
+        } else {
+          try {
+            result = await callMcpTool(tc.name, args);
+          } catch (err) {
+            result = JSON.stringify({ error: err instanceof Error ? err.message : "Tool execution failed" });
+          }
         }
+
+        sendReasoningChunk(
+          clientResponse,
+          `> ${displayName} [${rawAction}] 完成\n\n`,
+          requestBody.model
+        );
 
         messages.push({
           role: "tool",
-          tool_call_id: tc.id,
+          tool_call_id: tc.id || `call_${crypto.randomUUID()}`,
           content: typeof result === "string" ? result : JSON.stringify(result)
         });
       }
     }
 
-    if (isStream) {
-      clientResponse.write("data: [DONE]\n\n");
-      clientResponse.end();
-    }
+    throw new Error("工具调用轮数达到上限");
   } finally {
     if (keepAliveTimer) clearInterval(keepAliveTimer);
   }
-}
-
-function convertGeminiToOpenAiRequest(geminiBody, modelName, isStream) {
-  const messages = [];
-
-  if (geminiBody.systemInstruction?.parts) {
-    const sysText = geminiBody.systemInstruction.parts
-      .map((p) => p.text || "")
-      .filter(Boolean)
-      .join("\n");
-    if (sysText) {
-      messages.push({ role: "system", content: sysText });
-    }
-  }
-
-  if (Array.isArray(geminiBody.contents)) {
-    for (const c of geminiBody.contents) {
-      const role = c.role === "model" ? "assistant" : "user";
-      if (!Array.isArray(c.parts)) continue;
-
-      const contentArray = [];
-      let hasMultiModal = false;
-
-      for (const p of c.parts) {
-        if (p.functionCall) {
-          messages.push({
-            role: "assistant",
-            tool_calls: [
-              {
-                id: `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`,
-                type: "function",
-                function: {
-                  name: p.functionCall.name,
-                  arguments: JSON.stringify(p.functionCall.args || {})
-                }
-              }
-            ]
-          });
-        } else if (p.functionResponse) {
-          messages.push({
-            role: "tool",
-            tool_call_id: `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`,
-            content: JSON.stringify(p.functionResponse.response || {})
-          });
-        } else if (p.inlineData && p.inlineData.data) {
-          hasMultiModal = true;
-          const mimeType = p.inlineData.mimeType || "image/jpeg";
-          contentArray.push({
-            type: "image_url",
-            image_url: { url: `data:${mimeType};base64,${p.inlineData.data}` }
-          });
-        } else if (p.text) {
-          contentArray.push({ type: "text", text: p.text });
-        }
-      }
-
-      if (contentArray.length > 0) {
-        if (hasMultiModal) {
-          messages.push({ role, content: contentArray });
-        } else {
-          const allText = contentArray.map(item => item.text).join("\n");
-          messages.push({ role, content: allText });
-        }
-      }
-    }
-  }
-
-  const openAiBody = {
-    ...geminiBody,
-    model: modelName,
-    messages,
-    stream: isStream
-  };
-
-  delete openAiBody.contents;
-  delete openAiBody.systemInstruction;
-  delete openAiBody.generationConfig;
-
-  if (geminiBody.generationConfig) {
-    openAiBody.generationConfig = geminiBody.generationConfig;
-    const gc = geminiBody.generationConfig;
-    if (gc.temperature !== undefined) openAiBody.temperature = gc.temperature;
-    if (gc.maxOutputTokens !== undefined) openAiBody.max_tokens = gc.maxOutputTokens;
-    if (gc.topP !== undefined) openAiBody.top_p = gc.topP;
-    if (gc.stopSequences && Array.isArray(gc.stopSequences)) openAiBody.stop = gc.stopSequences;
-
-    if (gc.thinkingConfig) {
-      openAiBody.thinkingConfig = gc.thinkingConfig;
-      const tb = Number(gc.thinkingConfig.thinkingBudget);
-      const level = String(gc.thinkingConfig.thinkingLevel || "").toLowerCase();
-
-      if (level === "off" || level === "none" || tb === 0) {
-        openAiBody.reasoning_effort = "none";
-        openAiBody.thinking = { type: "disabled" };
-      } else if (level === "low") {
-        openAiBody.reasoning_effort = "low";
-        openAiBody.thinking = { type: "enabled", budget_tokens: 2048 };
-      } else if (level === "medium") {
-        openAiBody.reasoning_effort = "medium";
-        openAiBody.thinking = { type: "enabled", budget_tokens: 8192 };
-      } else if (level === "high") {
-        openAiBody.reasoning_effort = "high";
-        openAiBody.thinking = { type: "enabled", budget_tokens: 32768 };
-      } else if (tb > 0) {
-        openAiBody.thinking = { type: "enabled", budget_tokens: tb };
-        if (tb > 8192) openAiBody.reasoning_effort = "high";
-        else if (tb > 2048) openAiBody.reasoning_effort = "medium";
-        else openAiBody.reasoning_effort = "low";
-      }
-    }
-  }
-
-  return openAiBody;
-}
-
-function convertOpenAiToGeminiResponse(openAiJson, modelName) {
-  const choice = openAiJson.choices?.[0];
-  const parts = [];
-  const reasoning = choice?.message?.reasoning_content || choice?.message?.reasoning || choice?.message?.thought;
-  if (reasoning) {
-    parts.push({ text: reasoning, thought: true });
-  }
-
-  const contentText = choice?.message?.content || "";
-  if (contentText) {
-    parts.push({ text: contentText });
-  }
-
-  const finishReason = choice?.finish_reason;
-  let geminiFinishReason = "STOP";
-  if (finishReason === "length") geminiFinishReason = "MAX_TOKENS";
-  if (finishReason === "tool_calls") geminiFinishReason = "STOP";
-
-  const candidate = {
-    index: 0,
-    finishReason: geminiFinishReason
-  };
-  if (parts.length > 0) {
-    candidate.content = {
-      parts,
-      role: "model"
-    };
-  }
-
-  return {
-    candidates: [candidate],
-    usageMetadata: {
-      promptTokenCount: openAiJson.usage?.prompt_tokens || 0,
-      candidatesTokenCount: openAiJson.usage?.completion_tokens || 0,
-      totalTokenCount: openAiJson.usage?.total_tokens || 0
-    },
-    modelVersion: modelName
-  };
-}
-
-function createGeminiStreamAdapter(clientResponse, modelName) {
-  setCorsHeaders(clientResponse);
-  clientResponse.writeHead(200, {
-    "Content-Type": "text/event-stream; charset=utf-8",
-    "Cache-Control": "no-cache, no-transform",
-    Connection: "keep-alive",
-    "X-Accel-Buffering": "no"
-  });
-
-  let buffer = "";
-
-  return {
-    headersSent: true,
-    setHeader(name, value) {
-      try {
-        clientResponse.setHeader(name, value);
-      } catch {}
-    },
-    writeHead(code, headers) {},
-    write(chunk) {
-      const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
-      buffer += text;
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith("data:")) continue;
-        const dataStr = trimmed.slice(5).trim();
-        if (dataStr === "[DONE]") {
-          const geminiFinishChunk = {
-            candidates: [
-              {
-                content: {
-                  parts: [{ text: "" }],
-                  role: "model"
-                },
-                finishReason: "STOP",
-                index: 0
-              }
-            ],
-            modelVersion: modelName
-          };
-          clientResponse.write(`data: ${JSON.stringify(geminiFinishChunk)}\n\n`);
-          continue;
-        }
-
-        try {
-          const parsed = JSON.parse(dataStr);
-          const delta = parsed.choices?.[0]?.delta;
-          const finishReason = parsed.choices?.[0]?.finish_reason;
-          const parts = [];
-
-          const reasoningPart = extractReasoningText(delta);
-          if (reasoningPart) {
-            parts.push({
-              text: reasoningPart,
-              thought: true
-            });
-          }
-
-          if (delta?.content) {
-            parts.push({
-              text: delta.content
-            });
-          }
-
-          let geminiFinishReason = finishReason ? (finishReason === "length" ? "MAX_TOKENS" : "STOP") : undefined;
-
-          if (parts.length > 0 || geminiFinishReason) {
-            const candidate = {
-              index: 0
-            };
-            if (parts.length > 0) {
-              candidate.content = { parts, role: "model" };
-            }
-            if (geminiFinishReason) {
-              candidate.finishReason = geminiFinishReason;
-            }
-            const geminiChunk = {
-              candidates: [candidate],
-              modelVersion: modelName
-            };
-            clientResponse.write(`data: ${JSON.stringify(geminiChunk)}\n\n`);
-          }
-        } catch {}
-      }
-      return true;
-    },
-    end(chunk) {
-      if (chunk) {
-        this.write(chunk);
-      }
-      clientResponse.end();
-    }
-  };
 }
 
 function getLoginHtml() {
@@ -1254,29 +899,31 @@ function getLoginHtml() {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>MCP 控制台登录</title>
+  <title>MCP 控制台 - 登录认证</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
       background: #f8fafc;
+      color: #0f172a;
       min-height: 100vh;
       display: flex;
       align-items: center;
       justify-content: center;
-      padding: 20px;
+      padding: 16px;
     }
     .card {
       background: #ffffff;
       border: 1px solid #e2e8f0;
       border-radius: 12px;
-      padding: 32px 28px;
+      padding: 32px 24px;
       width: 100%;
       max-width: 360px;
       box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+      text-align: center;
     }
-    h2 { font-size: 20px; font-weight: 700; color: #0f172a; margin-bottom: 8px; }
-    p { font-size: 13px; color: #64748b; margin-bottom: 24px; }
+    h1 { font-size: 18px; font-weight: 700; margin-bottom: 8px; }
+    p { font-size: 13px; color: #64748b; margin-bottom: 20px; }
     input {
       width: 100%;
       background: #ffffff;
@@ -1284,9 +931,8 @@ function getLoginHtml() {
       padding: 10px 14px;
       border-radius: 8px;
       font-size: 14px;
-      color: #0f172a;
       outline: none;
-      margin-bottom: 16px;
+      margin-bottom: 14px;
     }
     input:focus { border-color: #2563eb; }
     button {
@@ -1294,84 +940,55 @@ function getLoginHtml() {
       background: #2563eb;
       color: #ffffff;
       border: none;
-      padding: 10px;
-      border-radius: 8px;
       font-weight: 600;
       font-size: 14px;
+      padding: 10px;
+      border-radius: 8px;
       cursor: pointer;
     }
     button:hover { background: #1d4ed8; }
-    .err { color: #dc2626; font-size: 13px; margin-top: 12px; text-align: center; }
+    #err-msg { color: #dc2626; font-size: 13px; margin-top: 10px; }
   </style>
 </head>
 <body>
   <div class="card">
-    <h2>MCP 控制台</h2>
-    <p>请输入面板密码继续</p>
-    <form method="POST" action="/login">
-      <input type="password" name="password" placeholder="面板密码" required autofocus />
-      <button type="submit">登 录</button>
-    </form>
+    <h1>MCP 控制台认证</h1>
+    <p>请输入后台管理密码以进入面板</p>
+    <input id="pwd" type="password" placeholder="输入管理密码" onkeydown="if(event.key==='Enter')login()">
+    <button onclick="login()">验证并进入</button>
+    <div id="err-msg"></div>
   </div>
+  <script>
+    async function login() {
+      const pwd = document.getElementById("pwd").value.trim();
+      const err = document.getElementById("err-msg");
+      if (!pwd) { err.innerText = "请输入管理密码"; return; }
+      try {
+        const res = await fetch("/api/panel/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password: pwd })
+        });
+        if (res.ok) {
+          location.reload();
+        } else {
+          err.innerText = "密码错误，请重新输入";
+        }
+      } catch (e) {
+        err.innerText = e.message;
+      }
+    }
+  </script>
 </body>
 </html>`;
 }
 
-function resolveUpstreamBase() {
-  return UPSTREAM_BASE_URL.replace(/\/+$/, "").replace(/\/v1$/, "");
-}
-
-async function handleGeminiNativePassThrough(reqUrl, request, response, customBody) {
-  setCorsHeaders(response);
-  const upstreamBase = resolveUpstreamBase();
-  const targetUrl = `${upstreamBase}${reqUrl.pathname}${reqUrl.search}`;
-
-  const headers = {
-    "Content-Type": request.headers["content-type"] || "application/json"
-  };
-  if (UPSTREAM_API_KEY) {
-    headers["Authorization"] = `Bearer ${UPSTREAM_API_KEY}`;
-    headers["x-goog-api-key"] = UPSTREAM_API_KEY;
-  }
-
-  const upstreamRes = await fetch(targetUrl, {
-    method: request.method,
-    headers,
-    body: customBody ? JSON.stringify(customBody) : (["POST", "PUT", "PATCH"].includes(request.method) ? request : undefined),
-    duplex: "half",
-    signal: AbortSignal.timeout(300000)
-  });
-
-  if (!upstreamRes.ok) {
-    throw new Error(`Upstream Gemini endpoint status ${upstreamRes.status}`);
-  }
-
-  response.writeHead(upstreamRes.status, {
-    "Content-Type": upstreamRes.headers.get("Content-Type") || "application/json",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive"
-  });
-
-  if (upstreamRes.body) {
-    const reader = upstreamRes.body.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      response.write(value);
-    }
-  }
-  response.end();
-}
-
 await initDatabase();
 await loadConfigFromStorage();
-await loadSettingsFromStorage();
+await loadEnabledModelsFromStorage();
 
 const server = http.createServer(async (request, response) => {
   try {
-    const reqUrl = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
-    appendLog("info", "REQUEST", `${request.method} ${reqUrl.pathname}`);
-
     if (request.method === "OPTIONS") {
       setCorsHeaders(response);
       response.writeHead(204);
@@ -1379,42 +996,17 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    if (request.method === "GET" && reqUrl.pathname === "/login") {
-      response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      response.end(getLoginHtml());
-      return;
-    }
+    const reqUrl = new URL(request.url, `http://${request.headers.host || "localhost"}`);
 
-    if (request.method === "POST" && reqUrl.pathname === "/login") {
-      const body = await readRequestBody(request);
-      if (!PANEL_PASSWORD || body.password === PANEL_PASSWORD) {
-        const token = generateSessionToken();
-        response.writeHead(302, {
-          "Set-Cookie": `panel_auth=${token}; Path=/; HttpOnly; SameSite=Lax`,
-          Location: "/"
-        });
-        response.end();
-        return;
-      }
-      response.writeHead(401, { "Content-Type": "text/html; charset=utf-8" });
-      response.end(getLoginHtml());
-      return;
-    }
-
-    if (request.method === "POST" && reqUrl.pathname === "/logout") {
-      response.writeHead(302, {
-        "Set-Cookie": "panel_auth=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
-        Location: "/login"
-      });
-      response.end();
-      return;
-    }
-
-    if (request.method === "GET" && reqUrl.pathname === "/") {
-      if (!isPanelAuthorized(request)) {
-        response.writeHead(302, { Location: "/login" });
-        response.end();
-        return;
+    if (request.method === "GET" && (reqUrl.pathname === "/" || reqUrl.pathname === "")) {
+      setCorsHeaders(response);
+      if (PANEL_PASSWORD) {
+        const cookies = parseCookies(request);
+        if (!verifySessionToken(cookies.panel_auth)) {
+          response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+          response.end(getLoginHtml());
+          return;
+        }
       }
       const htmlPath = path.join(__dirname, "dashboard.html");
       const htmlContent = fs.readFileSync(htmlPath, "utf8");
@@ -1423,225 +1015,185 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
+    if (request.method === "GET" && reqUrl.pathname === "/health") {
+      sendJson(response, 200, { status: "ok" });
+      return;
+    }
+
+    if (request.method === "POST" && reqUrl.pathname === "/api/panel/login") {
+      const body = await readRequestBody(request);
+      if (!PANEL_PASSWORD || body.password === PANEL_PASSWORD) {
+        const token = generateSessionToken();
+        setCorsHeaders(response);
+        response.writeHead(200, {
+          "Content-Type": "application/json",
+          "Set-Cookie": `panel_auth=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`
+        });
+        response.end(JSON.stringify({ success: true }));
+      } else {
+        sendJson(response, 401, { error: "密码错误" });
+      }
+      return;
+    }
+
+    if (request.method === "POST" && reqUrl.pathname === "/api/panel/logout") {
+      setCorsHeaders(response);
+      response.writeHead(200, {
+        "Content-Type": "application/json",
+        "Set-Cookie": `panel_auth=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`
+      });
+      response.end(JSON.stringify({ success: true }));
+      return;
+    }
+
     if (reqUrl.pathname.startsWith("/api/")) {
       if (!isPanelAuthorized(request)) {
-        sendJson(response, 401, { error: "无权访问面板 API" });
+        sendJson(response, 401, { error: "控制台未授权，请输入管理密码" });
         return;
       }
 
-      if (request.method === "GET" && reqUrl.pathname === "/api/logs") {
-        sendJson(response, 200, {
-          enabled: loggingEnabled,
-          logs: recentLogs
-        });
+      if (request.method === "GET" && reqUrl.pathname === "/api/settings/enabled-models") {
+        sendJson(response, 200, { enabledModels: Array.from(enabledModels) });
         return;
       }
 
-      if (request.method === "POST" && reqUrl.pathname === "/api/logs/toggle") {
+      if (request.method === "POST" && reqUrl.pathname === "/api/settings/enabled-models") {
         const body = await readRequestBody(request);
-        const newStatus = typeof body.enabled === "boolean" ? body.enabled : !loggingEnabled;
-        await saveLoggingConfigToStorage(newStatus);
-        sendJson(response, 200, { success: true, enabled: loggingEnabled });
-        return;
-      }
-
-      if (request.method === "POST" && reqUrl.pathname === "/api/logs/clear") {
-        recentLogs.length = 0;
-        sendJson(response, 200, { success: true, logs: [] });
-        return;
-      }
-
-      if (request.method === "GET" && reqUrl.pathname === "/api/servers") {
-        sendJson(response, 200, Array.from(mcpServers.values()));
-        return;
-      }
-
-      if (request.method === "POST" && reqUrl.pathname === "/api/servers") {
-        const body = await readRequestBody(request);
-        if (!body.name || !body.url) {
-          sendJson(response, 400, { error: "缺少必要字段 name 或 url" });
-          return;
-        }
-        try {
-          const s = await connectToMcpServer({ name: body.name, url: body.url, token: body.token });
-          sendJson(response, 200, { success: true, server: s });
-        } catch (err) {
-          sendJson(response, 500, { error: err.message });
-        }
-        return;
-      }
-
-      if (request.method === "POST" && reqUrl.pathname.startsWith("/api/servers/") && reqUrl.pathname.endsWith("/toggle")) {
-        const id = reqUrl.pathname.split("/")[3];
-        const s = mcpServers.get(id);
-        if (!s) {
-          sendJson(response, 404, { error: "未找到该服务器" });
-          return;
-        }
-        s.status = s.status === "active" ? "inactive" : "active";
-        if (s.status === "inactive") {
-          for (const t of s.tools) mcpToolRegistry.delete(t.key);
-        } else {
-          for (const t of s.tools) {
-            mcpToolRegistry.set(t.key, {
-              serverId: s.id,
-              serverName: s.name,
-              rawName: t.rawName,
-              postEndpoint: s.postEndpoint,
-              headers: s.headers
-            });
-          }
-        }
-        await saveServerToStorage(s);
-        sendJson(response, 200, { success: true, server: s });
-        return;
-      }
-
-      if (request.method === "DELETE" && reqUrl.pathname.startsWith("/api/servers/")) {
-        const id = reqUrl.pathname.split("/")[3];
-        const s = mcpServers.get(id);
-        if (s) {
-          for (const t of s.tools) mcpToolRegistry.delete(t.key);
-          mcpServers.delete(id);
-          await deleteServerFromStorage(id);
-        }
-        sendJson(response, 200, { success: true });
-        return;
-      }
-
-      if (request.method === "GET" && reqUrl.pathname === "/api/models") {
-        sendJson(response, 200, {
-          enabledModels: Array.from(enabledModels)
-        });
-        return;
-      }
-
-      if (request.method === "POST" && reqUrl.pathname === "/api/models") {
-        const body = await readRequestBody(request);
-        if (!Array.isArray(body.models)) {
-          sendJson(response, 400, { error: "models 必须是数组" });
-          return;
-        }
-        await saveEnabledModelsToStorage(body.models);
+        const models = Array.isArray(body.models) ? body.models : [];
+        await saveEnabledModelsToStorage(models);
         sendJson(response, 200, { success: true, enabledModels: Array.from(enabledModels) });
         return;
       }
 
-      sendJson(response, 404, { error: "API 路径不存在" });
-      return;
-    }
-
-    if (!isProxyAuthorized(request, reqUrl)) {
-      sendOpenAIError(response, 401, "API Key 无效或未提供", "invalid_api_key");
-      return;
-    }
-
-    if (
-      request.method === "GET" &&
-      (reqUrl.pathname === "/v1beta/models" ||
-        reqUrl.pathname === "/v1/models" ||
-        (reqUrl.pathname === "/v1/models" &&
-          (request.headers["x-goog-api-key"] || reqUrl.searchParams.has("key"))))
-    ) {
-      try {
-        await handleGeminiNativePassThrough(reqUrl, request, response);
-        return;
-      } catch {}
-
-      let modelList = [];
-      if (UPSTREAM_BASE_URL && UPSTREAM_API_KEY) {
+      if (request.method === "GET" && reqUrl.pathname === "/api/upstream/models") {
+        if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
+          sendJson(response, 200, { models: [] });
+          return;
+        }
         const modelsUrl = UPSTREAM_BASE_URL.endsWith("/v1")
           ? `${UPSTREAM_BASE_URL}/models`
           : `${UPSTREAM_BASE_URL}/v1/models`;
+
         try {
-          const uRes = await fetch(modelsUrl, {
+          const upstreamResponse = await fetch(modelsUrl, {
             headers: { Authorization: `Bearer ${UPSTREAM_API_KEY}` },
-            signal: AbortSignal.timeout(5000)
+            signal: AbortSignal.timeout(10000)
           });
-          if (uRes.ok) {
-            const data = await uRes.json();
-            modelList = Array.isArray(data.data) ? data.data : (Array.isArray(data.models) ? data.models : []);
-          }
-        } catch {}
-      }
-
-      if (reqUrl.pathname.startsWith("/v1beta/models")) {
-        const geminiModels = modelList.map((m) => {
-          const id = m.id || m.name || "unknown";
-          return {
-            name: `models/${id}`,
-            version: "1.0",
-            displayName: id,
-            description: `Model ${id} via Mcp-AI Proxy`,
-            supportedGenerationMethods: ["generateContent", "streamGenerateContent", "countTokens"]
-          };
-        });
-        sendJson(response, 200, { models: geminiModels });
+          const data = await upstreamResponse.json();
+          const list = Array.isArray(data.data) ? data.data.map(m => m.id).filter(Boolean) : [];
+          sendJson(response, 200, { models: list });
+        } catch (e) {
+          sendJson(response, 500, { error: e.message, models: [] });
+        }
         return;
       }
 
-      sendJson(response, 200, { object: "list", data: modelList });
-      return;
-    }
-
-    const countTokensMatch = reqUrl.pathname.match(/^\/(?:v1beta|v1)\/models\/([^:]+):countTokens$/);
-    if (request.method === "POST" && countTokensMatch) {
-      try {
-        await handleGeminiNativePassThrough(reqUrl, request, response);
-        return;
-      } catch {
-        sendJson(response, 200, { totalTokens: 100 });
+      if (request.method === "GET" && reqUrl.pathname === "/api/mcp/servers") {
+        sendJson(response, 200, { servers: Array.from(mcpServers.values()) });
         return;
       }
-    }
 
-    const geminiMatch = reqUrl.pathname.match(/^\/(?:v1beta|v1)\/models\/([^:]+):(generateContent|streamGenerateContent)$/);
-    if (request.method === "POST" && geminiMatch) {
-      const rawModel = decodeURIComponent(geminiMatch[1]);
-      const modelName = rawModel.replace(/^models\//, "");
-      const action = geminiMatch[2];
-      const isStream = action === "streamGenerateContent";
-      const geminiBody = await readRequestBody(request);
+      if (request.method === "POST" && reqUrl.pathname === "/api/mcp/connect") {
+        const body = await readRequestBody(request);
+        const serverInfo = await connectToMcpServer(body);
+        sendJson(response, 200, { toolCount: serverInfo.toolCount });
+        return;
+      }
 
-      appendLog("info", "GEMINI-INCOMING", `接收 Gemini 请求 [${modelName}], stream=${isStream}`, {
-        modelName,
-        isStream,
-        mcpEnabled: isModelEnabledForMcp(modelName),
-        generationConfig: geminiBody.generationConfig
-      });
-
-      if (!isModelEnabledForMcp(modelName) || mcpToolRegistry.size === 0) {
-        try {
-          await handleGeminiNativePassThrough(reqUrl, request, response, geminiBody);
+      const matchStart = reqUrl.pathname.match(/^\/api\/mcp\/servers\/([^/]+)\/start$/);
+      if (request.method === "POST" && matchStart) {
+        const id = decodeURIComponent(matchStart[1]);
+        const s = mcpServers.get(id);
+        if (!s) {
+          sendJson(response, 404, { error: "未找到该服务" });
           return;
-        } catch {}
+        }
+        s.status = "active";
+        for (const t of s.tools) {
+          mcpToolRegistry.set(t.key, {
+            serverId: s.id,
+            serverName: s.name,
+            rawName: t.rawName,
+            postEndpoint: s.postEndpoint,
+            headers: s.headers
+          });
+        }
+        await saveServerToStorage(s);
+        sendJson(response, 200, { success: true, status: "active" });
+        return;
       }
 
-      const openAiBody = convertGeminiToOpenAiRequest(geminiBody, modelName, isStream);
+      const matchStop = reqUrl.pathname.match(/^\/api\/mcp\/servers\/([^/]+)\/stop$/);
+      if (request.method === "POST" && matchStop) {
+        const id = decodeURIComponent(matchStop[1]);
+        const s = mcpServers.get(id);
+        if (!s) {
+          sendJson(response, 404, { error: "未找到该服务" });
+          return;
+        }
+        s.status = "disabled";
+        for (const [key, val] of mcpToolRegistry.entries()) {
+          if (val.serverId === id) {
+            mcpToolRegistry.delete(key);
+          }
+        }
+        await saveServerToStorage(s);
+        sendJson(response, 200, { success: true, status: "disabled" });
+        return;
+      }
 
-      const targetAdapter = isStream
-        ? createGeminiStreamAdapter(response, modelName)
-        : {
-            headersSent: false,
-            writeHead: (code, headers) => response.writeHead(code, headers),
-            end: (payload) => {
-              try {
-                const openAiJson = JSON.parse(payload);
-                const geminiJson = convertOpenAiToGeminiResponse(openAiJson, modelName);
-                sendJson(response, 200, geminiJson);
-              } catch {
-                response.end(payload);
-              }
-            }
-          };
+      const matchDelete = reqUrl.pathname.match(/^\/api\/mcp\/servers\/([^/]+)$/);
+      if (request.method === "DELETE" && matchDelete) {
+        const id = decodeURIComponent(matchDelete[1]);
+        mcpServers.delete(id);
+        for (const [key, val] of mcpToolRegistry.entries()) {
+          if (val.serverId === id) {
+            mcpToolRegistry.delete(key);
+          }
+        }
+        await deleteServerFromStorage(id);
+        sendJson(response, 200, { success: true });
+        return;
+      }
+    }
 
-      await runAgent(openAiBody, targetAdapter);
+    if (!isProxyAuthorized(request)) {
+      sendOpenAIError(response, 401, "API Key 错误", "authentication_error");
       return;
     }
 
-    if (request.method === "POST" && (reqUrl.pathname === "/chat/completions" || reqUrl.pathname === "/v1/chat/completions")) {
-      if (!UPSTREAM_BASE_URL) {
-        sendOpenAIError(response, 500, "未配置 UPSTREAM_BASE_URL 环境变量");
+    if (request.method === "GET" && reqUrl.pathname === "/v1/models") {
+      if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
+        sendJson(response, 200, {
+          object: "list",
+          data: [{ id: "default", object: "model", created: 0, owned_by: "proxy" }]
+        });
+        return;
+      }
+
+      const modelsUrl = UPSTREAM_BASE_URL.endsWith("/v1")
+        ? `${UPSTREAM_BASE_URL}/models`
+        : `${UPSTREAM_BASE_URL}/v1/models`;
+
+      try {
+        const upstreamResponse = await fetch(modelsUrl, {
+          headers: { Authorization: `Bearer ${UPSTREAM_API_KEY}` },
+          signal: AbortSignal.timeout(10000)
+        });
+        const data = await upstreamResponse.json();
+        sendJson(response, 200, data);
+      } catch {
+        sendJson(response, 200, {
+          object: "list",
+          data: [{ id: "default", object: "model", created: 0, owned_by: "proxy" }]
+        });
+      }
+      return;
+    }
+
+    if (request.method === "POST" && reqUrl.pathname === "/v1/chat/completions") {
+      if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
+        sendOpenAIError(response, 500, "服务端未配置环境变量：UPSTREAM_BASE_URL 或 UPSTREAM_API_KEY");
         return;
       }
 
@@ -1655,15 +1207,35 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    sendOpenAIError(response, 404, "接口不存在", "not_found");
+    sendOpenAIError(response, 404, "接口不存在");
   } catch (err) {
-    appendLog("error", "SERVER", "全局捕获错误", err.message);
-    if (!response.headersSent) {
-      sendOpenAIError(response, 500, `代理服务器内部错误: ${err.message}`, "internal_error");
+    if (response.headersSent) {
+      try {
+        const errChunk = {
+          id: `chatcmpl-${Date.now()}`,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          choices: [
+            {
+              index: 0,
+              delta: { content: `\n\n[代理服务错误]: ${err instanceof Error ? err.message : "未知错误"}` },
+              finish_reason: "stop"
+            }
+          ]
+        };
+        response.write(`data: ${JSON.stringify(errChunk)}\n\n`);
+        response.write("data: [DONE]\n\n");
+        response.end();
+      } catch {}
+      return;
     }
+
+    sendJson(response, 500, { error: err.message });
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`[MCP-AI] 服务已在端口 ${PORT} 启动`);
-});
+server.keepAliveTimeout = 600000;
+server.requestTimeout = 600000;
+server.headersTimeout = 600000;
+
+server.listen(PORT, "0.0.0.0");
