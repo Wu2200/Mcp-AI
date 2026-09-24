@@ -14,6 +14,7 @@ const PROXY_API_KEY = (process.env.PROXY_API_KEY || "").trim();
 const PANEL_PASSWORD = (process.env.PANEL_PASSWORD || "").trim();
 const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
 const MAX_ROUNDS = Number(process.env.MAX_ROUNDS || 100);
+const MAX_TOOL_CHARS = Number(process.env.MAX_TOOL_CHARS || 200000);
 
 const DATA_FILE = path.join(__dirname, "mcp-config.json");
 const SETTINGS_FILE = path.join(__dirname, "mcp-settings.json");
@@ -547,13 +548,14 @@ function extractMcpResultContent(data) {
     contentStr = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult, null, 2);
   }
 
-  // 关键保护：单次工具输出最大限制 10000 字符，保留前后有效信息，防止撑爆大模型上下文导致截断或 400 报错
-  const MAX_TOOL_CHARS = 10000;
-  if (contentStr.length > MAX_TOOL_CHARS) {
-    const head = contentStr.slice(0, 7500);
-    const tail = contentStr.slice(-2000);
+  // 关键保护：单次工具输出最大限制（默认 200,000 字符，支持通过 MAX_TOOL_CHARS 环境变量调整或设为 0 关闭截断）
+  if (MAX_TOOL_CHARS > 0 && contentStr.length > MAX_TOOL_CHARS) {
+    const headLen = Math.floor(MAX_TOOL_CHARS * 0.8);
+    const tailLen = Math.floor(MAX_TOOL_CHARS * 0.2);
+    const head = contentStr.slice(0, headLen);
+    const tail = contentStr.slice(-tailLen);
     const originLen = contentStr.length;
-    contentStr = `${head}\n\n[⚠️ 系统截断提示：工具返回内容过大(共 ${originLen} 字符)，为防止超出模型上下文导致响应中断，已智能截取关键首尾部分]\n\n${tail}`;
+    contentStr = `${head}\n\n[⚠️ 系统截断提示：工具返回内容过大(共 ${originLen} 字符)，已智能保留前 ${headLen} 和后 ${tailLen} 字符]\n\n${tail}`;
   }
 
   return contentStr;
