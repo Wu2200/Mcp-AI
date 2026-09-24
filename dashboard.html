@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>MCP 控制台</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -10,7 +10,7 @@
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
       background-color: #f8fafc;
       color: #1e293b;
-      padding: 16px 12px;
+      padding: 24px 14px;
       line-height: 1.5;
     }
     .container {
@@ -21,11 +21,11 @@
       display: flex;
       justify-content: space-between;
       align-items: center;
-      margin-bottom: 16px;
+      margin-bottom: 20px;
       gap: 12px;
     }
     .header h1 {
-      font-size: 19px;
+      font-size: 20px;
       font-weight: 700;
       color: #0f172a;
       letter-spacing: -0.02em;
@@ -57,30 +57,18 @@
       background: #ffffff;
       border: 1px solid #e2e8f0;
       border-radius: 12px;
-      padding: 16px;
+      padding: 20px;
       margin-bottom: 16px;
-      box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.04);
+      box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05);
     }
-    .card-header-block {
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-      margin-bottom: 12px;
-    }
-    .card-title-row {
+    .card-title {
+      font-size: 15px;
+      font-weight: 600;
+      color: #0f172a;
+      margin-bottom: 14px;
       display: flex;
       align-items: center;
-      justify-content: space-between;
       gap: 8px;
-      width: 100%;
-    }
-    .card-title-text {
-      font-size: 15px;
-      font-weight: 700;
-      color: #0f172a;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
     }
     .badge {
       display: inline-flex;
@@ -96,16 +84,8 @@
     .badge-green { background: #dcfce7; color: #15803d; }
     .badge-gray { background: #f1f5f9; color: #64748b; border: 1px solid #e2e8f0; }
 
-    .action-row {
-      display: flex;
-      gap: 8px;
-      align-items: center;
-      width: 100%;
-      flex-wrap: wrap;
-    }
-
     .group {
-      margin-bottom: 12px;
+      margin-bottom: 14px;
     }
     .group:last-child {
       margin-bottom: 0;
@@ -132,7 +112,7 @@
       width: 100%;
       background: #ffffff;
       border: 1px solid #cbd5e1;
-      padding: 9px 12px;
+      padding: 10px 12px;
       border-radius: 8px;
       color: #0f172a;
       font-size: 14px;
@@ -152,7 +132,7 @@
       border: none;
       font-weight: 600;
       font-size: 14px;
-      padding: 9px 18px;
+      padding: 10px 24px;
       border-radius: 8px;
       cursor: pointer;
       white-space: nowrap;
@@ -166,23 +146,28 @@
       background: #f1f5f9;
       color: #334155;
       border: 1px solid #cbd5e1;
-      padding: 8px 14px;
+      padding: 8px 16px;
       font-size: 13px;
     }
     .btn-secondary:hover {
       background: #e2e8f0;
       color: #0f172a;
     }
+    .action-group {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      flex-shrink: 0;
+    }
     .btn-action {
       border: none;
-      padding: 7px 12px;
+      padding: 5px 12px;
       font-size: 12px;
       font-weight: 600;
       border-radius: 6px;
       cursor: pointer;
       white-space: nowrap;
-      flex: 1;
-      text-align: center;
+      flex-shrink: 0;
       transition: all 0.15s;
     }
     .btn-start {
@@ -205,44 +190,23 @@
       color: #ffffff;
       border-color: #d97706;
     }
-
-    /* 极简精致小型文本按钮（断开、启动、删除） */
-    .server-btn {
-      border: none;
-      background: transparent;
-      padding: 0 4px;
-      font-size: 12px;
-      font-weight: 500;
-      cursor: pointer;
-      white-space: nowrap;
-      flex: none;
-      line-height: 1.4;
-      text-decoration: underline;
-      transition: opacity 0.15s;
+    .btn-del {
+      background: #fee2e2;
+      color: #991b1b;
+      border: 1px solid #fecaca;
     }
-    .server-btn:hover {
-      opacity: 0.8;
-    }
-    .server-btn-stop {
-      color: #b45309;
-    }
-    .server-btn-start {
-      color: #15803d;
-    }
-    .server-btn-del {
-      color: #94a3b8;
-    }
-    .server-btn-del:hover {
-      color: #dc2626;
-      opacity: 1;
+    .btn-del:hover {
+      background: #dc2626;
+      color: #ffffff;
+      border-color: #dc2626;
     }
 
     .server-item {
       background: #f8fafc;
       border: 1px solid #e2e8f0;
-      padding: 12px;
+      padding: 14px;
       border-radius: 10px;
-      margin-bottom: 10px;
+      margin-bottom: 12px;
     }
     .server-item:last-child {
       margin-bottom: 0;
@@ -259,13 +223,14 @@
       gap: 8px;
     }
     .server-item-title {
-      font-size: 14px;
+      font-size: 15px;
       font-weight: 600;
       color: #0f172a;
       display: flex;
       align-items: center;
       gap: 8px;
       min-width: 0;
+      overflow: hidden;
     }
     .server-name-text {
       white-space: nowrap;
@@ -368,62 +333,9 @@
     }
     .empty-state {
       text-align: center;
-      padding: 24px 12px;
+      padding: 28px 14px;
       color: #94a3b8;
       font-size: 13px;
-    }
-
-    /* 实时日志面板样式 */
-    .log-box {
-      background: #0b1120;
-      border-radius: 8px;
-      padding: 10px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-      font-size: 11px;
-      color: #e2e8f0;
-      max-height: 380px;
-      overflow-y: auto;
-      white-space: pre-wrap;
-      word-break: break-all;
-      -webkit-overflow-scrolling: touch;
-    }
-    .log-row {
-      margin-bottom: 8px;
-      line-height: 1.45;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.07);
-      padding-bottom: 6px;
-    }
-    .log-time { color: #64748b; margin-right: 6px; }
-    .log-tag { color: #38bdf8; font-weight: 600; margin-right: 6px; }
-    .log-info { color: #f1f5f9; }
-    .log-error { color: #f87171; }
-    .log-detail {
-      background: rgba(0, 0, 0, 0.4);
-      padding: 6px 8px;
-      border-radius: 4px;
-      margin-top: 4px;
-      color: #94a3b8;
-      font-size: 11px;
-      border-left: 2px solid #38bdf8;
-    }
-
-    @media (max-width: 640px) {
-      body {
-        padding: 10px 8px;
-      }
-      .card {
-        padding: 14px 10px;
-      }
-      .action-row {
-        display: grid;
-        grid-template-columns: 1.4fr 1fr 1fr;
-        gap: 6px;
-      }
-      .action-row .btn-action {
-        width: 100%;
-        padding: 8px 4px;
-        font-size: 11px;
-      }
     }
   </style>
 </head>
@@ -438,19 +350,13 @@
     </div>
 
     <div class="card">
-      <div class="card-header-block">
-        <div class="card-title-row">
-          <span class="card-title-text">客户端连接配置</span>
-          <span class="badge badge-blue">Chatbox 专用</span>
-        </div>
+      <div class="card-title">
+        <span>客户端连接配置</span>
+        <span class="badge badge-blue">Chatbox 专用</span>
       </div>
       <div class="group">
-        <label>OpenAI 格式 API 域名 (Base URL)</label>
+        <label>API 域名 (Base URL)</label>
         <div class="box" id="proxy-url"></div>
-      </div>
-      <div class="group">
-        <label>Google Gemini 格式 API 域名</label>
-        <div class="box" id="gemini-proxy-url"></div>
       </div>
       <div class="group">
         <label>模型 (Model)</label>
@@ -458,73 +364,46 @@
       </div>
     </div>
 
-    <!-- 实时日志监控卡片 -->
-    <div class="card">
-      <div class="card-header-block">
-        <div class="card-title-row">
-          <span class="card-title-text">请求与调度日志监控</span>
-          <span id="log-status-badge" class="badge badge-green">监听中</span>
-        </div>
-        <div class="action-row">
-          <button id="btn-copy-log" class="btn-action btn-start" onclick="copyAllLogs()">一键复制全部日志</button>
-          <button id="btn-toggle-log" class="btn-action btn-stop" onclick="toggleLogging()">关闭日志</button>
-          <button class="btn-action btn-secondary" onclick="clearLogs()">清空日志</button>
-        </div>
-      </div>
-      <p style="font-size: 13px; color: #64748b; margin-bottom: 10px;">
-        在此面板可直接查看 Chatbox 传入的原始参数、上游转发情况以及 MCP 工具的调用与错误信息。
-      </p>
-      <div id="log-container" class="log-box">
-        <div style="color: #64748b;">暂无日志输出，等待调用...</div>
-      </div>
-    </div>
-
     <!-- 启用模型配置卡片（白名单模式） -->
     <div class="card">
-      <div class="card-header-block">
-        <div class="card-title-row">
-          <span class="card-title-text">启用 MCP 的模型设置（白名单模式）</span>
-          <span class="badge badge-green">仅选中模型支持 MCP</span>
-        </div>
+      <div class="card-title">
+        <span>启用 MCP 的模型设置（白名单模式）</span>
+        <span class="badge badge-green">仅选中模型支持 MCP</span>
       </div>
-      <p style="font-size: 13px; color: #64748b; margin-bottom: 12px;">
+      <p style="font-size: 13px; color: #64748b; margin-bottom: 14px;">
         <strong>白名单规则</strong>：只有加入此列表的模型才会挂载 MCP 工具。未在此列表中的其他所有模型将<strong>完全纯净直通上游</strong>（绝不携带任何 tools 参数），从而 100% 触发上游网关自带的原生网络搜索，互不干扰。
       </p>
 
       <div class="group">
         <label>当前支持 MCP 的模型列表（支持完全匹配或通配符，如 claude*、gpt-4o*）：</label>
-        <div id="enabled-tags" style="min-height: 38px; padding: 4px 0;">
+        <div id="enabled-tags" style="min-height: 38px; padding: 6px 0;">
           <span style="font-size: 13px; color: #94a3b8;">暂未启用任何模型，所有请求默认直通上游网关。</span>
         </div>
       </div>
 
-      <div class="group" style="display: flex; gap: 8px; margin-top: 8px;">
+      <div class="group" style="display: flex; gap: 8px; margin-top: 10px;">
         <input id="custom-model-input" placeholder="手动输入模型名称或通配符（如 claude*，回车添加）" onkeydown="if(event.key==='Enter')addCustomModel()">
         <button class="btn btn-secondary" onclick="addCustomModel()">添加</button>
       </div>
 
-      <div class="group" style="margin-top: 12px;">
+      <div class="group" style="margin-top: 14px;">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
           <label style="margin: 0;">从上游所有模型中选择（点击即可开启 MCP）：</label>
-          <button class="btn-action btn-start" style="flex: none; padding: 4px 10px;" onclick="fetchUpstreamModels()">刷新上游模型列表</button>
+          <button class="btn-action btn-start" onclick="fetchUpstreamModels()">刷新上游模型列表</button>
         </div>
         <div id="upstream-candidates" style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px; max-height: 140px; overflow-y: auto;">
           <span style="font-size: 12px; color: #94a3b8;">点击上方“刷新上游模型列表”按钮获取上游所有可用模型</span>
         </div>
       </div>
 
-      <div style="display: flex; align-items: center; margin-top: 14px;">
+      <div style="display: flex; align-items: center; margin-top: 16px;">
         <button class="btn" onclick="saveEnabledModels()">保存启用配置</button>
         <span id="enable-msg"></span>
       </div>
     </div>
 
     <div class="card">
-      <div class="card-header-block">
-        <div class="card-title-row">
-          <span class="card-title-text">手动挂载 MCP 服务（支持添加多个）</span>
-        </div>
-      </div>
+      <div class="card-title">手动挂载 MCP 服务（支持添加多个）</div>
       <div class="group">
         <label>服务前缀名称（如 Github、Gitlab、Notion 等）</label>
         <input id="mcp-name" value="Github" placeholder="输入唯一标识名称">
@@ -537,135 +416,30 @@
         <label>认证令牌 (Token，可选)</label>
         <input id="mcp-token" type="password" placeholder="如需认证请粘贴 Token（如 ghu_、ghp_）">
       </div>
-      <div style="display: flex; align-items: center; margin-top: 14px;">
+      <div style="display: flex; align-items: center; margin-top: 16px;">
         <button id="btn-conn" class="btn" onclick="handleConnect()">添加</button>
         <span id="conn-msg"></span>
       </div>
     </div>
 
     <div class="card">
-      <div class="card-header-block">
-        <div class="card-title-row">
-          <span class="card-title-text">已挂载 MCP 服务列表</span>
-        </div>
+      <div class="card-title">
+        <span>已挂载 MCP 服务列表</span>
       </div>
       <div id="mcp-list">
-        <div class="empty-state">尚未挂载任何远程 MCP 服务。直接透传上游模型配置与联网搜索。</div>
+        <div class="empty-state">正在加载服务列表...</div>
       </div>
     </div>
   </div>
 
   <script>
     document.getElementById("proxy-url").innerText = window.location.origin + "/v1";
-    document.getElementById("gemini-proxy-url").innerText = window.location.origin;
 
     let currentEnabledList = [];
-    let isLoggingActive = true;
-    let logPollTimer = null;
-    let rawLogsCache = [];
 
     async function handleLogout() {
       await fetch("/api/panel/logout", { method: "POST" });
       location.reload();
-    }
-
-    async function fetchLogs() {
-      try {
-        const res = await fetch("/api/logs");
-        if (res.status === 401) return;
-        const data = await res.json();
-        isLoggingActive = data.enabled;
-        rawLogsCache = data.logs || [];
-        updateLogSwitchUI();
-
-        const container = document.getElementById("log-container");
-        if (!data.logs || data.logs.length === 0) {
-          container.innerHTML = '<div style="color: #64748b;">暂无日志输出，等待调用...</div>';
-          return;
-        }
-
-        const isScrolledToBottom = container.scrollHeight - container.clientHeight <= container.scrollTop + 30;
-
-        container.innerHTML = data.logs.map(log => `
-          <div class="log-row">
-            <span class="log-time">[${log.time}]</span>
-            <span class="log-tag">[${log.tag}]</span>
-            <span class="${log.level === 'error' ? 'log-error' : 'log-info'}">${log.message}</span>
-            ${log.data ? `<div class="log-detail">${log.data}</div>` : ''}
-          </div>
-        `).join("");
-
-        if (isScrolledToBottom) {
-          container.scrollTop = container.scrollHeight;
-        }
-      } catch {}
-    }
-
-    async function copyAllLogs() {
-      const btn = document.getElementById("btn-copy-log");
-      if (!rawLogsCache || rawLogsCache.length === 0) {
-        btn.innerText = "暂无日志可复制";
-        setTimeout(() => { btn.innerText = "一键复制全部日志"; }, 1500);
-        return;
-      }
-      const text = rawLogsCache.map(l => {
-        let str = `[${l.time}] [${l.tag}] ${l.message}`;
-        if (l.data) str += `\n${l.data}`;
-        return str;
-      }).join("\n\n");
-
-      try {
-        await navigator.clipboard.writeText(text);
-        btn.innerText = "✓ 已复制到剪贴板";
-        setTimeout(() => { btn.innerText = "一键复制全部日志"; }, 1500);
-      } catch {
-        const ta = document.createElement("textarea");
-        ta.value = text;
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand("copy");
-        document.body.removeChild(ta);
-        btn.innerText = "✓ 已复制到剪贴板";
-        setTimeout(() => { btn.innerText = "一键复制全部日志"; }, 1500);
-      }
-    }
-
-    function updateLogSwitchUI() {
-      const btn = document.getElementById("btn-toggle-log");
-      const badge = document.getElementById("log-status-badge");
-      if (isLoggingActive) {
-        btn.innerText = "关闭日志";
-        btn.className = "btn-action btn-stop";
-        badge.innerText = "监听中";
-        badge.className = "badge badge-green";
-      } else {
-        btn.innerText = "开启日志";
-        btn.className = "btn-action btn-start";
-        badge.innerText = "已暂停";
-        badge.className = "badge badge-gray";
-      }
-    }
-
-    async function toggleLogging() {
-      const nextState = !isLoggingActive;
-      try {
-        const res = await fetch("/api/logs/toggle", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ enabled: nextState })
-        });
-        const data = await res.json();
-        isLoggingActive = data.enabled;
-        updateLogSwitchUI();
-        fetchLogs();
-      } catch {}
-    }
-
-    async function clearLogs() {
-      try {
-        await fetch("/api/logs/clear", { method: "POST" });
-        fetchLogs();
-      } catch {}
     }
 
     function renderEnabledTags() {
@@ -791,8 +565,8 @@
             : '<span class="badge badge-gray">已断开</span>';
 
           const toggleActionBtn = isActive
-            ? `<button class="server-btn server-btn-stop" onclick="handleStop('${s.id}')">断开</button>`
-            : `<button class="server-btn server-btn-start" onclick="handleStart('${s.id}')">启动</button>`;
+            ? `<button class="btn-action btn-stop" onclick="handleStop('${s.id}')">断开</button>`
+            : `<button class="btn-action btn-start" onclick="handleStart('${s.id}')">启动</button>`;
 
           let tags = s.tools.map(t => '<span class="tag">' + t.key + '</span>').join("");
 
@@ -803,9 +577,9 @@
                   <span class="server-name-text">${s.name}</span>
                   ${statusBadge}
                 </div>
-                <div style="display: flex; gap: 8px; align-items: center;">
+                <div class="action-group">
                   ${toggleActionBtn}
-                  <button class="server-btn server-btn-del" onclick="handleDelete('${s.id}')">删除</button>
+                  <button class="btn-action btn-del" onclick="handleDelete('${s.id}')">删除</button>
                 </div>
               </div>
               <div class="server-item-url">${s.url}</div>
@@ -876,8 +650,6 @@
 
     loadEnabledSettings();
     loadServers();
-    fetchLogs();
-    logPollTimer = setInterval(fetchLogs, 2000);
   </script>
 </body>
 </html>
