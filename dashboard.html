@@ -14,7 +14,7 @@
       line-height: 1.5;
     }
     .container {
-      max-width: 800px;
+      max-width: 860px;
       margin: 0 auto;
     }
     .header {
@@ -68,6 +68,12 @@
       margin-bottom: 14px;
       display: flex;
       align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .card-title-left {
+      display: flex;
+      align-items: center;
       gap: 8px;
     }
     .badge {
@@ -82,6 +88,7 @@
     }
     .badge-blue { background: #e0f2fe; color: #0369a1; }
     .badge-green { background: #dcfce7; color: #15803d; }
+    .badge-red { background: #fee2e2; color: #b91c1c; }
     .badge-gray { background: #f1f5f9; color: #64748b; border: 1px solid #e2e8f0; }
 
     .group {
@@ -326,7 +333,7 @@
       color: #166534;
       border-color: #86efac;
     }
-    #conn-msg, #enable-msg {
+    #conn-msg, #enable-msg, #log-msg {
       margin-left: 12px;
       font-size: 13px;
       font-weight: 500;
@@ -336,6 +343,77 @@
       padding: 28px 14px;
       color: #94a3b8;
       font-size: 13px;
+    }
+
+    /* 日志控制台样式 */
+    .log-panel-container {
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 12px;
+      color: #f1f5f9;
+      max-height: 480px;
+      overflow-y: auto;
+    }
+    .log-item {
+      border-bottom: 1px solid #1e293b;
+      padding: 8px 0;
+    }
+    .log-item:last-child {
+      border-bottom: none;
+    }
+    .log-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .log-header:hover {
+      color: #38bdf8;
+    }
+    .log-time {
+      color: #64748b;
+      font-size: 11px;
+      white-space: nowrap;
+    }
+    .log-type-tag {
+      padding: 1px 6px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .tag-downstream { background: #0284c7; color: #ffffff; }
+    .tag-upstream { background: #d97706; color: #ffffff; }
+    .tag-agent { background: #7c3aed; color: #ffffff; }
+    .tag-tool { background: #059669; color: #ffffff; }
+    .tag-error { background: #dc2626; color: #ffffff; }
+    .log-summary {
+      flex: 1;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-weight: 500;
+    }
+    .log-expand-icon {
+      color: #64748b;
+      font-size: 11px;
+    }
+    .log-body {
+      display: none;
+      background: #020617;
+      border: 1px solid #1e293b;
+      border-radius: 6px;
+      padding: 8px 10px;
+      margin-top: 6px;
+      white-space: pre-wrap;
+      word-break: break-all;
+      color: #94a3b8;
+      max-height: 300px;
+      overflow-y: auto;
     }
   </style>
 </head>
@@ -351,8 +429,10 @@
 
     <div class="card">
       <div class="card-title">
-        <span>客户端连接配置</span>
-        <span class="badge badge-blue">Chatbox 专用</span>
+        <div class="card-title-left">
+          <span>客户端连接配置</span>
+          <span class="badge badge-blue">Chatbox 专用</span>
+        </div>
       </div>
       <div class="group">
         <label>API 域名 (Base URL)</label>
@@ -364,11 +444,36 @@
       </div>
     </div>
 
+    <!-- 调试抓包日志卡片 -->
+    <div class="card">
+      <div class="card-title">
+        <div class="card-title-left">
+          <span>全链路调试抓包日志</span>
+          <span id="log-status-badge" class="badge badge-green">抓取中</span>
+        </div>
+        <div class="action-group">
+          <button id="btn-toggle-log" class="btn-action btn-stop" onclick="toggleLogging()">关闭日志</button>
+          <button class="btn-action btn-start" onclick="copyAllLogs()">复制全部日志</button>
+          <button class="btn-action btn-del" onclick="clearAllLogs()">清空日志</button>
+          <button class="btn-action btn-start" onclick="loadLogs()">刷新</button>
+        </div>
+      </div>
+      <p style="font-size: 13px; color: #64748b; margin-bottom: 12px;">
+        自动捕获下游客户端请求、发往上游 Payload、上游返回内容及 MCP 工具执行明细。点击任意日志条目即可展开查看完整数据报文。
+      </p>
+      <div id="log-panel" class="log-panel-container">
+        <div class="empty-state" style="color: #64748b;">暂无抓包记录</div>
+      </div>
+      <span id="log-msg"></span>
+    </div>
+
     <!-- 启用模型配置卡片（白名单模式） -->
     <div class="card">
       <div class="card-title">
-        <span>启用 MCP 的模型设置（白名单模式）</span>
-        <span class="badge badge-green">仅选中模型支持 MCP</span>
+        <div class="card-title-left">
+          <span>启用 MCP 的模型设置（白名单模式）</span>
+          <span class="badge badge-green">仅选中模型支持 MCP</span>
+        </div>
       </div>
       <p style="font-size: 13px; color: #64748b; margin-bottom: 14px;">
         <strong>白名单规则</strong>：只有加入此列表的模型才会挂载 MCP 工具。未在此列表中的其他所有模型将<strong>完全纯净直通上游</strong>（绝不携带任何 tools 参数），从而 100% 触发上游网关自带的原生网络搜索，互不干扰。
@@ -403,7 +508,11 @@
     </div>
 
     <div class="card">
-      <div class="card-title">手动挂载 MCP 服务（支持添加多个）</div>
+      <div class="card-title">
+        <div class="card-title-left">
+          <span>手动挂载 MCP 服务（支持添加多个）</span>
+        </div>
+      </div>
       <div class="group">
         <label>服务前缀名称（如 Github、Gitlab、Notion 等）</label>
         <input id="mcp-name" value="Github" placeholder="输入唯一标识名称">
@@ -424,7 +533,9 @@
 
     <div class="card">
       <div class="card-title">
-        <span>已挂载 MCP 服务列表</span>
+        <div class="card-title-left">
+          <span>已挂载 MCP 服务列表</span>
+        </div>
       </div>
       <div id="mcp-list">
         <div class="empty-state">正在加载服务列表...</div>
@@ -436,6 +547,8 @@
     document.getElementById("proxy-url").innerText = window.location.origin + "/v1";
 
     let currentEnabledList = [];
+    let isLoggingActive = true;
+    let cachedLogs = [];
 
     async function handleLogout() {
       await fetch("/api/panel/logout", { method: "POST" });
@@ -544,6 +657,122 @@
       }
     }
 
+    function toggleLogDetail(id) {
+      const bodyEl = document.getElementById("log-detail-" + id);
+      const iconEl = document.getElementById("log-icon-" + id);
+      if (!bodyEl) return;
+      if (bodyEl.style.display === "block") {
+        bodyEl.style.display = "none";
+        if (iconEl) iconEl.innerText = "▶";
+      } else {
+        bodyEl.style.display = "block";
+        if (iconEl) iconEl.innerText = "▼";
+      }
+    }
+
+    function getTagClass(type) {
+      if (type.startsWith("DOWNSTREAM")) return "tag-downstream";
+      if (type.startsWith("UPSTREAM")) return "tag-upstream";
+      if (type.startsWith("AGENT")) return "tag-agent";
+      if (type.startsWith("TOOL")) return "tag-tool";
+      if (type.startsWith("ERROR")) return "tag-error";
+      return "tag-downstream";
+    }
+
+    async function loadLogs() {
+      try {
+        const res = await fetch("/api/logs");
+        if (!res.ok) return;
+        const data = await res.json();
+        isLoggingActive = !!data.enabled;
+        cachedLogs = data.logs || [];
+
+        const badge = document.getElementById("log-status-badge");
+        const toggleBtn = document.getElementById("btn-toggle-log");
+        if (isLoggingActive) {
+          badge.className = "badge badge-green";
+          badge.innerText = "抓取中";
+          toggleBtn.className = "btn-action btn-stop";
+          toggleBtn.innerText = "关闭日志";
+        } else {
+          badge.className = "badge badge-gray";
+          badge.innerText = "已暂停";
+          toggleBtn.className = "btn-action btn-start";
+          toggleBtn.innerText = "开启日志";
+        }
+
+        const panel = document.getElementById("log-panel");
+        if (cachedLogs.length === 0) {
+          panel.innerHTML = '<div class="empty-state" style="color: #64748b;">暂无抓包记录</div>';
+          return;
+        }
+
+        // 倒序展示最新的在最前面
+        const list = [...cachedLogs].reverse();
+        panel.innerHTML = list.map(item => `
+          <div class="log-item">
+            <div class="log-header" onclick="toggleLogDetail('${item.id}')">
+              <span class="log-expand-icon" id="log-icon-${item.id}">▶</span>
+              <span class="log-time">${item.time}</span>
+              <span class="log-type-tag ${getTagClass(item.type)}">${item.type}</span>
+              <span class="log-summary" title="${item.summary.replace(/"/g, '&quot;')}">${item.summary}</span>
+            </div>
+            <div class="log-body" id="log-detail-${item.id}">${escapeHtml(item.detail)}</div>
+          </div>
+        `).join("");
+      } catch {}
+    }
+
+    function escapeHtml(str) {
+      if (!str) return "";
+      return String(str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+    }
+
+    async function toggleLogging() {
+      try {
+        const nextState = !isLoggingActive;
+        const res = await fetch("/api/logs/toggle", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: nextState })
+        });
+        if (res.ok) {
+          loadLogs();
+        }
+      } catch {}
+    }
+
+    async function clearAllLogs() {
+      if (!confirm("确认清空所有抓包日志？")) return;
+      try {
+        const res = await fetch("/api/logs/clear", { method: "POST" });
+        if (res.ok) {
+          loadLogs();
+        }
+      } catch {}
+    }
+
+    function copyAllLogs() {
+      if (!cachedLogs || cachedLogs.length === 0) {
+        alert("暂无日志可复制");
+        return;
+      }
+      const text = cachedLogs.map(l => `[${l.time}] [${l.type}] ${l.summary}\n${l.detail}\n----------------------------------------`).join("\n\n");
+      navigator.clipboard.writeText(text).then(() => {
+        const msg = document.getElementById("log-msg");
+        msg.innerText = "已复制全量抓包日志到剪贴板！";
+        msg.style.color = "#16a34a";
+        setTimeout(() => { msg.innerText = ""; }, 3000);
+      }).catch(() => {
+        alert("复制失败，请手动在控制台查看。");
+      });
+    }
+
     async function loadServers() {
       try {
         const res = await fetch("/api/mcp/servers");
@@ -650,6 +879,8 @@
 
     loadEnabledSettings();
     loadServers();
+    loadLogs();
+    setInterval(loadLogs, 3000);
   </script>
 </body>
 </html>
