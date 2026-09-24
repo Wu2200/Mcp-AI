@@ -206,49 +206,35 @@
       border-color: #d97706;
     }
 
-    /* 极简精致小型操作按钮 */
+    /* 极简精致小型文本按钮（断开、启动、删除） */
     .server-btn {
-      border: 1px solid #e2e8f0;
-      background: #ffffff;
-      padding: 2px 8px;
-      font-size: 11px;
+      border: none;
+      background: transparent;
+      padding: 0 4px;
+      font-size: 12px;
       font-weight: 500;
-      border-radius: 4px;
       cursor: pointer;
       white-space: nowrap;
       flex: none;
       line-height: 1.4;
-      transition: all 0.15s;
+      text-decoration: underline;
+      transition: opacity 0.15s;
+    }
+    .server-btn:hover {
+      opacity: 0.8;
     }
     .server-btn-stop {
       color: #b45309;
-      border-color: #fde68a;
-      background: #fffbeb;
-    }
-    .server-btn-stop:hover {
-      background: #fef3c7;
-      color: #92400e;
-      border-color: #fcd34d;
     }
     .server-btn-start {
       color: #15803d;
-      border-color: #bbf7d0;
-      background: #f0fdf4;
-    }
-    .server-btn-start:hover {
-      background: #dcfce7;
-      color: #166534;
-      border-color: #86efac;
     }
     .server-btn-del {
       color: #94a3b8;
-      border-color: #e2e8f0;
-      background: #ffffff;
     }
     .server-btn-del:hover {
-      background: #fee2e2;
       color: #dc2626;
-      border-color: #fca5a5;
+      opacity: 1;
     }
 
     .server-item {
@@ -817,7 +803,7 @@
                   <span class="server-name-text">${s.name}</span>
                   ${statusBadge}
                 </div>
-                <div style="display: flex; gap: 4px; align-items: center;">
+                <div style="display: flex; gap: 8px; align-items: center;">
                   ${toggleActionBtn}
                   <button class="server-btn server-btn-del" onclick="handleDelete('${s.id}')">删除</button>
                 </div>
