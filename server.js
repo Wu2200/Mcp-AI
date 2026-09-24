@@ -332,6 +332,13 @@ function sendOpenAIError(response, statusCode, message, type = "invalid_request_
 
 function isProxyAuthorized(request) {
   if (!PROXY_API_KEY) return true;
+  const reqUrl = new URL(request.url, `http://${request.headers.host || "localhost"}`);
+  const queryKey = reqUrl.searchParams.get("key") || "";
+  if (queryKey && queryKey === PROXY_API_KEY) return true;
+
+  const headerKey = request.headers["x-goog-api-key"] || "";
+  if (headerKey && headerKey.trim() === PROXY_API_KEY) return true;
+
   const authorization = request.headers.authorization || "";
   const token = authorization.startsWith("Bearer ")
     ? authorization.slice(7).trim()
@@ -701,6 +708,176 @@ function isModelEnabledForMcp(modelName) {
     }
   }
   return false;
+}
+
+// Gemini 原生格式双向转换模块
+function convertGeminiToOpenAIMessages(body) {
+  const messages = [];
+  if (body.systemInstruction?.parts) {
+    const sysText = body.systemInstruction.parts.map(p => p.text || "").join("\n");
+    if (sysText) messages.push({ role: "system", content: sysText });
+  }
+  if (Array.isArray(body.contents)) {
+    for (const c of body.contents) {
+      const role = c.role === "model" ? "assistant" : "user";
+      const parts = Array.isArray(c.parts) ? c.parts : [];
+      let textContent = "";
+      const toolCalls = [];
+
+      for (const p of parts) {
+        if (p.text) textContent += p.text;
+        if (p.functionCall) {
+          toolCalls.push({
+            id: `call_${crypto.randomUUID()}`,
+            type: "function",
+            function: {
+              name: p.functionCall.name,
+              arguments: JSON.stringify(p.functionCall.args || {})
+            }
+          });
+        }
+        if (p.functionResponse) {
+          messages.push({
+            role: "tool",
+            tool_call_id: p.functionResponse.id || `call_${crypto.randomUUID()}`,
+            content: JSON.stringify(p.functionResponse.response || {})
+          });
+        }
+      }
+
+      if (textContent || toolCalls.length > 0) {
+        const msg = { role, content: textContent || null };
+        if (toolCalls.length > 0) msg.tool_calls = toolCalls;
+        messages.push(msg);
+      }
+    }
+  }
+  return messages;
+}
+
+function convertOpenAiChunkToGemini(parsedChunk) {
+  const choice = parsedChunk.choices?.[0];
+  const delta = choice?.delta;
+  const text = delta?.content || "";
+  const reasoning = delta?.reasoning_content || "";
+  const fullText = reasoning ? `> 正在思考...\n${reasoning}\n\n${text}` : text;
+
+  let finishReason = undefined;
+  if (choice?.finish_reason === "stop") finishReason = "STOP";
+  else if (choice?.finish_reason === "length") finishReason = "MAX_TOKENS";
+
+  return {
+    candidates: [
+      {
+        content: {
+          parts: [{ text: fullText }],
+          role: "model"
+        },
+        finishReason,
+        index: 0
+      }
+    ]
+  };
+}
+
+async function handleGeminiGenerateContent(modelName, isStream, geminiBody, clientResponse, reqMeta) {
+  const openAiMessages = convertGeminiToOpenAIMessages(geminiBody);
+  const openAiBody = {
+    model: modelName,
+    messages: openAiMessages,
+    stream: isStream,
+    temperature: geminiBody.generationConfig?.temperature,
+    max_tokens: geminiBody.generationConfig?.maxOutputTokens
+  };
+
+  const mcpEnabled = isModelEnabledForMcp(modelName) && mcpToolRegistry.size > 0;
+
+  addDebugLog("DOWNSTREAM", `收到 Gemini 格式请求 [${modelName}] - stream=${isStream}`, {
+    model: modelName,
+    stream: isStream,
+    mcpEnabled,
+    messagesCount: openAiMessages.length
+  });
+
+  if (!isStream) {
+    const fakeClientResponse = {
+      _headers: {},
+      _body: "",
+      statusCode: 200,
+      setHeader(k, v) { this._headers[k] = v; },
+      writeHead(code, headers) { this.statusCode = code; Object.assign(this._headers, headers); },
+      write(chunk) { this._body += chunk.toString(); },
+      end(chunk) {
+        if (chunk) this._body += chunk.toString();
+        try {
+          const json = JSON.parse(this._body);
+          const candidateText = json.choices?.[0]?.message?.content || "";
+          const geminiResp = {
+            candidates: [
+              {
+                content: { parts: [{ text: candidateText }], role: "model" },
+                finishReason: "STOP",
+                index: 0
+              }
+            ]
+          };
+          sendJson(clientResponse, 200, geminiResp);
+        } catch {
+          sendJson(clientResponse, 500, { error: { message: "Gemini 响应解析失败" } });
+        }
+      }
+    };
+    if (mcpEnabled) {
+      await runAgent(openAiBody, fakeClientResponse, reqMeta);
+    } else {
+      await passThrough(openAiBody, fakeClientResponse, reqMeta);
+    }
+    return;
+  }
+
+  // 流式转换
+  setCorsHeaders(clientResponse);
+  clientResponse.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive"
+  });
+
+  let buffer = "";
+  const fakeStreamClientResponse = {
+    _headers: {},
+    setHeader(k, v) { this._headers[k] = v; },
+    writeHead(code, headers) { Object.assign(this._headers, headers); },
+    write(chunk) {
+      buffer += chunk.toString();
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith("data:")) continue;
+        const dataStr = trimmed.slice(5).trim();
+        if (dataStr === "[DONE]") {
+          clientResponse.write("data: [DONE]\n\n");
+          continue;
+        }
+        try {
+          const parsed = JSON.parse(dataStr);
+          const geminiChunk = convertOpenAiChunkToGemini(parsed);
+          clientResponse.write(`data: ${JSON.stringify(geminiChunk)}\n\n`);
+        } catch {}
+      }
+    },
+    end() {
+      clientResponse.end();
+    }
+  };
+
+  if (mcpEnabled) {
+    await runAgent(openAiBody, fakeStreamClientResponse, reqMeta);
+  } else {
+    await passThrough(openAiBody, fakeStreamClientResponse, reqMeta);
+  }
 }
 
 async function runAgent(requestBody, clientResponse, reqMeta) {
@@ -1297,6 +1474,29 @@ const server = http.createServer(async (request, response) => {
         sendJson(response, 200, { success: true });
         return;
       }
+    }
+
+    // Google Gemini 官方格式路由: /v1beta/models/...
+    const geminiMatch = reqUrl.pathname.match(/^\/v1beta\/models\/([^:]+):(generateContent|streamGenerateContent)$/);
+    if (geminiMatch) {
+      if (!isProxyAuthorized(request)) {
+        const authHeader = request.headers.authorization || request.headers["x-goog-api-key"] || reqUrl.searchParams.get("key") || "(无 Auth 凭证)";
+        sendOpenAIError(response, 401, "API Key 错误", "authentication_error", {
+          path: reqUrl.pathname,
+          method: request.method,
+          clientIp: request.headers["x-forwarded-for"] || request.socket.remoteAddress,
+          receivedAuth: authHeader.length > 20 ? authHeader.slice(0, 15) + "..." : authHeader
+        });
+        return;
+      }
+
+      const modelName = decodeURIComponent(geminiMatch[1]);
+      const action = geminiMatch[2];
+      const isStream = action === "streamGenerateContent" || reqUrl.searchParams.get("alt") === "sse";
+      const body = await readRequestBody(request);
+
+      await handleGeminiGenerateContent(modelName, isStream, body, response, { ip: request.socket.remoteAddress });
+      return;
     }
 
     // 只有 /v1/ 下的 OpenAI 客户端接口才进行 PROXY_API_KEY 校验
