@@ -1378,9 +1378,13 @@ function getLoginHtml() {
 </html>`;
 }
 
-async function handleGeminiNativePassThrough(reqUrl, request, response) {
+function resolveUpstreamBase() {
+  return UPSTREAM_BASE_URL.replace(/\/+$/, "").replace(/\/v1$/, "");
+}
+
+async function handleGeminiNativePassThrough(reqUrl, request, response, customBody) {
   setCorsHeaders(response);
-  const upstreamBase = UPSTREAM_BASE_URL.replace(/\/v1$/, "");
+  const upstreamBase = resolveUpstreamBase();
   const targetUrl = `${upstreamBase}${reqUrl.pathname}${reqUrl.search}`;
 
   const headers = {
@@ -1394,10 +1398,14 @@ async function handleGeminiNativePassThrough(reqUrl, request, response) {
   const upstreamRes = await fetch(targetUrl, {
     method: request.method,
     headers,
-    body: ["POST", "PUT", "PATCH"].includes(request.method) ? request : undefined,
+    body: customBody ? JSON.stringify(customBody) : (["POST", "PUT", "PATCH"].includes(request.method) ? request : undefined),
     duplex: "half",
     signal: AbortSignal.timeout(300000)
   });
+
+  if (!upstreamRes.ok) {
+    throw new Error(`Upstream Gemini endpoint status ${upstreamRes.status}`);
+  }
 
   response.writeHead(upstreamRes.status, {
     "Content-Type": upstreamRes.headers.get("Content-Type") || "application/json",
@@ -1695,18 +1703,17 @@ const server = http.createServer(async (request, response) => {
 
       const rawModel = decodeURIComponent(geminiMatch[1]);
       const modelName = rawModel.replace(/^models\//, "");
+      const action = geminiMatch[2];
+      const isStream = action === "streamGenerateContent";
+      const geminiBody = await readRequestBody(request);
 
       if (!isModelEnabledForMcp(modelName) || mcpToolRegistry.size === 0) {
         try {
-          await handleGeminiNativePassThrough(reqUrl, request, response);
+          await handleGeminiNativePassThrough(reqUrl, request, response, geminiBody);
           return;
         } catch {}
       }
 
-      const action = geminiMatch[2];
-      const isStream = action === "streamGenerateContent";
-
-      const geminiBody = await readRequestBody(request);
       const openAiBody = convertGeminiToOpenAiRequest(geminiBody, modelName, isStream);
 
       const targetAdapter = isStream
@@ -1757,12 +1764,11 @@ const server = http.createServer(async (request, response) => {
       }
 
       const body = await readRequestBody(request);
-      const normalizedBody = normalizeReasoningPayload(body);
 
-      if (isModelEnabledForMcp(normalizedBody.model) && mcpToolRegistry.size > 0) {
-        await runAgent(normalizedBody, response);
+      if (isModelEnabledForMcp(body.model) && mcpToolRegistry.size > 0) {
+        await runAgent(body, response);
       } else {
-        await passThrough(normalizedBody, response);
+        await passThrough(body, response);
       }
       return;
     }
