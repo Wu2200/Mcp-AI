@@ -216,6 +216,47 @@
       border-color: #dc2626;
     }
 
+    /* 服务列表小巧紧凑按钮 */
+    .server-btn {
+      border: 1px solid transparent;
+      padding: 3px 8px;
+      font-size: 12px;
+      font-weight: 500;
+      border-radius: 4px;
+      cursor: pointer;
+      white-space: nowrap;
+      flex: none;
+      line-height: 1.4;
+      transition: all 0.15s;
+    }
+    .server-btn-stop {
+      background: #fffbeb;
+      color: #b45309;
+      border-color: #fde68a;
+    }
+    .server-btn-stop:hover {
+      background: #fef3c7;
+      color: #92400e;
+    }
+    .server-btn-start {
+      background: #f0fdf4;
+      color: #15803d;
+      border-color: #bbf7d0;
+    }
+    .server-btn-start:hover {
+      background: #dcfce7;
+      color: #166534;
+    }
+    .server-btn-del {
+      background: #fef2f2;
+      color: #b91c1c;
+      border-color: #fecaca;
+    }
+    .server-btn-del:hover {
+      background: #fee2e2;
+      color: #991b1b;
+    }
+
     .server-item {
       background: #f8fafc;
       border: 1px solid #e2e8f0;
@@ -236,7 +277,6 @@
       align-items: center;
       margin-bottom: 8px;
       gap: 8px;
-      flex-wrap: wrap;
     }
     .server-item-title {
       font-size: 14px;
@@ -403,14 +443,6 @@
         width: 100%;
         padding: 8px 4px;
         font-size: 11px;
-      }
-      .server-item-head {
-        flex-direction: column;
-        align-items: stretch;
-      }
-      .server-item-head .action-row {
-        display: flex;
-        justify-content: flex-end;
       }
     }
   </style>
@@ -779,8 +811,8 @@
             : '<span class="badge badge-gray">已断开</span>';
 
           const toggleActionBtn = isActive
-            ? `<button class="btn-action btn-stop" onclick="handleStop('${s.id}')">断开</button>`
-            : `<button class="btn-action btn-start" onclick="handleStart('${s.id}')">启动</button>`;
+            ? `<button class="server-btn server-btn-stop" onclick="handleStop('${s.id}')">断开</button>`
+            : `<button class="server-btn server-btn-start" onclick="handleStart('${s.id}')">启动</button>`;
 
           let tags = s.tools.map(t => '<span class="tag">' + t.key + '</span>').join("");
 
@@ -791,9 +823,9 @@
                   <span class="server-name-text">${s.name}</span>
                   ${statusBadge}
                 </div>
-                <div class="action-row" style="width: auto;">
+                <div style="display: flex; gap: 6px; align-items: center;">
                   ${toggleActionBtn}
-                  <button class="btn-action btn-del" onclick="handleDelete('${s.id}')">删除</button>
+                  <button class="server-btn server-btn-del" onclick="handleDelete('${s.id}')">删除</button>
                 </div>
               </div>
               <div class="server-item-url">${s.url}</div>
