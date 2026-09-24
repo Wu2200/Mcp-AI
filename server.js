@@ -264,13 +264,22 @@ function sendOpenAIError(response, statusCode, message, type = "invalid_request_
   sendJson(response, statusCode, { error: { message, type, code: null } });
 }
 
-function isProxyAuthorized(request) {
+function isProxyAuthorized(request, reqUrl) {
   if (!PROXY_API_KEY) return true;
   const authorization = request.headers.authorization || "";
   const token = authorization.startsWith("Bearer ")
     ? authorization.slice(7).trim()
     : authorization.trim();
-  return token === PROXY_API_KEY;
+  if (token === PROXY_API_KEY) return true;
+
+  const googApiKey = (request.headers["x-goog-api-key"] || "").trim();
+  if (googApiKey === PROXY_API_KEY) return true;
+
+  if (reqUrl) {
+    const queryKey = (reqUrl.searchParams.get("key") || "").trim();
+    if (queryKey === PROXY_API_KEY) return true;
+  }
+  return false;
 }
 
 function isPanelAuthorized(request) {
@@ -542,7 +551,6 @@ function toolArguments(toolCall) {
   }
 }
 
-// 统一包装为 Chatbox / OpenAI 客户端可安全解析的标准 SSE Chunk
 function sendSSEChunk(clientResponse, delta, model = "default") {
   const chunk = {
     id: `chatcmpl-${Date.now()}`,
@@ -656,7 +664,6 @@ async function runAgent(requestBody, clientResponse) {
     });
   }
 
-  // 客户端兼容的合法 SSE 保活心跳：输出空 delta，所有客户端均合法兼容且永不掐线
   let keepAliveTimer = null;
   if (isStream) {
     keepAliveTimer = setInterval(() => {
@@ -802,14 +809,12 @@ async function runAgent(requestBody, clientResponse) {
               }
             }
 
-            // 遇到普通正文内容：实时推给客户端，避免任何超时；若本轮是工具调用，正文不透传以免污染
             if (delta?.content) {
               assistantContent += delta.content;
               if (!hasToolCalls) {
                 clientResponse.write(`${line}\n\n`);
               }
             } else if (delta?.reasoning_content) {
-              // 推送模型原生思考过程给客户端（Chatbox 深度思考展示）
               clientResponse.write(`${line}\n\n`);
             }
           } catch {}
@@ -891,6 +896,211 @@ async function runAgent(requestBody, clientResponse) {
   } finally {
     if (keepAliveTimer) clearInterval(keepAliveTimer);
   }
+}
+
+function convertGeminiToOpenAiRequest(geminiBody, modelName, isStream) {
+  const messages = [];
+
+  if (geminiBody.systemInstruction?.parts) {
+    const sysText = geminiBody.systemInstruction.parts
+      .map((p) => p.text || "")
+      .filter(Boolean)
+      .join("\n");
+    if (sysText) {
+      messages.push({ role: "system", content: sysText });
+    }
+  }
+
+  if (Array.isArray(geminiBody.contents)) {
+    for (const c of geminiBody.contents) {
+      const role = c.role === "model" ? "assistant" : "user";
+      if (!Array.isArray(c.parts)) continue;
+
+      const textParts = [];
+      const contentArray = [];
+      let hasMultiModal = false;
+
+      for (const p of c.parts) {
+        if (p.text) {
+          textParts.push(p.text);
+          contentArray.push({ type: "text", text: p.text });
+        } else if (p.inlineData && p.inlineData.data) {
+          hasMultiModal = true;
+          const mimeType = p.inlineData.mimeType || "image/jpeg";
+          contentArray.push({
+            type: "image_url",
+            image_url: { url: `data:${mimeType};base64,${p.inlineData.data}` }
+          });
+        }
+      }
+
+      if (hasMultiModal) {
+        messages.push({ role, content: contentArray });
+      } else {
+        messages.push({ role, content: textParts.join("\n") });
+      }
+    }
+  }
+
+  const openAiBody = {
+    model: modelName,
+    messages,
+    stream: isStream
+  };
+
+  if (geminiBody.generationConfig) {
+    const gc = geminiBody.generationConfig;
+    if (gc.temperature !== undefined) openAiBody.temperature = gc.temperature;
+    if (gc.maxOutputTokens !== undefined) openAiBody.max_tokens = gc.maxOutputTokens;
+    if (gc.topP !== undefined) openAiBody.top_p = gc.topP;
+    if (gc.stopSequences && Array.isArray(gc.stopSequences)) openAiBody.stop = gc.stopSequences;
+  }
+
+  return openAiBody;
+}
+
+function convertOpenAiToGeminiResponse(openAiJson, modelName) {
+  const choice = openAiJson.choices?.[0];
+  const contentText = choice?.message?.content || "";
+  const finishReason = choice?.finish_reason;
+  let geminiFinishReason = "STOP";
+  if (finishReason === "length") geminiFinishReason = "MAX_TOKENS";
+
+  return {
+    candidates: [
+      {
+        content: {
+          parts: [{ text: contentText }],
+          role: "model"
+        },
+        finishReason: geminiFinishReason,
+        index: 0
+      }
+    ],
+    usageMetadata: {
+      promptTokenCount: openAiJson.usage?.prompt_tokens || 0,
+      candidatesTokenCount: openAiJson.usage?.completion_tokens || 0,
+      totalTokenCount: openAiJson.usage?.total_tokens || 0
+    },
+    modelVersion: modelName
+  };
+}
+
+function createGeminiStreamAdapter(clientResponse, modelName) {
+  setCorsHeaders(clientResponse);
+  clientResponse.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no"
+  });
+
+  let buffer = "";
+
+  return {
+    headersSent: true,
+    setHeader(name, value) {
+      try {
+        clientResponse.setHeader(name, value);
+      } catch {}
+    },
+    writeHead(code, headers) {},
+    write(chunk) {
+      const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      buffer += text;
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith("data:")) continue;
+        const dataStr = trimmed.slice(5).trim();
+        if (dataStr === "[DONE]") {
+          const finishChunk = {
+            candidates: [
+              {
+                content: { parts: [], role: "model" },
+                finishReason: "STOP",
+                index: 0
+              }
+            ],
+            modelVersion: modelName
+          };
+          clientResponse.write(`data: ${JSON.stringify(finishChunk)}\n\n`);
+          continue;
+        }
+
+        try {
+          const parsed = JSON.parse(dataStr);
+          const delta = parsed.choices?.[0]?.delta;
+          const content = delta?.content || delta?.reasoning_content || "";
+          if (content) {
+            const geminiChunk = {
+              candidates: [
+                {
+                  content: {
+                    parts: [{ text: content }],
+                    role: "model"
+                  },
+                  index: 0
+                }
+              ],
+              modelVersion: modelName
+            };
+            clientResponse.write(`data: ${JSON.stringify(geminiChunk)}\n\n`);
+          }
+        } catch {}
+      }
+      return true;
+    },
+    end(chunk) {
+      if (chunk) {
+        this.write(chunk);
+      }
+      clientResponse.end();
+    }
+  };
+}
+
+function createGeminiNonStreamAdapter(clientResponse, modelName) {
+  let accumulatedBody = "";
+  let statusCode = 200;
+
+  return {
+    headersSent: false,
+    setHeader(name, value) {
+      setCorsHeaders(clientResponse);
+    },
+    writeHead(code, headers) {
+      statusCode = code;
+    },
+    write(chunk) {
+      accumulatedBody += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      return true;
+    },
+    end(chunk) {
+      if (chunk) accumulatedBody += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      try {
+        const openAiJson = JSON.parse(accumulatedBody);
+        if (openAiJson.error) {
+          sendJson(clientResponse, statusCode, {
+            error: {
+              code: statusCode,
+              message: openAiJson.error.message || "Request failed",
+              status: "INVALID_ARGUMENT"
+            }
+          });
+          return;
+        }
+        const geminiJson = convertOpenAiToGeminiResponse(openAiJson, modelName);
+        sendJson(clientResponse, 200, geminiJson);
+      } catch (e) {
+        sendJson(clientResponse, statusCode, {
+          error: { code: statusCode, message: accumulatedBody || e.message, status: "INTERNAL" }
+        });
+      }
+    }
+  };
 }
 
 function getLoginHtml() {
@@ -1157,8 +1367,111 @@ const server = http.createServer(async (request, response) => {
       }
     }
 
-    if (!isProxyAuthorized(request)) {
-      sendOpenAIError(response, 401, "API Key 错误", "authentication_error");
+    if (!isProxyAuthorized(request, reqUrl)) {
+      if (
+        reqUrl.pathname.startsWith("/v1beta/") ||
+        reqUrl.pathname.includes(":generateContent") ||
+        reqUrl.pathname.includes(":streamGenerateContent")
+      ) {
+        sendJson(response, 401, {
+          error: { code: 401, message: "API key not valid", status: "UNAUTHENTICATED" }
+        });
+      } else {
+        sendOpenAIError(response, 401, "API Key 错误", "authentication_error");
+      }
+      return;
+    }
+
+    if (
+      request.method === "GET" &&
+      (reqUrl.pathname === "/v1beta/models" ||
+        (reqUrl.pathname === "/v1/models" &&
+          (request.headers["x-goog-api-key"] || reqUrl.searchParams.has("key"))))
+    ) {
+      let modelList = [];
+      if (UPSTREAM_BASE_URL && UPSTREAM_API_KEY) {
+        const modelsUrl = UPSTREAM_BASE_URL.endsWith("/v1")
+          ? `${UPSTREAM_BASE_URL}/models`
+          : `${UPSTREAM_BASE_URL}/v1/models`;
+
+        try {
+          const upstreamResponse = await fetch(modelsUrl, {
+            headers: { Authorization: `Bearer ${UPSTREAM_API_KEY}` },
+            signal: AbortSignal.timeout(10000)
+          });
+          const data = await upstreamResponse.json();
+          if (Array.isArray(data.data)) {
+            modelList = data.data.map((m) => m.id).filter(Boolean);
+          }
+        } catch {}
+      }
+      if (modelList.length === 0) {
+        modelList = ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-1.5-pro", "gemini-1.5-flash", "default"];
+      }
+
+      const geminiModels = modelList.map((id) => ({
+        name: id.startsWith("models/") ? id : `models/${id}`,
+        version: "1.0",
+        displayName: id.replace(/^models\//, ""),
+        description: `Model ${id} via Mcp-AI Proxy`,
+        supportedGenerationMethods: ["generateContent", "streamGenerateContent", "countTokens"]
+      }));
+
+      sendJson(response, 200, { models: geminiModels });
+      return;
+    }
+
+    const geminiModelMatch = reqUrl.pathname.match(/^\/(?:v1beta|v1)\/models\/([^:/]+)$/);
+    if (request.method === "GET" && geminiModelMatch) {
+      const modelId = decodeURIComponent(geminiModelMatch[1]);
+      sendJson(response, 200, {
+        name: `models/${modelId}`,
+        version: "1.0",
+        displayName: modelId,
+        description: `Model ${modelId} via Mcp-AI Proxy`,
+        supportedGenerationMethods: ["generateContent", "streamGenerateContent", "countTokens"]
+      });
+      return;
+    }
+
+    const countTokensMatch = reqUrl.pathname.match(/^\/(?:v1beta|v1)\/models\/([^:]+):countTokens$/);
+    if (request.method === "POST" && countTokensMatch) {
+      sendJson(response, 200, { totalTokens: 100 });
+      return;
+    }
+
+    const geminiMatch = reqUrl.pathname.match(
+      /^\/(?:v1beta|v1)\/models\/([^:]+):(generateContent|streamGenerateContent)$/
+    );
+    if (request.method === "POST" && geminiMatch) {
+      if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
+        sendJson(response, 500, {
+          error: {
+            code: 500,
+            message: "服务端未配置环境变量：UPSTREAM_BASE_URL 或 UPSTREAM_API_KEY",
+            status: "INTERNAL"
+          }
+        });
+        return;
+      }
+
+      const rawModel = decodeURIComponent(geminiMatch[1]);
+      const modelName = rawModel.replace(/^models\//, "");
+      const action = geminiMatch[2];
+      const isStream = action === "streamGenerateContent";
+
+      const geminiBody = await readRequestBody(request);
+      const openAiBody = convertGeminiToOpenAiRequest(geminiBody, modelName, isStream);
+
+      const targetAdapter = isStream
+        ? createGeminiStreamAdapter(response, modelName)
+        : createGeminiNonStreamAdapter(response, modelName);
+
+      if (isModelEnabledForMcp(modelName) && mcpToolRegistry.size > 0) {
+        await runAgent(openAiBody, targetAdapter);
+      } else {
+        await passThrough(openAiBody, targetAdapter);
+      }
       return;
     }
 
