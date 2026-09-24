@@ -821,15 +821,8 @@ async function runAgent(requestBody, clientResponse) {
         messages.push(message);
 
         for (const tc of mcpCalls) {
-          let toolInfo = mcpToolRegistry.get(tc.function.name);
-          if (!toolInfo) {
-            for (const [k, v] of mcpToolRegistry.entries()) {
-              if (k.endsWith(tc.function.name) || tc.function.name.endsWith(v.rawName)) {
-                toolInfo = v;
-                break;
-              }
-            }
-          }
+          const callId = tc.id || `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+          tc.id = callId;
           const args = toolArguments(tc);
           appendLog("info", "RUN-AGENT", `非流式执行工具: ${tc.function.name}`);
           let result;
@@ -840,7 +833,7 @@ async function runAgent(requestBody, clientResponse) {
           }
           messages.push({
             role: "tool",
-            tool_call_id: tc.id,
+            tool_call_id: callId,
             content: typeof result === "string" ? result : JSON.stringify(result)
           });
         }
@@ -853,6 +846,8 @@ async function runAgent(requestBody, clientResponse) {
       let accumulatedToolCalls = [];
       let assistantContent = "";
       let hasToolCalls = false;
+      let roundReasoningText = "";
+      let roundContentText = "";
 
       while (true) {
         const { done, value } = await reader.read();
@@ -877,8 +872,9 @@ async function runAgent(requestBody, clientResponse) {
               for (const tc of delta.tool_calls) {
                 const index = tc.index ?? 0;
                 if (!accumulatedToolCalls[index]) {
+                  const fallbackId = `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
                   accumulatedToolCalls[index] = {
-                    id: tc.id || `call_${crypto.randomUUID()}`,
+                    id: tc.id || fallbackId,
                     name: tc.function?.name || "",
                     arguments: ""
                   };
@@ -891,9 +887,11 @@ async function runAgent(requestBody, clientResponse) {
 
             const reasoningPart = extractReasoningText(delta);
             if (reasoningPart) {
+              roundReasoningText += reasoningPart;
               clientResponse.write(`${line}\n\n`);
             } else if (delta?.content) {
               assistantContent += delta.content;
+              roundContentText += delta.content;
               if (!hasToolCalls) {
                 clientResponse.write(`${line}\n\n`);
               }
@@ -903,6 +901,8 @@ async function runAgent(requestBody, clientResponse) {
           } catch {}
         }
       }
+
+      appendLog("info", "RUN-AGENT", `第 ${round + 1} 轮传输结束: 正文=${roundContentText.length}字, 思考=${roundReasoningText.length}字, 是否有工具调用=${hasToolCalls}`);
 
       const mcpCalls = accumulatedToolCalls.filter((tc) => {
         if (!tc || !tc.name) return false;
@@ -923,7 +923,7 @@ async function runAgent(requestBody, clientResponse) {
         role: "assistant",
         content: assistantContent || null,
         tool_calls: mcpCalls.map((tc) => ({
-          id: tc.id || `call_${crypto.randomUUID()}`,
+          id: tc.id,
           type: "function",
           function: { name: tc.name, arguments: tc.arguments }
         }))
@@ -971,7 +971,7 @@ async function runAgent(requestBody, clientResponse) {
 
         messages.push({
           role: "tool",
-          tool_call_id: tc.id || `call_${crypto.randomUUID()}`,
+          tool_call_id: tc.id,
           content: typeof result === "string" ? result : JSON.stringify(result)
         });
       }
@@ -1021,7 +1021,7 @@ function convertGeminiToOpenAiRequest(geminiBody, modelName, isStream) {
             role: "assistant",
             tool_calls: [
               {
-                id: `call_${crypto.randomUUID()}`,
+                id: `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`,
                 type: "function",
                 function: {
                   name: p.functionCall.name,
@@ -1033,7 +1033,7 @@ function convertGeminiToOpenAiRequest(geminiBody, modelName, isStream) {
         } else if (p.functionResponse) {
           messages.push({
             role: "tool",
-            tool_call_id: `call_${crypto.randomUUID()}`,
+            tool_call_id: `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`,
             content: JSON.stringify(p.functionResponse.response || {})
           });
         }
@@ -1126,17 +1126,19 @@ function convertOpenAiToGeminiResponse(openAiJson, modelName) {
   if (finishReason === "length") geminiFinishReason = "MAX_TOKENS";
   if (finishReason === "tool_calls") geminiFinishReason = "STOP";
 
+  const candidate = {
+    index: 0,
+    finishReason: geminiFinishReason
+  };
+  if (parts.length > 0) {
+    candidate.content = {
+      parts,
+      role: "model"
+    };
+  }
+
   return {
-    candidates: [
-      {
-        content: {
-          parts,
-          role: "model"
-        },
-        finishReason: geminiFinishReason,
-        index: 0
-      }
-    ],
+    candidates: [candidate],
     usageMetadata: {
       promptTokenCount: openAiJson.usage?.prompt_tokens || 0,
       candidatesTokenCount: openAiJson.usage?.completion_tokens || 0,
@@ -1156,7 +1158,6 @@ function createGeminiStreamAdapter(clientResponse, modelName) {
   });
 
   let buffer = "";
-  let insideThoughtBlock = false;
 
   return {
     headersSent: true,
@@ -1177,17 +1178,6 @@ function createGeminiStreamAdapter(clientResponse, modelName) {
         if (!trimmed || !trimmed.startsWith("data:")) continue;
         const dataStr = trimmed.slice(5).trim();
         if (dataStr === "[DONE]") {
-          const finishChunk = {
-            candidates: [
-              {
-                content: { parts: [], role: "model" },
-                finishReason: "STOP",
-                index: 0
-              }
-            ],
-            modelVersion: modelName
-          };
-          clientResponse.write(`data: ${JSON.stringify(finishChunk)}\n\n`);
           continue;
         }
 
@@ -1210,30 +1200,10 @@ function createGeminiStreamAdapter(clientResponse, modelName) {
           }
 
           if (delta?.content) {
-            let contentText = delta.content;
-
-            if (!insideThoughtBlock && contentText.includes("<thought>")) {
-              const [before, after] = contentText.split("<thought>");
-              if (before) parts.push({ text: before });
-              insideThoughtBlock = true;
-              contentText = after || "";
-            }
-
-            if (insideThoughtBlock) {
-              if (contentText.includes("</thought>")) {
-                const [thoughtPart, remaining] = contentText.split("</thought>");
-                if (thoughtPart) parts.push({ text: thoughtPart, thought: true });
-                insideThoughtBlock = false;
-                if (remaining) parts.push({ text: remaining });
-              } else {
-                if (contentText) parts.push({ text: contentText, thought: true });
-              }
-            } else {
-              if (contentText) parts.push({ text: contentText });
-            }
+            parts.push({ text: delta.content });
           }
 
-          if (parts.length > 0 || finishReason) {
+          if (parts.length > 0) {
             const geminiChunk = {
               candidates: [
                 {
@@ -1241,13 +1211,26 @@ function createGeminiStreamAdapter(clientResponse, modelName) {
                     parts,
                     role: "model"
                   },
-                  finishReason: finishReason === "length" ? "MAX_TOKENS" : (finishReason ? "STOP" : undefined),
                   index: 0
                 }
               ],
               modelVersion: modelName
             };
+            if (finishReason) {
+              geminiChunk.candidates[0].finishReason = finishReason === "length" ? "MAX_TOKENS" : "STOP";
+            }
             clientResponse.write(`data: ${JSON.stringify(geminiChunk)}\n\n`);
+          } else if (finishReason) {
+            const geminiFinishChunk = {
+              candidates: [
+                {
+                  finishReason: finishReason === "length" ? "MAX_TOKENS" : "STOP",
+                  index: 0
+                }
+              ],
+              modelVersion: modelName
+            };
+            clientResponse.write(`data: ${JSON.stringify(geminiFinishChunk)}\n\n`);
           }
         } catch {}
       }
@@ -1256,6 +1239,27 @@ function createGeminiStreamAdapter(clientResponse, modelName) {
     end(chunk) {
       if (chunk) {
         this.write(chunk);
+      }
+      if (buffer.trim()) {
+        const line = buffer.trim();
+        if (line.startsWith("data:") && !line.includes("[DONE]")) {
+          try {
+            const parsed = JSON.parse(line.slice(5).trim());
+            const delta = parsed.choices?.[0]?.delta;
+            if (delta?.content) {
+              const geminiChunk = {
+                candidates: [
+                  {
+                    content: { parts: [{ text: delta.content }], role: "model" },
+                    index: 0
+                  }
+                ],
+                modelVersion: modelName
+              };
+              clientResponse.write(`data: ${JSON.stringify(geminiChunk)}\n\n`);
+            }
+          } catch {}
+        }
       }
       clientResponse.end();
     }
