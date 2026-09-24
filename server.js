@@ -21,6 +21,30 @@ const mcpServers = new Map();
 const mcpToolRegistry = new Map();
 let enabledModels = new Set();
 
+let loggingEnabled = true;
+const MAX_LOGS = 200;
+const debugLogs = [];
+
+function addDebugLog(type, summary, detail = "") {
+  if (!loggingEnabled) return;
+  const now = new Date();
+  const time =
+    now.toLocaleTimeString("zh-CN", { hour12: false }) +
+    "." +
+    String(now.getMilliseconds()).padStart(3, "0");
+  const entry = {
+    id: `log_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    time,
+    type,
+    summary,
+    detail: typeof detail === "object" ? JSON.stringify(detail, null, 2) : String(detail)
+  };
+  debugLogs.push(entry);
+  if (debugLogs.length > MAX_LOGS) {
+    debugLogs.shift();
+  }
+}
+
 const SESSION_SECRET = PANEL_PASSWORD
   ? crypto.createHash("sha256").update(`mcp-proxy-session:${PANEL_PASSWORD}`).digest("hex")
   : crypto.randomBytes(32).toString("hex");
@@ -93,6 +117,32 @@ async function initDatabase() {
   }
 }
 
+async function saveLoggingConfigToStorage(enabled) {
+  loggingEnabled = enabled;
+  if (pgPool) {
+    try {
+      await pgPool.query(
+        `INSERT INTO mcp_settings (key, value, updated_at)
+         VALUES ('logging_enabled', $1, CURRENT_TIMESTAMP)
+         ON CONFLICT (key) DO UPDATE SET
+           value = EXCLUDED.value,
+           updated_at = CURRENT_TIMESTAMP`,
+        [JSON.stringify(enabled)]
+      );
+    } catch {}
+  }
+  try {
+    let current = {};
+    if (fs.existsSync(SETTINGS_FILE)) {
+      try {
+        current = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf8"));
+      } catch {}
+    }
+    current.loggingEnabled = enabled;
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(current, null, 2), "utf8");
+  } catch {}
+}
+
 async function saveEnabledModelsToStorage(modelsArray) {
   enabledModels = new Set(modelsArray);
   if (pgPool) {
@@ -108,18 +158,30 @@ async function saveEnabledModelsToStorage(modelsArray) {
     } catch {}
   }
   try {
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify({ enabledModels: modelsArray }, null, 2), "utf8");
+    let current = {};
+    if (fs.existsSync(SETTINGS_FILE)) {
+      try {
+        current = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf8"));
+      } catch {}
+    }
+    current.enabledModels = modelsArray;
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(current, null, 2), "utf8");
   } catch {}
 }
 
-async function loadEnabledModelsFromStorage() {
+async function loadSettingsFromStorage() {
   if (pgPool) {
     try {
-      const res = await pgPool.query("SELECT value FROM mcp_settings WHERE key = 'enabled_models' LIMIT 1");
+      const res = await pgPool.query("SELECT key, value FROM mcp_settings WHERE key IN ('enabled_models', 'logging_enabled')");
       if (res.rows && res.rows.length > 0) {
-        const val = res.rows[0].value;
-        const list = Array.isArray(val) ? val : (typeof val === "string" ? JSON.parse(val) : []);
-        enabledModels = new Set(list);
+        for (const r of res.rows) {
+          if (r.key === "enabled_models") {
+            const list = Array.isArray(r.value) ? r.value : (typeof r.value === "string" ? JSON.parse(r.value) : []);
+            enabledModels = new Set(list);
+          } else if (r.key === "logging_enabled") {
+            loggingEnabled = r.value !== false && r.value !== "false";
+          }
+        }
         return;
       }
     } catch {}
@@ -131,6 +193,9 @@ async function loadEnabledModelsFromStorage() {
       const data = JSON.parse(raw);
       if (Array.isArray(data.enabledModels)) {
         enabledModels = new Set(data.enabledModels);
+      }
+      if (data.loggingEnabled !== undefined) {
+        loggingEnabled = data.loggingEnabled === true;
       }
     } catch {}
   }
@@ -261,6 +326,7 @@ function sendJson(response, statusCode, body) {
 }
 
 function sendOpenAIError(response, statusCode, message, type = "invalid_request_error") {
+  addDebugLog("ERROR", `返回客户端错误 (${statusCode}): ${message}`, { statusCode, message, type });
   sendJson(response, statusCode, { error: { message, type, code: null } });
 }
 
@@ -433,12 +499,13 @@ async function connectToMcpServer({ name, url, token }) {
 
   mcpServers.set(serverId, serverInfo);
   await saveServerToStorage(serverInfo);
+  addDebugLog("TOOL", `成功挂载 MCP 服务: ${name}`, { serverId, url: cleanUrl, toolCount: registeredTools.length });
   return serverInfo;
 }
 
 function extractMcpResultContent(data) {
   if (!data) return "{}";
-  if (typeof data === "string") return data;
+  let contentStr = "";
 
   const rawResult = data.result !== undefined ? data.result : data;
   if (!rawResult) return "{}";
@@ -465,17 +532,30 @@ function extractMcpResultContent(data) {
       }
     }
     if (pieces.length > 0) {
-      return pieces.join("\n\n");
+      contentStr = pieces.join("\n\n");
     }
   }
 
-  if (rawResult.content && rawResult.encoding === "base64" && typeof rawResult.content === "string") {
+  if (!contentStr && rawResult.content && rawResult.encoding === "base64" && typeof rawResult.content === "string") {
     try {
-      return Buffer.from(rawResult.content, "base64").toString("utf8");
+      contentStr = Buffer.from(rawResult.content, "base64").toString("utf8");
     } catch {}
   }
 
-  return typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult, null, 2);
+  if (!contentStr) {
+    contentStr = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult, null, 2);
+  }
+
+  // 关键保护：单次工具输出最大限制 10000 字符，保留前后有效信息，防止撑爆大模型上下文导致截断或 400 报错
+  const MAX_TOOL_CHARS = 10000;
+  if (contentStr.length > MAX_TOOL_CHARS) {
+    const head = contentStr.slice(0, 7500);
+    const tail = contentStr.slice(-2000);
+    const originLen = contentStr.length;
+    contentStr = `${head}\n\n[⚠️ 系统截断提示：工具返回内容过大(共 ${originLen} 字符)，为防止超出模型上下文导致响应中断，已智能截取关键首尾部分]\n\n${tail}`;
+  }
+
+  return contentStr;
 }
 
 async function callMcpTool(toolKey, args) {
@@ -490,6 +570,7 @@ async function callMcpTool(toolKey, args) {
   }
   if (!info) throw new Error(`未找到工具：${toolKey}`);
 
+  const startTime = Date.now();
   const res = await fetch(info.postEndpoint, {
     method: "POST",
     headers: info.headers,
@@ -502,15 +583,25 @@ async function callMcpTool(toolKey, args) {
     signal: AbortSignal.timeout(60000)
   });
 
+  const duration = Date.now() - startTime;
   if (!res.ok) {
     const txt = await res.text();
+    addDebugLog("ERROR", `MCP 工具 [${toolKey}] 执行失败 (${res.status}) - 耗时 ${duration}ms`, { error: txt });
     throw new Error(`执行失败 (${res.status}): ${txt.slice(0, 300)}`);
   }
 
   const data = await parseMcpResponse(res);
-  if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
+  if (data.error) {
+    addDebugLog("ERROR", `MCP 工具 [${toolKey}] 报错 - 耗时 ${duration}ms`, data.error);
+    throw new Error(data.error.message || JSON.stringify(data.error));
+  }
 
-  return extractMcpResultContent(data);
+  const resultText = extractMcpResultContent(data);
+  addDebugLog("TOOL", `MCP 工具 [${toolKey}] 执行成功 - 耗时 ${duration}ms, 输出 ${resultText.length} 字符`, {
+    arguments: args,
+    outputPreview: resultText.slice(0, 500)
+  });
+  return resultText;
 }
 
 function getAllTools() {
@@ -542,7 +633,6 @@ function toolArguments(toolCall) {
   }
 }
 
-// 统一包装为 Chatbox / OpenAI 客户端可安全解析的标准 SSE Chunk
 function sendSSEChunk(clientResponse, delta, model = "default") {
   const chunk = {
     id: `chatcmpl-${Date.now()}`,
@@ -564,8 +654,17 @@ function sendReasoningChunk(clientResponse, text, model = "default") {
   sendSSEChunk(clientResponse, { reasoning_content: text }, model);
 }
 
-async function passThrough(requestBody, clientResponse) {
+async function passThrough(requestBody, clientResponse, reqMeta) {
+  const startTime = Date.now();
   setCorsHeaders(clientResponse);
+
+  addDebugLog("UPSTREAM", `[直通模式] 转发请求至上游: ${requestBody.model || "default"}`, {
+    url: upstreamChatCompletionsUrl(),
+    model: requestBody.model,
+    stream: requestBody.stream,
+    messagesCount: requestBody.messages?.length || 0
+  });
+
   const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
     method: "POST",
     headers: {
@@ -574,6 +673,12 @@ async function passThrough(requestBody, clientResponse) {
     },
     body: JSON.stringify(requestBody),
     signal: AbortSignal.timeout(300000)
+  });
+
+  const duration = Date.now() - startTime;
+  addDebugLog("UPSTREAM", `[直通模式] 上游响应状态: ${upstreamResponse.status} - 耗时 ${duration}ms`, {
+    status: upstreamResponse.status,
+    contentType: upstreamResponse.headers.get("Content-Type")
   });
 
   clientResponse.writeHead(upstreamResponse.status, {
@@ -614,11 +719,11 @@ function buildHostEnvironmentSystemMessage() {
   const beijingTime = now.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
   return [
     `[System Environment] Current Time: ${beijingTime} (UTC+8).`,
-    `Tool Usage Rule: Strictly execute tools relevant to the target platform (e.g. use GitHub tools only for GitHub repositories). Never attempt workarounds or execute unrelated tools.`
+    `Tool Usage Rule: Strictly execute tools relevant to the user request. Once tool results are retrieved, analyze them and provide a complete final response. Avoid infinite or repetitive tool loops.`
   ].join("\n");
 }
 
-async function runAgent(requestBody, clientResponse) {
+async function runAgent(requestBody, clientResponse, reqMeta) {
   if (!Array.isArray(requestBody.messages) || requestBody.messages.length === 0) {
     throw new Error("messages 必须是非空数组");
   }
@@ -646,6 +751,14 @@ async function runAgent(requestBody, clientResponse) {
   const mcpTools = getAllTools();
   const tools = [...clientTools, ...mcpTools];
 
+  addDebugLog("AGENT", `启动 MCP 调度 - 模型 [${requestBody.model}] - 挂载工具数: ${tools.length}`, {
+    model: requestBody.model,
+    stream: isStream,
+    mcpToolCount: mcpTools.length,
+    clientToolCount: clientTools.length,
+    initialMessages: messages.length
+  });
+
   if (isStream) {
     setCorsHeaders(clientResponse);
     clientResponse.writeHead(200, {
@@ -656,18 +769,21 @@ async function runAgent(requestBody, clientResponse) {
     });
   }
 
-  // 客户端兼容的合法 SSE 保活心跳：输出空 delta，所有客户端均合法兼容且永不掐线
+  // 标准 SSE 注释保活心跳：绝不破坏下游客户端的 JSON 解析，同时确保反代连接永不断开
   let keepAliveTimer = null;
   if (isStream) {
     keepAliveTimer = setInterval(() => {
       try {
-        sendSSEChunk(clientResponse, {}, requestBody.model || "default");
+        clientResponse.write(": keep-alive\n\n");
       } catch {}
-    }, 5000);
+    }, 4000);
   }
 
+  let finalFinishReason = null;
+  const MAX_ROUNDS = 15;
+
   try {
-    for (let round = 0; round < 100; round += 1) {
+    for (let round = 0; round < MAX_ROUNDS; round += 1) {
       const payload = {
         ...requestBody,
         messages,
@@ -679,6 +795,13 @@ async function runAgent(requestBody, clientResponse) {
         payload.tool_choice = "auto";
       }
 
+      const roundStartTime = Date.now();
+      addDebugLog("UPSTREAM", `第 ${round + 1} 轮上游调用请求 - 消息量: ${messages.length}`, {
+        round: round + 1,
+        toolsEnabled: Boolean(payload.tools),
+        messagesCount: messages.length
+      });
+
       const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
         method: "POST",
         headers: {
@@ -689,8 +812,12 @@ async function runAgent(requestBody, clientResponse) {
         signal: AbortSignal.timeout(300000)
       });
 
+      const roundDuration = Date.now() - roundStartTime;
+
       if (!upstreamResponse.ok) {
-        const err = await upstreamResponse.text();
+        const errText = await upstreamResponse.text();
+        addDebugLog("ERROR", `第 ${round + 1} 轮上游报错 (${upstreamResponse.status}) - 耗时 ${roundDuration}ms`, errText);
+        
         if (isStream) {
           const errorChunk = {
             id: `chatcmpl-${Date.now()}`,
@@ -700,7 +827,7 @@ async function runAgent(requestBody, clientResponse) {
             choices: [
               {
                 index: 0,
-                delta: { content: `\n\n上游返回错误 (${upstreamResponse.status})：${err.slice(0, 500)}` },
+                delta: { content: `\n\n⚠️ [上游接口返回错误 ${upstreamResponse.status}]: ${errText.slice(0, 500)}` },
                 finish_reason: "stop"
               }
             ]
@@ -710,13 +837,20 @@ async function runAgent(requestBody, clientResponse) {
           clientResponse.end();
           return;
         }
-        throw new Error(`上游接口返回错误 (${upstreamResponse.status})：${err.slice(0, 500)}`);
+        throw new Error(`上游接口返回错误 (${upstreamResponse.status})：${errText.slice(0, 500)}`);
       }
 
       if (!isStream) {
         const json = await upstreamResponse.json();
-        const message = json.choices?.[0]?.message;
+        const choice = json.choices?.[0];
+        const message = choice?.message;
         const toolCalls = message?.tool_calls || [];
+        finalFinishReason = choice?.finish_reason;
+
+        if (finalFinishReason === "length") {
+          addDebugLog("ERROR", `⚠️ [截断诊断] 上游因达到最大输出 Token 上限被截断 (finish_reason: length)`, json);
+        }
+
         const mcpCalls = toolCalls.filter((tc) => {
           if (!tc || !tc.function?.name) return false;
           const name = tc.function.name;
@@ -728,6 +862,10 @@ async function runAgent(requestBody, clientResponse) {
         });
 
         if (mcpCalls.length === 0) {
+          addDebugLog("AGENT", `第 ${round + 1} 轮最终完成 - 非流式响应返回客户端`, {
+            finishReason: finalFinishReason,
+            contentLength: message?.content?.length || 0
+          });
           sendJson(clientResponse, 200, json);
           return;
         }
@@ -760,12 +898,14 @@ async function runAgent(requestBody, clientResponse) {
         continue;
       }
 
+      // 流式处理逻辑
       const reader = upstreamResponse.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
       let accumulatedToolCalls = [];
       let assistantContent = "";
       let hasToolCalls = false;
+      let roundFinishReason = null;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -783,7 +923,11 @@ async function runAgent(requestBody, clientResponse) {
 
           try {
             const parsed = JSON.parse(dataStr);
-            const delta = parsed.choices?.[0]?.delta;
+            const choice = parsed.choices?.[0];
+            const delta = choice?.delta;
+            if (choice?.finish_reason) {
+              roundFinishReason = choice.finish_reason;
+            }
 
             if (delta?.tool_calls) {
               hasToolCalls = true;
@@ -802,18 +946,27 @@ async function runAgent(requestBody, clientResponse) {
               }
             }
 
-            // 遇到普通正文内容：实时推给客户端，避免任何超时；若本轮是工具调用，正文不透传以免污染
+            // 遇到正文内容：累计内容
             if (delta?.content) {
               assistantContent += delta.content;
+              // 关键保护：若本轮检测到工具调用，严禁透传草稿正文，防止下游误判提前截断；只有确定无工具调用时直接流式推送
               if (!hasToolCalls) {
                 clientResponse.write(`${line}\n\n`);
               }
             } else if (delta?.reasoning_content) {
-              // 推送模型原生思考过程给客户端（Chatbox 深度思考展示）
+              // 深度思考原生内容透传
               clientResponse.write(`${line}\n\n`);
             }
           } catch {}
         }
+      }
+
+      if (roundFinishReason === "length") {
+        addDebugLog("ERROR", `⚠️ [截断诊断] 第 ${round + 1} 轮上游因达到最大输出 Token 上限被强制截断！(finish_reason: length)`, {
+          round: round + 1,
+          finishReason: roundFinishReason,
+          assistantContentLength: assistantContent.length
+        });
       }
 
       const mcpCalls = accumulatedToolCalls.filter((tc) => {
@@ -825,12 +978,36 @@ async function runAgent(requestBody, clientResponse) {
         return false;
       });
 
+      // 没有工具调用，说明本轮为最终回答轮，正常终结流
       if (mcpCalls.length === 0) {
+        if (roundFinishReason === "length") {
+          const warningChunk = {
+            id: `chatcmpl-${Date.now()}`,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: requestBody.model || "default",
+            choices: [
+              {
+                index: 0,
+                delta: { content: "\n\n⚠️ [代理提示: 上游模型回复因达到最大输出 Token 限制被截断，可输入“继续”]" },
+                finish_reason: "length"
+              }
+            ]
+          };
+          clientResponse.write(`data: ${JSON.stringify(warningChunk)}\n\n`);
+        }
+
         clientResponse.write("data: [DONE]\n\n");
         clientResponse.end();
+        addDebugLog("AGENT", `第 ${round + 1} 轮流式完成输出 - 结束原因: ${roundFinishReason || "stop"}`, {
+          round: round + 1,
+          finishReason: roundFinishReason,
+          totalRounds: round + 1
+        });
         return;
       }
 
+      // 如果有工具调用，记录进入历史
       messages.push({
         role: "assistant",
         content: assistantContent || null,
@@ -887,6 +1064,26 @@ async function runAgent(requestBody, clientResponse) {
       }
     }
 
+    addDebugLog("ERROR", `工具调用轮数达到上限 (${MAX_ROUNDS})，防止死循环而终止`);
+    if (isStream) {
+      const limitChunk = {
+        id: `chatcmpl-${Date.now()}`,
+        object: "chat.completion.chunk",
+        created: Math.floor(Date.now() / 1000),
+        model: requestBody.model || "default",
+        choices: [
+          {
+            index: 0,
+            delta: { content: "\n\n⚠️ [代理提示: 工具调用轮数达到系统上限，已安全中止]" },
+            finish_reason: "stop"
+          }
+        ]
+      };
+      clientResponse.write(`data: ${JSON.stringify(limitChunk)}\n\n`);
+      clientResponse.write("data: [DONE]\n\n");
+      clientResponse.end();
+      return;
+    }
     throw new Error("工具调用轮数达到上限");
   } finally {
     if (keepAliveTimer) clearInterval(keepAliveTimer);
@@ -985,7 +1182,7 @@ function getLoginHtml() {
 
 await initDatabase();
 await loadConfigFromStorage();
-await loadEnabledModelsFromStorage();
+await loadSettingsFromStorage();
 
 const server = http.createServer(async (request, response) => {
   try {
@@ -1052,6 +1249,29 @@ const server = http.createServer(async (request, response) => {
         return;
       }
 
+      // 日志调试接口
+      if (request.method === "GET" && reqUrl.pathname === "/api/logs") {
+        sendJson(response, 200, {
+          enabled: loggingEnabled,
+          logs: debugLogs
+        });
+        return;
+      }
+
+      if (request.method === "POST" && reqUrl.pathname === "/api/logs/toggle") {
+        const body = await readRequestBody(request);
+        const newStatus = typeof body.enabled === "boolean" ? body.enabled : !loggingEnabled;
+        await saveLoggingConfigToStorage(newStatus);
+        sendJson(response, 200, { success: true, enabled: loggingEnabled });
+        return;
+      }
+
+      if (request.method === "POST" && reqUrl.pathname === "/api/logs/clear") {
+        debugLogs.length = 0;
+        sendJson(response, 200, { success: true, logs: [] });
+        return;
+      }
+
       if (request.method === "GET" && reqUrl.pathname === "/api/settings/enabled-models") {
         sendJson(response, 200, { enabledModels: Array.from(enabledModels) });
         return;
@@ -1080,7 +1300,7 @@ const server = http.createServer(async (request, response) => {
             signal: AbortSignal.timeout(10000)
           });
           const data = await upstreamResponse.json();
-          const list = Array.isArray(data.data) ? data.data.map(m => m.id).filter(Boolean) : [];
+          const list = Array.isArray(data.data) ? data.data.map((m) => m.id).filter(Boolean) : [];
           sendJson(response, 200, { models: list });
         } catch (e) {
           sendJson(response, 500, { error: e.message, models: [] });
@@ -1198,17 +1418,28 @@ const server = http.createServer(async (request, response) => {
       }
 
       const body = await readRequestBody(request);
+      const mcpEnabled = isModelEnabledForMcp(body.model) && mcpToolRegistry.size > 0;
+      const lastMsg = Array.isArray(body.messages) ? body.messages[body.messages.length - 1] : null;
 
-      if (isModelEnabledForMcp(body.model) && mcpToolRegistry.size > 0) {
-        await runAgent(body, response);
+      addDebugLog("DOWNSTREAM", `收到客户端请求 [${body.model || "default"}] - stream=${body.stream === true}`, {
+        model: body.model,
+        stream: body.stream,
+        mcpEnabled,
+        messagesCount: body.messages?.length || 0,
+        lastUserMessagePreview: typeof lastMsg?.content === "string" ? lastMsg.content.slice(0, 300) : "[非纯文本内容]"
+      });
+
+      if (mcpEnabled) {
+        await runAgent(body, response, { ip: request.socket.remoteAddress });
       } else {
-        await passThrough(body, response);
+        await passThrough(body, response, { ip: request.socket.remoteAddress });
       }
       return;
     }
 
     sendOpenAIError(response, 404, "接口不存在");
   } catch (err) {
+    addDebugLog("ERROR", `全局服务未捕获异常: ${err.message}`, err.stack || err);
     if (response.headersSent) {
       try {
         const errChunk = {
