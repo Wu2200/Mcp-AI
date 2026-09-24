@@ -574,41 +574,65 @@ function sendReasoningChunk(clientResponse, text, model = "default") {
 
 function normalizeReasoningPayload(rawPayload) {
   const payload = { ...rawPayload };
-  const rawEffort = payload.reasoning_effort || payload.reasoningEffort;
 
-  if (typeof rawEffort === "string") {
-    const val = rawEffort.trim().toLowerCase();
-    if (val === "off" || val === "none") {
+  let effort = null;
+  if (typeof payload.reasoning_effort === "string") {
+    effort = payload.reasoning_effort.trim().toLowerCase();
+  } else if (typeof payload.reasoningEffort === "string") {
+    effort = payload.reasoningEffort.trim().toLowerCase();
+  } else if (payload.reasoning && typeof payload.reasoning.effort === "string") {
+    effort = payload.reasoning.effort.trim().toLowerCase();
+  }
+
+  if (effort) {
+    if (effort === "off" || effort === "none" || effort === "disable" || effort === "disabled") {
       payload.reasoning_effort = "none";
-      payload.thinking = { type: "disabled" };
+      payload.thinking = { type: "disabled", budget_tokens: 0 };
       payload.enable_thinking = false;
-    } else if (val === "low") {
+      payload.thinking_budget = 0;
+    } else if (effort === "low") {
       payload.reasoning_effort = "low";
       payload.thinking = { type: "enabled", budget_tokens: 1024 };
       payload.enable_thinking = true;
-    } else if (val === "medium") {
+      payload.thinking_budget = 1024;
+    } else if (effort === "medium") {
       payload.reasoning_effort = "medium";
       payload.thinking = { type: "enabled", budget_tokens: 4096 };
       payload.enable_thinking = true;
-    } else if (val === "high") {
+      payload.thinking_budget = 4096;
+    } else if (effort === "high") {
       payload.reasoning_effort = "high";
       payload.thinking = { type: "enabled", budget_tokens: 16384 };
       payload.enable_thinking = true;
+      payload.thinking_budget = 16384;
     }
   }
 
   if (payload.thinking && typeof payload.thinking === "object") {
-    if (payload.thinking.type === "disabled") {
+    if (payload.thinking.type === "disabled" || payload.thinking.budget_tokens === 0) {
       payload.reasoning_effort = "none";
       payload.enable_thinking = false;
+      payload.thinking_budget = 0;
     } else if (payload.thinking.type === "enabled") {
       payload.enable_thinking = true;
-      if (!payload.reasoning_effort) {
-        const budget = Number(payload.thinking.budget_tokens || 0);
+      const budget = Number(payload.thinking.budget_tokens || 0);
+      payload.thinking_budget = budget;
+      if (!payload.reasoning_effort || payload.reasoning_effort === "default") {
         if (budget > 8192) payload.reasoning_effort = "high";
         else if (budget > 2048) payload.reasoning_effort = "medium";
         else payload.reasoning_effort = "low";
       }
+    }
+  }
+
+  if (payload.thinking_budget !== undefined && Number(payload.thinking_budget) > 0 && !payload.thinking) {
+    const budget = Number(payload.thinking_budget);
+    payload.enable_thinking = true;
+    payload.thinking = { type: "enabled", budget_tokens: budget };
+    if (!payload.reasoning_effort) {
+      if (budget > 8192) payload.reasoning_effort = "high";
+      else if (budget > 2048) payload.reasoning_effort = "medium";
+      else payload.reasoning_effort = "low";
     }
   }
 
@@ -1030,9 +1054,13 @@ function convertGeminiToOpenAiRequest(geminiBody, modelName, isStream) {
       const tb = Number(gc.thinkingConfig.thinkingBudget);
       if (tb === 0) {
         openAiBody.reasoning_effort = "none";
-        openAiBody.thinking = { type: "disabled" };
+        openAiBody.thinking = { type: "disabled", budget_tokens: 0 };
+        openAiBody.enable_thinking = false;
+        openAiBody.thinking_budget = 0;
       } else if (tb > 0) {
         openAiBody.thinking = { type: "enabled", budget_tokens: tb };
+        openAiBody.thinking_budget = tb;
+        openAiBody.enable_thinking = true;
         if (tb > 8192) openAiBody.reasoning_effort = "high";
         else if (tb > 2048) openAiBody.reasoning_effort = "medium";
         else openAiBody.reasoning_effort = "low";
