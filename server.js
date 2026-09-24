@@ -659,7 +659,12 @@ async function passThrough(requestBody, clientResponse, reqMeta) {
     url: upstreamChatCompletionsUrl(),
     model: requestBody.model,
     stream: requestBody.stream,
-    messagesCount: requestBody.messages?.length || 0
+    messagesCount: requestBody.messages?.length || 0,
+    upstreamPayloadSummary: {
+      reasoning_effort: requestBody.reasoning_effort,
+      thinkingConfig: requestBody.thinkingConfig,
+      thinking_budget: requestBody.thinking_budget
+    }
   });
 
   const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
@@ -801,16 +806,35 @@ async function handleGeminiGenerateContent(modelName, isStream, geminiBody, clie
     max_tokens: geminiBody.generationConfig?.maxOutputTokens
   };
 
-  // 100% 完整透传 Chatbox 设置的 Gemini 思考配置 (thinkingConfig / reasoning / reasoning_effort 等)
+  // 全方位适配 Chatbox 的 thinkingLevel 与 thinkingBudget
   if (geminiBody.generationConfig?.thinkingConfig) {
     openAiBody.thinkingConfig = geminiBody.generationConfig.thinkingConfig;
-    const budget = geminiBody.generationConfig.thinkingConfig.thinkingBudget;
-    if (typeof budget === "number") {
-      openAiBody.thinking_budget = budget;
-      if (budget <= 0) openAiBody.reasoning_effort = "off";
-      else if (budget < 2048) openAiBody.reasoning_effort = "low";
-      else if (budget < 8192) openAiBody.reasoning_effort = "medium";
-      else openAiBody.reasoning_effort = "high";
+    const tc = geminiBody.generationConfig.thinkingConfig;
+
+    let level = "";
+    if (typeof tc.thinkingLevel === "string") {
+      level = tc.thinkingLevel.toLowerCase().trim();
+    }
+
+    if (typeof tc.thinkingBudget === "number") {
+      openAiBody.thinking_budget = tc.thinkingBudget;
+      if (tc.thinkingBudget <= 0) level = "off";
+      else if (tc.thinkingBudget < 2048) level = "low";
+      else if (tc.thinkingBudget < 8192) level = "medium";
+      else level = "high";
+    }
+
+    if (level) {
+      openAiBody.reasoning_effort = level;
+      if (level === "off") {
+        openAiBody.thinking_budget = 0;
+      } else if (level === "low") {
+        openAiBody.thinking_budget = 1024;
+      } else if (level === "medium") {
+        openAiBody.thinking_budget = 4096;
+      } else if (level === "high") {
+        openAiBody.thinking_budget = 16384;
+      }
     }
   }
 
@@ -829,7 +853,8 @@ async function handleGeminiGenerateContent(modelName, isStream, geminiBody, clie
     stream: isStream,
     mcpEnabled,
     messagesCount: openAiMessages.length,
-    thinkingConfig: geminiBody.generationConfig?.thinkingConfig || null
+    thinkingConfig: geminiBody.generationConfig?.thinkingConfig || null,
+    reasoning_effort: openAiBody.reasoning_effort || null
   });
 
   if (!isStream) {
@@ -978,7 +1003,12 @@ async function runAgent(requestBody, clientResponse, reqMeta) {
       addDebugLog("UPSTREAM", `第 ${round + 1} 轮上游调用请求 - 消息量: ${messages.length}`, {
         round: round + 1,
         toolsEnabled: Boolean(payload.tools),
-        messagesCount: messages.length
+        messagesCount: messages.length,
+        upstreamPayloadSummary: {
+          reasoning_effort: payload.reasoning_effort,
+          thinkingConfig: payload.thinkingConfig,
+          thinking_budget: payload.thinking_budget
+        }
       });
 
       const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
