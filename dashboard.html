@@ -416,6 +416,7 @@
           <span id="log-status-badge" class="badge badge-green">监听中</span>
         </div>
         <div class="action-group">
+          <button id="btn-copy-log" class="btn-action btn-start" onclick="copyAllLogs()">一键复制全部日志</button>
           <button id="btn-toggle-log" class="btn-action btn-stop" onclick="toggleLogging()">关闭日志</button>
           <button class="btn-action btn-secondary" onclick="clearLogs()">清空日志</button>
         </div>
@@ -511,6 +512,7 @@
     let currentEnabledList = [];
     let isLoggingActive = true;
     let logPollTimer = null;
+    let rawLogsCache = [];
 
     async function handleLogout() {
       await fetch("/api/panel/logout", { method: "POST" });
@@ -523,6 +525,7 @@
         if (res.status === 401) return;
         const data = await res.json();
         isLoggingActive = data.enabled;
+        rawLogsCache = data.logs || [];
         updateLogSwitchUI();
 
         const container = document.getElementById("log-container");
@@ -546,6 +549,35 @@
           container.scrollTop = container.scrollHeight;
         }
       } catch {}
+    }
+
+    async function copyAllLogs() {
+      const btn = document.getElementById("btn-copy-log");
+      if (!rawLogsCache || rawLogsCache.length === 0) {
+        btn.innerText = "暂无日志可复制";
+        setTimeout(() => { btn.innerText = "一键复制全部日志"; }, 1500);
+        return;
+      }
+      const text = rawLogsCache.map(l => {
+        let str = `[${l.time}] [${l.tag}] ${l.message}`;
+        if (l.data) str += `\n${l.data}`;
+        return str;
+      }).join("\n\n");
+
+      try {
+        await navigator.clipboard.writeText(text);
+        btn.innerText = "✓ 已复制到剪贴板";
+        setTimeout(() => { btn.innerText = "一键复制全部日志"; }, 1500);
+      } catch {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+        btn.innerText = "✓ 已复制到剪贴板";
+        setTimeout(() => { btn.innerText = "一键复制全部日志"; }, 1500);
+      }
     }
 
     function updateLogSwitchUI() {
