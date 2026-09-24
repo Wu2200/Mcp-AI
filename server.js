@@ -917,6 +917,8 @@ async function handleGeminiGenerateContent(modelName, isStream, geminiBody, clie
       _headers: {},
       _body: "",
       statusCode: 200,
+      get destroyed() { return clientResponse.destroyed; },
+      get writableEnded() { return clientResponse.writableEnded; },
       setHeader(k, v) { this._headers[k] = v; },
       writeHead(code, headers) { this.statusCode = code; Object.assign(this._headers, headers); },
       write(chunk) { this._body += chunk.toString(); },
@@ -965,6 +967,7 @@ async function handleGeminiGenerateContent(modelName, isStream, geminiBody, clie
     const fakeStreamClientResponse = {
       _headers: {},
       get destroyed() { return clientResponse.destroyed; },
+      get writableEnded() { return clientResponse.writableEnded; },
       setHeader(k, v) { this._headers[k] = v; },
       writeHead(code, headers) { Object.assign(this._headers, headers); },
       write(chunk) {
@@ -1854,15 +1857,15 @@ const server = http.createServer(async (request, response) => {
 
       const abortController = new AbortController();
       const onClientClose = () => {
-        if (!response.writableEnded) abortController.abort();
+        if (!response.writableEnded && (response.destroyed || response.socket?.destroyed)) {
+          abortController.abort();
+        }
       };
-      request.on("close", onClientClose);
       response.on("close", onClientClose);
 
       try {
         await handleGeminiGenerateContent(modelName, isStream, body, response, { ip: request.socket.remoteAddress }, abortController.signal);
       } finally {
-        request.off("close", onClientClose);
         response.off("close", onClientClose);
       }
       return;
@@ -1931,9 +1934,10 @@ const server = http.createServer(async (request, response) => {
 
         const abortController = new AbortController();
         const onClientClose = () => {
-          if (!response.writableEnded) abortController.abort();
+          if (!response.writableEnded && (response.destroyed || response.socket?.destroyed)) {
+            abortController.abort();
+          }
         };
-        request.on("close", onClientClose);
         response.on("close", onClientClose);
 
         try {
@@ -1943,7 +1947,6 @@ const server = http.createServer(async (request, response) => {
             await passThrough(body, response, { ip: request.socket.remoteAddress }, abortController.signal);
           }
         } finally {
-          request.off("close", onClientClose);
           response.off("close", onClientClose);
         }
         return;
