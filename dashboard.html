@@ -68,6 +68,12 @@
       margin-bottom: 14px;
       display: flex;
       align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .card-title-left {
+      display: flex;
+      align-items: center;
       gap: 8px;
     }
     .badge {
@@ -337,6 +343,38 @@
       color: #94a3b8;
       font-size: 13px;
     }
+
+    /* 实时日志面板样式 */
+    .log-box {
+      background: #0f172a;
+      border-radius: 8px;
+      padding: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 12px;
+      color: #e2e8f0;
+      max-height: 360px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .log-row {
+      margin-bottom: 6px;
+      line-height: 1.4;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+      padding-bottom: 4px;
+    }
+    .log-time { color: #64748b; margin-right: 6px; }
+    .log-tag { color: #38bdf8; font-weight: 600; margin-right: 6px; }
+    .log-info { color: #f1f5f9; }
+    .log-error { color: #f87171; }
+    .log-detail {
+      background: rgba(0, 0, 0, 0.3);
+      padding: 6px 8px;
+      border-radius: 4px;
+      margin-top: 4px;
+      color: #cbd5e1;
+      font-size: 11px;
+    }
   </style>
 </head>
 <body>
@@ -351,12 +389,18 @@
 
     <div class="card">
       <div class="card-title">
-        <span>客户端连接配置</span>
-        <span class="badge badge-blue">Chatbox 专用</span>
+        <div class="card-title-left">
+          <span>客户端连接配置</span>
+          <span class="badge badge-blue">Chatbox 专用</span>
+        </div>
       </div>
       <div class="group">
-        <label>API 域名 (Base URL)</label>
+        <label>OpenAI 格式 API 域名 (Base URL)</label>
         <div class="box" id="proxy-url"></div>
+      </div>
+      <div class="group">
+        <label>Google Gemini 格式 API 域名</label>
+        <div class="box" id="gemini-proxy-url"></div>
       </div>
       <div class="group">
         <label>模型 (Model)</label>
@@ -364,11 +408,33 @@
       </div>
     </div>
 
+    <!-- 实时日志监控卡片 -->
+    <div class="card">
+      <div class="card-title">
+        <div class="card-title-left">
+          <span>请求与调度日志监控</span>
+          <span id="log-status-badge" class="badge badge-green">监听中</span>
+        </div>
+        <div class="action-group">
+          <button id="btn-toggle-log" class="btn-action btn-stop" onclick="toggleLogging()">关闭日志</button>
+          <button class="btn-action btn-secondary" onclick="clearLogs()">清空日志</button>
+        </div>
+      </div>
+      <p style="font-size: 13px; color: #64748b; margin-bottom: 12px;">
+        在此面板可直接查看 Chatbox 传入的原始参数、上游转发情况以及 MCP 工具的调用与错误信息。
+      </p>
+      <div id="log-container" class="log-box">
+        <div style="color: #64748b;">暂无日志输出，等待调用...</div>
+      </div>
+    </div>
+
     <!-- 启用模型配置卡片（白名单模式） -->
     <div class="card">
       <div class="card-title">
-        <span>启用 MCP 的模型设置（白名单模式）</span>
-        <span class="badge badge-green">仅选中模型支持 MCP</span>
+        <div class="card-title-left">
+          <span>启用 MCP 的模型设置（白名单模式）</span>
+          <span class="badge badge-green">仅选中模型支持 MCP</span>
+        </div>
       </div>
       <p style="font-size: 13px; color: #64748b; margin-bottom: 14px;">
         <strong>白名单规则</strong>：只有加入此列表的模型才会挂载 MCP 工具。未在此列表中的其他所有模型将<strong>完全纯净直通上游</strong>（绝不携带任何 tools 参数），从而 100% 触发上游网关自带的原生网络搜索，互不干扰。
@@ -403,7 +469,11 @@
     </div>
 
     <div class="card">
-      <div class="card-title">手动挂载 MCP 服务（支持添加多个）</div>
+      <div class="card-title">
+        <div class="card-title-left">
+          <span>手动挂载 MCP 服务（支持添加多个）</span>
+        </div>
+      </div>
       <div class="group">
         <label>服务前缀名称（如 Github、Gitlab、Notion 等）</label>
         <input id="mcp-name" value="Github" placeholder="输入唯一标识名称">
@@ -424,7 +494,9 @@
 
     <div class="card">
       <div class="card-title">
-        <span>已挂载 MCP 服务列表</span>
+        <div class="card-title-left">
+          <span>已挂载 MCP 服务列表</span>
+        </div>
       </div>
       <div id="mcp-list">
         <div class="empty-state">正在加载服务列表...</div>
@@ -434,12 +506,84 @@
 
   <script>
     document.getElementById("proxy-url").innerText = window.location.origin + "/v1";
+    document.getElementById("gemini-proxy-url").innerText = window.location.origin;
 
     let currentEnabledList = [];
+    let isLoggingActive = true;
+    let logPollTimer = null;
 
     async function handleLogout() {
       await fetch("/api/panel/logout", { method: "POST" });
       location.reload();
+    }
+
+    async function fetchLogs() {
+      try {
+        const res = await fetch("/api/logs");
+        if (res.status === 401) return;
+        const data = await res.json();
+        isLoggingActive = data.enabled;
+        updateLogSwitchUI();
+
+        const container = document.getElementById("log-container");
+        if (!data.logs || data.logs.length === 0) {
+          container.innerHTML = '<div style="color: #64748b;">暂无日志输出，等待调用...</div>';
+          return;
+        }
+
+        const isScrolledToBottom = container.scrollHeight - container.clientHeight <= container.scrollTop + 30;
+
+        container.innerHTML = data.logs.map(log => `
+          <div class="log-row">
+            <span class="log-time">[${log.time}]</span>
+            <span class="log-tag">[${log.tag}]</span>
+            <span class="${log.level === 'error' ? 'log-error' : 'log-info'}">${log.message}</span>
+            ${log.data ? `<div class="log-detail">${log.data}</div>` : ''}
+          </div>
+        `).join("");
+
+        if (isScrolledToBottom) {
+          container.scrollTop = container.scrollHeight;
+        }
+      } catch {}
+    }
+
+    function updateLogSwitchUI() {
+      const btn = document.getElementById("btn-toggle-log");
+      const badge = document.getElementById("log-status-badge");
+      if (isLoggingActive) {
+        btn.innerText = "关闭日志";
+        btn.className = "btn-action btn-stop";
+        badge.innerText = "监听中";
+        badge.className = "badge badge-green";
+      } else {
+        btn.innerText = "开启日志";
+        btn.className = "btn-action btn-start";
+        badge.innerText = "已暂停";
+        badge.className = "badge badge-gray";
+      }
+    }
+
+    async function toggleLogging() {
+      const nextState = !isLoggingActive;
+      try {
+        const res = await fetch("/api/logs/toggle", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: nextState })
+        });
+        const data = await res.json();
+        isLoggingActive = data.enabled;
+        updateLogSwitchUI();
+        fetchLogs();
+      } catch {}
+    }
+
+    async function clearLogs() {
+      try {
+        await fetch("/api/logs/clear", { method: "POST" });
+        fetchLogs();
+      } catch {}
     }
 
     function renderEnabledTags() {
@@ -650,6 +794,8 @@
 
     loadEnabledSettings();
     loadServers();
+    fetchLogs();
+    logPollTimer = setInterval(fetchLogs, 2000);
   </script>
 </body>
 </html>
