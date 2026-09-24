@@ -311,12 +311,14 @@ async function loadConfigFromStorage() {
 }
 
 function setCorsHeaders(response) {
+  if (response.headersSent) return;
   response.setHeader("Access-Control-Allow-Origin", "*");
   response.setHeader("Access-Control-Allow-Headers", "*");
   response.setHeader("Access-Control-Allow-Methods", "GET, HEAD, POST, DELETE, OPTIONS");
 }
 
 function sendJson(response, statusCode, body) {
+  if (response.headersSent) return;
   setCorsHeaders(response);
   response.writeHead(statusCode, {
     "Content-Type": "application/json; charset=utf-8",
