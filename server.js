@@ -892,7 +892,7 @@ async function handleGeminiGenerateContent(modelName, isStream, geminiBody, clie
     if (mcpEnabled) {
       await runAgent(openAiBody, fakeClientResponse, reqMeta);
     } else {
-      await passThrough(openAiBody, fakeClientResponse, reqMeta);
+      await passThroughAndTransformGemini(openAiBody, clientResponse, false);
     }
     return;
   }
@@ -938,8 +938,93 @@ async function handleGeminiGenerateContent(modelName, isStream, geminiBody, clie
   if (mcpEnabled) {
     await runAgent(openAiBody, fakeStreamClientResponse, reqMeta);
   } else {
-    await passThrough(openAiBody, fakeStreamClientResponse, reqMeta);
+    await passThroughAndTransformGemini(openAiBody, clientResponse, true);
   }
+}
+
+async function passThroughAndTransformGemini(requestBody, clientResponse, isStream) {
+  const startTime = Date.now();
+  setCorsHeaders(clientResponse);
+
+  addDebugLog("UPSTREAM", `[Gemini 直通模式] 转发转换至上游: ${requestBody.model || "default"}`, {
+    url: upstreamChatCompletionsUrl(),
+    model: requestBody.model,
+    stream: isStream,
+    messagesCount: requestBody.messages?.length || 0
+  });
+
+  const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${UPSTREAM_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(requestBody)
+  });
+
+  const duration = Date.now() - startTime;
+  addDebugLog("UPSTREAM", `[Gemini 直通模式] 上游响应状态: ${upstreamResponse.status} - 耗时 ${duration}ms`, {
+    status: upstreamResponse.status,
+    contentType: upstreamResponse.headers.get("Content-Type")
+  });
+
+  if (!upstreamResponse.ok) {
+    const errTxt = await upstreamResponse.text();
+    sendJson(clientResponse, upstreamResponse.status, {
+      error: { code: upstreamResponse.status, message: errTxt }
+    });
+    return;
+  }
+
+  if (!isStream) {
+    const json = await upstreamResponse.json();
+    const candidateText = json.choices?.[0]?.message?.content || "";
+    const reasoning = json.choices?.[0]?.message?.reasoning_content || "";
+    const parts = [];
+    if (reasoning) parts.push({ thought: true, text: reasoning });
+    if (candidateText) parts.push({ text: candidateText });
+
+    const geminiResp = {
+      candidates: [
+        {
+          content: { parts: parts.length > 0 ? parts : [{ text: "" }], role: "model" },
+          finishReason: "STOP",
+          index: 0
+        }
+      ]
+    };
+    sendJson(clientResponse, 200, geminiResp);
+    return;
+  }
+
+  let buffer = "";
+  const reader = upstreamResponse.body.getReader();
+  const decoder = new TextDecoder();
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || !trimmed.startsWith("data:")) continue;
+      const dataStr = trimmed.slice(5).trim();
+      if (dataStr === "[DONE]") {
+        clientResponse.write("data: [DONE]\n\n");
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(dataStr);
+        const geminiChunk = convertOpenAiChunkToGemini(parsed);
+        clientResponse.write(`data: ${JSON.stringify(geminiChunk)}\n\n`);
+      } catch {}
+    }
+  }
+  clientResponse.end();
 }
 
 async function runAgent(requestBody, clientResponse, reqMeta) {
