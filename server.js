@@ -512,7 +512,7 @@ async function connectToMcpServer({ name, url, token }) {
 
 function extractMcpResultContent(data) {
   if (!data) return "{}";
-  if (typeof data === "string") return data;
+  let contentStr = "";
 
   const rawResult = data.result !== undefined ? data.result : data;
   if (!rawResult) return "{}";
@@ -539,17 +539,25 @@ function extractMcpResultContent(data) {
       }
     }
     if (pieces.length > 0) {
-      return pieces.join("\n\n");
+      contentStr = pieces.join("\n\n");
     }
   }
 
-  if (rawResult.content && rawResult.encoding === "base64" && typeof rawResult.content === "string") {
+  if (!contentStr && rawResult.content && rawResult.encoding === "base64" && typeof rawResult.content === "string") {
     try {
-      return Buffer.from(rawResult.content, "base64").toString("utf8");
+      contentStr = Buffer.from(rawResult.content, "base64").toString("utf8");
     } catch {}
   }
 
-  return typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult, null, 2);
+  if (!contentStr) {
+    contentStr = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult, null, 2);
+  }
+
+  if (contentStr.length > 8000) {
+    contentStr = contentStr.slice(0, 8000) + "\n\n[提示：工具输出内容过长，已截断保留前 8000 字符，避免超出模型上下文限制]";
+  }
+
+  return contentStr;
 }
 
 async function callMcpTool(toolKey, args) {
@@ -702,6 +710,8 @@ function isModelEnabledForMcp(modelName) {
   return false;
 }
 
+const MCP_DISPATCH_PROMPT = `【工具调用准则】仅在用户明确需要查询、操作特定平台外部数据时才调用对应工具。对于解答配置、分析代码或图片、回答常规问题，必须直接生成正文回复，严禁无故乱调无关工具。`;
+
 async function runAgent(requestBody, clientResponse) {
   appendLog("info", "RUN-AGENT", `启动 MCP 调度 - 模型 [${requestBody.model}]`, {
     reasoning_effort: requestBody.reasoning_effort,
@@ -716,6 +726,16 @@ async function runAgent(requestBody, clientResponse) {
 
   const isStream = requestBody.stream === true;
   let messages = [...requestBody.messages];
+
+  const firstMsg = messages[0];
+  if (firstMsg && firstMsg.role === "system") {
+    messages[0] = {
+      ...firstMsg,
+      content: `${firstMsg.content || ""}\n\n${MCP_DISPATCH_PROMPT}`
+    };
+  } else {
+    messages.unshift({ role: "system", content: MCP_DISPATCH_PROMPT });
+  }
 
   const clientTools = Array.isArray(requestBody.tools)
     ? requestBody.tools.filter((t) => t && t.type === "function")
@@ -739,7 +759,7 @@ async function runAgent(requestBody, clientResponse) {
   if (isStream) {
     keepAliveTimer = setInterval(() => {
       try {
-        sendSSEChunk(clientResponse, {}, requestBody.model || "default");
+        clientResponse.write(": keep-alive\n\n");
       } catch {}
     }, 5000);
   }
@@ -1224,6 +1244,10 @@ function createGeminiStreamAdapter(clientResponse, modelName) {
             const geminiFinishChunk = {
               candidates: [
                 {
+                  content: {
+                    parts: [{ text: "" }],
+                    role: "model"
+                  },
                   finishReason: finishReason === "length" ? "MAX_TOKENS" : "STOP",
                   index: 0
                 }
