@@ -19,3 +19,5 @@ services:
         sync: false
       - key: MAX_ROUNDS
         sync: false
+      - key: MAX_TOOL_CHARS
+        sync: false
