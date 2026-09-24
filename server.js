@@ -816,6 +816,8 @@ async function runAgent(requestBody, clientResponse) {
               }
             } else if (delta?.reasoning_content) {
               clientResponse.write(`${line}\n\n`);
+            } else if (delta && !hasToolCalls) {
+              clientResponse.write(`${line}\n\n`);
             }
           } catch {}
         }
@@ -943,10 +945,14 @@ function convertGeminiToOpenAiRequest(geminiBody, modelName, isStream) {
   }
 
   const openAiBody = {
+    ...geminiBody,
     model: modelName,
     messages,
     stream: isStream
   };
+  delete openAiBody.contents;
+  delete openAiBody.systemInstruction;
+  delete openAiBody.generationConfig;
 
   if (geminiBody.generationConfig) {
     const gc = geminiBody.generationConfig;
@@ -954,6 +960,11 @@ function convertGeminiToOpenAiRequest(geminiBody, modelName, isStream) {
     if (gc.maxOutputTokens !== undefined) openAiBody.max_tokens = gc.maxOutputTokens;
     if (gc.topP !== undefined) openAiBody.top_p = gc.topP;
     if (gc.stopSequences && Array.isArray(gc.stopSequences)) openAiBody.stop = gc.stopSequences;
+    if (gc.thinkingConfig) {
+      if (gc.thinkingConfig.thinkingBudget !== undefined) {
+        openAiBody.thinking = { type: "enabled", budget_tokens: gc.thinkingConfig.thinkingBudget };
+      }
+    }
   }
 
   return openAiBody;
