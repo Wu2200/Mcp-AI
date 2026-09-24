@@ -20,6 +20,29 @@ const SETTINGS_FILE = path.join(__dirname, "mcp-settings.json");
 const mcpServers = new Map();
 const mcpToolRegistry = new Map();
 let enabledModels = new Set();
+let loggingEnabled = true;
+
+const recentLogs = [];
+const MAX_LOG_COUNT = 300;
+
+function appendLog(level, tag, message, data = null) {
+  const time = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  const entry = {
+    id: Date.now() + Math.random(),
+    time,
+    level,
+    tag,
+    message,
+    data: data ? (typeof data === "string" ? data : JSON.stringify(data, null, 2)) : null
+  };
+  console.log(`[${time}] [${tag}] ${message}`, data ? JSON.stringify(data) : "");
+  if (loggingEnabled) {
+    recentLogs.push(entry);
+    if (recentLogs.length > MAX_LOG_COUNT) {
+      recentLogs.shift();
+    }
+  }
+}
 
 const SESSION_SECRET = PANEL_PASSWORD
   ? crypto.createHash("sha256").update(`mcp-proxy-session:${PANEL_PASSWORD}`).digest("hex")
@@ -93,6 +116,32 @@ async function initDatabase() {
   }
 }
 
+async function saveLoggingConfigToStorage(enabled) {
+  loggingEnabled = enabled;
+  if (pgPool) {
+    try {
+      await pgPool.query(
+        `INSERT INTO mcp_settings (key, value, updated_at)
+         VALUES ('logging_enabled', $1, CURRENT_TIMESTAMP)
+         ON CONFLICT (key) DO UPDATE SET
+           value = EXCLUDED.value,
+           updated_at = CURRENT_TIMESTAMP`,
+        [JSON.stringify(enabled)]
+      );
+    } catch {}
+  }
+  try {
+    let current = {};
+    if (fs.existsSync(SETTINGS_FILE)) {
+      try {
+        current = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf8"));
+      } catch {}
+    }
+    current.loggingEnabled = enabled;
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(current, null, 2), "utf8");
+  } catch {}
+}
+
 async function saveEnabledModelsToStorage(modelsArray) {
   enabledModels = new Set(modelsArray);
   if (pgPool) {
@@ -108,18 +157,30 @@ async function saveEnabledModelsToStorage(modelsArray) {
     } catch {}
   }
   try {
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify({ enabledModels: modelsArray }, null, 2), "utf8");
+    let current = {};
+    if (fs.existsSync(SETTINGS_FILE)) {
+      try {
+        current = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf8"));
+      } catch {}
+    }
+    current.enabledModels = modelsArray;
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(current, null, 2), "utf8");
   } catch {}
 }
 
-async function loadEnabledModelsFromStorage() {
+async function loadSettingsFromStorage() {
   if (pgPool) {
     try {
-      const res = await pgPool.query("SELECT value FROM mcp_settings WHERE key = 'enabled_models' LIMIT 1");
+      const res = await pgPool.query("SELECT key, value FROM mcp_settings WHERE key IN ('enabled_models', 'logging_enabled')");
       if (res.rows && res.rows.length > 0) {
-        const val = res.rows[0].value;
-        const list = Array.isArray(val) ? val : (typeof val === "string" ? JSON.parse(val) : []);
-        enabledModels = new Set(list);
+        for (const r of res.rows) {
+          if (r.key === "enabled_models") {
+            const list = Array.isArray(r.value) ? r.value : (typeof r.value === "string" ? JSON.parse(r.value) : []);
+            enabledModels = new Set(list);
+          } else if (r.key === "logging_enabled") {
+            loggingEnabled = r.value !== false && r.value !== "false";
+          }
+        }
         return;
       }
     } catch {}
@@ -131,6 +192,9 @@ async function loadEnabledModelsFromStorage() {
       const data = JSON.parse(raw);
       if (Array.isArray(data.enabledModels)) {
         enabledModels = new Set(data.enabledModels);
+      }
+      if (data.loggingEnabled !== undefined) {
+        loggingEnabled = data.loggingEnabled === true;
       }
     } catch {}
   }
@@ -442,6 +506,7 @@ async function connectToMcpServer({ name, url, token }) {
 
   mcpServers.set(serverId, serverInfo);
   await saveServerToStorage(serverInfo);
+  appendLog("info", "MCP-INIT", `成功挂载 MCP: ${name}, 工具数量: ${registeredTools.length}`);
   return serverInfo;
 }
 
@@ -582,7 +647,13 @@ function extractReasoningText(delta) {
 }
 
 async function passThrough(requestBody, clientResponse) {
-  console.log(`[PASS-THROUGH] Forwarding request to upstream. Model: ${requestBody.model}, reasoning_effort: ${requestBody.reasoning_effort}, stream: ${requestBody.stream}`);
+  appendLog("info", "PASS-THROUGH", `直通转发模型 [${requestBody.model}]`, {
+    model: requestBody.model,
+    reasoning_effort: requestBody.reasoning_effort,
+    stream: requestBody.stream,
+    incoming_keys: Object.keys(requestBody)
+  });
+
   setCorsHeaders(clientResponse);
   const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
     method: "POST",
@@ -593,6 +664,8 @@ async function passThrough(requestBody, clientResponse) {
     body: JSON.stringify(requestBody),
     signal: AbortSignal.timeout(300000)
   });
+
+  appendLog("info", "PASS-THROUGH", `上游响应状态码: ${upstreamResponse.status}`);
 
   clientResponse.writeHead(upstreamResponse.status, {
     "Content-Type": upstreamResponse.headers.get("Content-Type") || "application/json",
@@ -628,9 +701,11 @@ function isModelEnabledForMcp(modelName) {
 }
 
 async function runAgent(requestBody, clientResponse) {
-  console.log(`[RUN-AGENT] Start MCP loop for model: ${requestBody.model}`);
-  console.log(`[RUN-AGENT] Client incoming keys:`, Object.keys(requestBody));
-  console.log(`[RUN-AGENT] Reasoning fields: reasoning_effort=${requestBody.reasoning_effort}, thinking=${JSON.stringify(requestBody.thinking)}, max_tokens=${requestBody.max_tokens}, max_completion_tokens=${requestBody.max_completion_tokens}`);
+  appendLog("info", "RUN-AGENT", `启动 MCP 调度 - 模型 [${requestBody.model}]`, {
+    reasoning_effort: requestBody.reasoning_effort,
+    thinking: requestBody.thinking,
+    incoming_keys: Object.keys(requestBody)
+  });
 
   if (!Array.isArray(requestBody.messages) || requestBody.messages.length === 0) {
     throw new Error("messages 必须是非空数组");
@@ -644,7 +719,8 @@ async function runAgent(requestBody, clientResponse) {
     : [];
   const mcpTools = getAllTools();
   const tools = [...clientTools, ...mcpTools];
-  console.log(`[RUN-AGENT] Injected MCP tools count: ${mcpTools.length}, Total tools: ${tools.length}`);
+
+  appendLog("info", "RUN-AGENT", `注入工具: MCP工具=${mcpTools.length}, 客户端工具=${clientTools.length}`);
 
   if (isStream) {
     setCorsHeaders(clientResponse);
@@ -667,7 +743,6 @@ async function runAgent(requestBody, clientResponse) {
 
   try {
     for (let round = 0; round < 100; round += 1) {
-      console.log(`[RUN-AGENT] Round ${round + 1} sending payload to upstream`);
       const payload = {
         ...requestBody,
         messages,
@@ -679,7 +754,10 @@ async function runAgent(requestBody, clientResponse) {
         payload.tool_choice = "auto";
       }
 
-      console.log(`[RUN-AGENT] Round ${round + 1} payload keys:`, Object.keys(payload));
+      appendLog("info", "RUN-AGENT", `第 ${round + 1} 轮请求上游`, {
+        payload_keys: Object.keys(payload),
+        has_tools: Boolean(payload.tools?.length)
+      });
 
       const upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
         method: "POST",
@@ -691,11 +769,11 @@ async function runAgent(requestBody, clientResponse) {
         signal: AbortSignal.timeout(300000)
       });
 
-      console.log(`[RUN-AGENT] Round ${round + 1} upstream status:`, upstreamResponse.status);
+      appendLog("info", "RUN-AGENT", `第 ${round + 1} 轮上游状态: ${upstreamResponse.status}`);
 
       if (!upstreamResponse.ok) {
         const err = await upstreamResponse.text();
-        console.error(`[RUN-AGENT] Round ${round + 1} upstream error:`, err);
+        appendLog("error", "RUN-AGENT", `第 ${round + 1} 轮上游错误: ${err}`);
         if (isStream) {
           const errorChunk = {
             id: `chatcmpl-${Date.now()}`,
@@ -750,7 +828,7 @@ async function runAgent(requestBody, clientResponse) {
             }
           }
           const args = toolArguments(tc);
-          console.log(`[RUN-AGENT] Non-stream executing tool: ${tc.function.name}`);
+          appendLog("info", "RUN-AGENT", `非流式执行工具: ${tc.function.name}`);
           let result;
           try {
             result = await callMcpTool(tc.function.name, args);
@@ -863,7 +941,7 @@ async function runAgent(requestBody, clientResponse) {
         const rawAction = toolInfo?.rawName || tc.name;
         const args = toolArguments({ function: { arguments: tc.arguments } });
 
-        console.log(`[RUN-AGENT] Executing tool: ${tc.name} via ${displayName}`);
+        appendLog("info", "RUN-AGENT", `触发执行工具: ${tc.name} (${displayName})`);
 
         sendReasoningChunk(
           clientResponse,
@@ -1305,6 +1383,8 @@ async function handleGeminiNativePassThrough(reqUrl, request, response, customBo
   const upstreamBase = resolveUpstreamBase();
   const targetUrl = `${upstreamBase}${reqUrl.pathname}${reqUrl.search}`;
 
+  appendLog("info", "GEMINI-PASS", `原生直通 Gemini 上游: ${reqUrl.pathname}`);
+
   const headers = {
     "Content-Type": request.headers["content-type"] || "application/json"
   };
@@ -1344,7 +1424,7 @@ async function handleGeminiNativePassThrough(reqUrl, request, response, customBo
 
 await initDatabase();
 await loadConfigFromStorage();
-await loadEnabledModelsFromStorage();
+await loadSettingsFromStorage();
 
 const server = http.createServer(async (request, response) => {
   try {
@@ -1356,7 +1436,6 @@ const server = http.createServer(async (request, response) => {
     }
 
     const reqUrl = new URL(request.url, `http://${request.headers.host || "localhost"}`);
-    console.log(`[REQUEST] ${request.method} ${reqUrl.pathname}`);
 
     if (request.method === "GET" && (reqUrl.pathname === "/" || reqUrl.pathname === "")) {
       setCorsHeaders(response);
@@ -1409,6 +1488,31 @@ const server = http.createServer(async (request, response) => {
     if (reqUrl.pathname.startsWith("/api/")) {
       if (!isPanelAuthorized(request)) {
         sendJson(response, 401, { error: "控制台未授权，请输入管理密码" });
+        return;
+      }
+
+      if (request.method === "GET" && reqUrl.pathname === "/api/logs") {
+        sendJson(response, 200, {
+          enabled: loggingEnabled,
+          logs: recentLogs
+        });
+        return;
+      }
+
+      if (request.method === "POST" && reqUrl.pathname === "/api/logs/toggle") {
+        const body = await readRequestBody(request);
+        const enabled = Boolean(body.enabled);
+        await saveLoggingConfigToStorage(enabled);
+        if (!enabled) {
+          recentLogs.length = 0;
+        }
+        sendJson(response, 200, { success: true, enabled: loggingEnabled });
+        return;
+      }
+
+      if (request.method === "POST" && reqUrl.pathname === "/api/logs/clear") {
+        recentLogs.length = 0;
+        sendJson(response, 200, { success: true });
         return;
       }
 
@@ -1626,7 +1730,11 @@ const server = http.createServer(async (request, response) => {
       const isStream = action === "streamGenerateContent";
       const geminiBody = await readRequestBody(request);
 
-      console.log(`[GEMINI-REQ] Model: ${modelName}, isStream: ${isStream}, MCP Enabled: ${isModelEnabledForMcp(modelName)}`);
+      appendLog("info", "GEMINI-INCOMING", `接收 Gemini 请求 [${modelName}], stream=${isStream}`, {
+        modelName,
+        isStream,
+        mcpEnabled: isModelEnabledForMcp(modelName)
+      });
 
       if (!isModelEnabledForMcp(modelName) || mcpToolRegistry.size === 0) {
         try {
@@ -1685,8 +1793,14 @@ const server = http.createServer(async (request, response) => {
       }
 
       const body = await readRequestBody(request);
-      console.log(`[CHAT-COMPLETIONS] Request body keys:`, Object.keys(body));
-      console.log(`[CHAT-COMPLETIONS] model=${body.model}, reasoning_effort=${body.reasoning_effort}, thinking=${JSON.stringify(body.thinking)}`);
+
+      appendLog("info", "CHAT-INCOMING", `接收客户端调用 [${body.model}]`, {
+        model: body.model,
+        reasoning_effort: body.reasoning_effort,
+        thinking: body.thinking,
+        stream: body.stream,
+        keys: Object.keys(body)
+      });
 
       if (isModelEnabledForMcp(body.model) && mcpToolRegistry.size > 0) {
         await runAgent(body, response);
@@ -1698,7 +1812,7 @@ const server = http.createServer(async (request, response) => {
 
     sendOpenAIError(response, 404, "接口不存在");
   } catch (err) {
-    console.error(`[SERVER-ERROR]`, err);
+    appendLog("error", "SERVER-ERROR", err.message, err.stack);
     if (response.headersSent) {
       try {
         const errChunk = {
