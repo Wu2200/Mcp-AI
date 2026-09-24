@@ -24,7 +24,7 @@ const mcpToolRegistry = new Map();
 let enabledModels = new Set();
 
 let loggingEnabled = true;
-const MAX_LOGS = 200;
+const MAX_LOGS = 1000;
 const debugLogs = [];
 
 function addDebugLog(type, summary, detail = "") {
@@ -717,36 +717,13 @@ function isModelEnabledForMcp(modelName) {
   return false;
 }
 
-function buildHostEnvironmentSystemMessage() {
-  const now = new Date();
-  const beijingTime = now.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
-  return [
-    `[System Environment] Current Time: ${beijingTime} (UTC+8).`,
-    `Tool Usage Rule: Strictly execute tools relevant to the user request. Once tool results are retrieved, analyze them and provide a complete final response. Avoid infinite or repetitive tool loops.`
-  ].join("\n");
-}
-
 async function runAgent(requestBody, clientResponse, reqMeta) {
   if (!Array.isArray(requestBody.messages) || requestBody.messages.length === 0) {
     throw new Error("messages 必须是非空数组");
   }
 
   const isStream = requestBody.stream === true;
-  const rawMessages = requestBody.messages;
-  const hostMeta = buildHostEnvironmentSystemMessage();
-
-  let messages;
-  const existingSystemIdx = rawMessages.findIndex((m) => m.role === "system");
-  if (existingSystemIdx >= 0) {
-    messages = rawMessages.map((m, idx) => {
-      if (idx === existingSystemIdx) {
-        return { role: "system", content: `${hostMeta}\n${m.content || ""}` };
-      }
-      return m;
-    });
-  } else {
-    messages = [{ role: "system", content: hostMeta }, ...rawMessages];
-  }
+  let messages = [...requestBody.messages];
 
   const clientTools = Array.isArray(requestBody.tools)
     ? requestBody.tools.filter((t) => t && t.type === "function")
