@@ -13,8 +13,6 @@ const UPSTREAM_API_KEY = (process.env.UPSTREAM_API_KEY || "").trim();
 const PROXY_API_KEY = (process.env.PROXY_API_KEY || "").trim();
 const PANEL_PASSWORD = (process.env.PANEL_PASSWORD || "").trim();
 const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
-const MAX_ROUNDS = Number(process.env.MAX_ROUNDS || 100);
-const MAX_TOOL_CHARS = Number(process.env.MAX_TOOL_CHARS || 200000);
 
 const DATA_FILE = path.join(__dirname, "mcp-config.json");
 const SETTINGS_FILE = path.join(__dirname, "mcp-settings.json");
@@ -24,7 +22,7 @@ const mcpToolRegistry = new Map();
 let enabledModels = new Set();
 
 let loggingEnabled = true;
-const MAX_LOGS = 1000;
+const MAX_LOGS = 200;
 const debugLogs = [];
 
 function addDebugLog(type, summary, detail = "") {
@@ -315,7 +313,7 @@ async function loadConfigFromStorage() {
 function setCorsHeaders(response) {
   response.setHeader("Access-Control-Allow-Origin", "*");
   response.setHeader("Access-Control-Allow-Headers", "*");
-  response.setHeader("Access-Control-Allow-Methods", "GET, HEAD, POST, DELETE, OPTIONS");
+  response.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
 }
 
 function sendJson(response, statusCode, body) {
@@ -327,8 +325,8 @@ function sendJson(response, statusCode, body) {
   response.end(JSON.stringify(body));
 }
 
-function sendOpenAIError(response, statusCode, message, type = "invalid_request_error", extraInfo = {}) {
-  addDebugLog("ERROR", `返回客户端错误 (${statusCode}): ${message}`, { statusCode, message, type, ...extraInfo });
+function sendOpenAIError(response, statusCode, message, type = "invalid_request_error") {
+  addDebugLog("ERROR", `返回客户端错误 (${statusCode}): ${message}`, { statusCode, message, type });
   sendJson(response, statusCode, { error: { message, type, code: null } });
 }
 
@@ -548,14 +546,13 @@ function extractMcpResultContent(data) {
     contentStr = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult, null, 2);
   }
 
-  // 关键保护：单次工具输出最大限制（默认 200,000 字符，支持通过 MAX_TOOL_CHARS 环境变量调整或设为 0 关闭截断）
-  if (MAX_TOOL_CHARS > 0 && contentStr.length > MAX_TOOL_CHARS) {
-    const headLen = Math.floor(MAX_TOOL_CHARS * 0.8);
-    const tailLen = Math.floor(MAX_TOOL_CHARS * 0.2);
-    const head = contentStr.slice(0, headLen);
-    const tail = contentStr.slice(-tailLen);
+  // 关键保护：单次工具输出最大限制 10000 字符，保留前后有效信息，防止撑爆大模型上下文导致截断或 400 报错
+  const MAX_TOOL_CHARS = 10000;
+  if (contentStr.length > MAX_TOOL_CHARS) {
+    const head = contentStr.slice(0, 7500);
+    const tail = contentStr.slice(-2000);
     const originLen = contentStr.length;
-    contentStr = `${head}\n\n[⚠️ 系统截断提示：工具返回内容过大(共 ${originLen} 字符)，已智能保留前 ${headLen} 和后 ${tailLen} 字符]\n\n${tail}`;
+    contentStr = `${head}\n\n[⚠️ 系统截断提示：工具返回内容过大(共 ${originLen} 字符)，为防止超出模型上下文导致响应中断，已智能截取关键首尾部分]\n\n${tail}`;
   }
 
   return contentStr;
@@ -717,15 +714,40 @@ function isModelEnabledForMcp(modelName) {
   return false;
 }
 
+function buildHostEnvironmentSystemMessage() {
+  const now = new Date();
+  const beijingTime = now.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
+  return [
+    `[System Environment] Current Time: ${beijingTime} (UTC+8).`,
+    `Tool Usage Rule: Strictly execute tools relevant to the user request. Once tool results are retrieved, analyze them and provide a complete final response. Avoid infinite or repetitive tool loops.`
+  ].join("\n");
+}
+
 async function runAgent(requestBody, clientResponse, reqMeta) {
   if (!Array.isArray(requestBody.messages) || requestBody.messages.length === 0) {
     throw new Error("messages 必须是非空数组");
   }
 
   const isStream = requestBody.stream === true;
-  let messages = [...requestBody.messages];
+  const rawMessages = requestBody.messages;
+  const hostMeta = buildHostEnvironmentSystemMessage();
 
-  const clientTools = Array.isArray(requestBody.tools) ? requestBody.tools : [];
+  let messages;
+  const existingSystemIdx = rawMessages.findIndex((m) => m.role === "system");
+  if (existingSystemIdx >= 0) {
+    messages = rawMessages.map((m, idx) => {
+      if (idx === existingSystemIdx) {
+        return { role: "system", content: `${hostMeta}\n${m.content || ""}` };
+      }
+      return m;
+    });
+  } else {
+    messages = [{ role: "system", content: hostMeta }, ...rawMessages];
+  }
+
+  const clientTools = Array.isArray(requestBody.tools)
+    ? requestBody.tools.filter((t) => t && t.type === "function")
+    : [];
   const mcpTools = getAllTools();
   const tools = [...clientTools, ...mcpTools];
 
@@ -758,6 +780,7 @@ async function runAgent(requestBody, clientResponse, reqMeta) {
   }
 
   let finalFinishReason = null;
+  const MAX_ROUNDS = 15;
 
   try {
     for (let round = 0; round < MAX_ROUNDS; round += 1) {
@@ -769,10 +792,7 @@ async function runAgent(requestBody, clientResponse, reqMeta) {
 
       if (tools.length > 0) {
         payload.tools = tools;
-        // 如果客户端传了 tool_choice 就保留，没传则不强行指定 auto，防止上游无法按默认规则注入
-        if (requestBody.tool_choice !== undefined) {
-          payload.tool_choice = requestBody.tool_choice;
-        }
+        payload.tool_choice = "auto";
       }
 
       const roundStartTime = Date.now();
@@ -1175,34 +1195,25 @@ const server = http.createServer(async (request, response) => {
 
     const reqUrl = new URL(request.url, `http://${request.headers.host || "localhost"}`);
 
-    if ((request.method === "GET" || request.method === "HEAD") && (reqUrl.pathname === "/" || reqUrl.pathname === "")) {
+    if (request.method === "GET" && (reqUrl.pathname === "/" || reqUrl.pathname === "")) {
       setCorsHeaders(response);
       if (PANEL_PASSWORD) {
         const cookies = parseCookies(request);
         if (!verifySessionToken(cookies.panel_auth)) {
           response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-          response.end(request.method === "HEAD" ? "" : getLoginHtml());
+          response.end(getLoginHtml());
           return;
         }
       }
       const htmlPath = path.join(__dirname, "dashboard.html");
       const htmlContent = fs.readFileSync(htmlPath, "utf8");
       response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      response.end(request.method === "HEAD" ? "" : htmlContent);
+      response.end(htmlContent);
       return;
     }
 
-    if ((request.method === "GET" || request.method === "HEAD") && reqUrl.pathname === "/health") {
-      setCorsHeaders(response);
-      response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-      response.end(request.method === "HEAD" ? "" : JSON.stringify({ status: "ok" }));
-      return;
-    }
-
-    if (reqUrl.pathname === "/favicon.ico") {
-      setCorsHeaders(response);
-      response.writeHead(204);
-      response.end();
+    if (request.method === "GET" && reqUrl.pathname === "/health") {
+      sendJson(response, 200, { status: "ok" });
       return;
     }
 
@@ -1366,74 +1377,64 @@ const server = http.createServer(async (request, response) => {
       }
     }
 
-    // 只有 /v1/ 下的 OpenAI 客户端接口才进行 PROXY_API_KEY 校验
-    if (reqUrl.pathname.startsWith("/v1/")) {
-      if (!isProxyAuthorized(request)) {
-        const authHeader = request.headers.authorization || "(无 Authorization 请求头)";
-        const clientIp = request.headers["x-forwarded-for"] || request.socket.remoteAddress;
-        sendOpenAIError(response, 401, "API Key 错误", "authentication_error", {
-          path: reqUrl.pathname,
-          method: request.method,
-          clientIp,
-          receivedAuth: authHeader.length > 20 ? authHeader.slice(0, 15) + "..." : authHeader
+    if (!isProxyAuthorized(request)) {
+      sendOpenAIError(response, 401, "API Key 错误", "authentication_error");
+      return;
+    }
+
+    if (request.method === "GET" && reqUrl.pathname === "/v1/models") {
+      if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
+        sendJson(response, 200, {
+          object: "list",
+          data: [{ id: "default", object: "model", created: 0, owned_by: "proxy" }]
         });
         return;
       }
 
-      if (request.method === "GET" && reqUrl.pathname === "/v1/models") {
-        if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
-          sendJson(response, 200, {
-            object: "list",
-            data: [{ id: "default", object: "model", created: 0, owned_by: "proxy" }]
-          });
-          return;
-        }
+      const modelsUrl = UPSTREAM_BASE_URL.endsWith("/v1")
+        ? `${UPSTREAM_BASE_URL}/models`
+        : `${UPSTREAM_BASE_URL}/v1/models`;
 
-        const modelsUrl = UPSTREAM_BASE_URL.endsWith("/v1")
-          ? `${UPSTREAM_BASE_URL}/models`
-          : `${UPSTREAM_BASE_URL}/v1/models`;
-
-        try {
-          const upstreamResponse = await fetch(modelsUrl, {
-            headers: { Authorization: `Bearer ${UPSTREAM_API_KEY}` },
-            signal: AbortSignal.timeout(10000)
-          });
-          const data = await upstreamResponse.json();
-          sendJson(response, 200, data);
-        } catch {
-          sendJson(response, 200, {
-            object: "list",
-            data: [{ id: "default", object: "model", created: 0, owned_by: "proxy" }]
-          });
-        }
-        return;
-      }
-
-      if (request.method === "POST" && reqUrl.pathname === "/v1/chat/completions") {
-        if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
-          sendOpenAIError(response, 500, "服务端未配置环境变量：UPSTREAM_BASE_URL 或 UPSTREAM_API_KEY");
-          return;
-        }
-
-        const body = await readRequestBody(request);
-        const mcpEnabled = isModelEnabledForMcp(body.model) && mcpToolRegistry.size > 0;
-        const lastMsg = Array.isArray(body.messages) ? body.messages[body.messages.length - 1] : null;
-
-        addDebugLog("DOWNSTREAM", `收到客户端请求 [${body.model || "default"}] - stream=${body.stream === true}`, {
-          model: body.model,
-          stream: body.stream,
-          mcpEnabled,
-          messagesCount: body.messages?.length || 0,
-          lastUserMessagePreview: typeof lastMsg?.content === "string" ? lastMsg.content.slice(0, 300) : "[非纯文本内容]"
+      try {
+        const upstreamResponse = await fetch(modelsUrl, {
+          headers: { Authorization: `Bearer ${UPSTREAM_API_KEY}` },
+          signal: AbortSignal.timeout(10000)
         });
+        const data = await upstreamResponse.json();
+        sendJson(response, 200, data);
+      } catch {
+        sendJson(response, 200, {
+          object: "list",
+          data: [{ id: "default", object: "model", created: 0, owned_by: "proxy" }]
+        });
+      }
+      return;
+    }
 
-        if (mcpEnabled) {
-          await runAgent(body, response, { ip: request.socket.remoteAddress });
-        } else {
-          await passThrough(body, response, { ip: request.socket.remoteAddress });
-        }
+    if (request.method === "POST" && reqUrl.pathname === "/v1/chat/completions") {
+      if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
+        sendOpenAIError(response, 500, "服务端未配置环境变量：UPSTREAM_BASE_URL 或 UPSTREAM_API_KEY");
         return;
       }
+
+      const body = await readRequestBody(request);
+      const mcpEnabled = isModelEnabledForMcp(body.model) && mcpToolRegistry.size > 0;
+      const lastMsg = Array.isArray(body.messages) ? body.messages[body.messages.length - 1] : null;
+
+      addDebugLog("DOWNSTREAM", `收到客户端请求 [${body.model || "default"}] - stream=${body.stream === true}`, {
+        model: body.model,
+        stream: body.stream,
+        mcpEnabled,
+        messagesCount: body.messages?.length || 0,
+        lastUserMessagePreview: typeof lastMsg?.content === "string" ? lastMsg.content.slice(0, 300) : "[非纯文本内容]"
+      });
+
+      if (mcpEnabled) {
+        await runAgent(body, response, { ip: request.socket.remoteAddress });
+      } else {
+        await passThrough(body, response, { ip: request.socket.remoteAddress });
+      }
+      return;
     }
 
     sendOpenAIError(response, 404, "接口不存在");
