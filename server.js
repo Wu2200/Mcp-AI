@@ -653,93 +653,6 @@ function sendReasoningChunk(clientResponse, text, model = "default") {
   sendSSEChunk(clientResponse, { reasoning_content: text }, model);
 }
 
-async function passThrough(requestBody, clientResponse, reqMeta, abortSignal) {
-  const startTime = Date.now();
-  setCorsHeaders(clientResponse);
-
-  addDebugLog("UPSTREAM", `[直通模式] 转发请求至上游: ${requestBody.model || "default"}`, {
-    url: upstreamChatCompletionsUrl(),
-    model: requestBody.model,
-    stream: requestBody.stream,
-    messagesCount: requestBody.messages?.length || 0,
-    upstreamPayloadSummary: {
-      reasoning_effort: requestBody.reasoning_effort,
-      thinkingConfig: requestBody.thinkingConfig,
-      thinking_budget: requestBody.thinking_budget
-    }
-  });
-
-  let upstreamResponse;
-  try {
-    upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${UPSTREAM_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(requestBody),
-      signal: abortSignal
-    });
-  } catch (err) {
-    if (abortSignal?.aborted || err.name === "AbortError") {
-      addDebugLog("UPSTREAM", `[直通模式] 客户端已断开，请求已中止`);
-      return;
-    }
-    throw err;
-  }
-
-  const duration = Date.now() - startTime;
-  addDebugLog("UPSTREAM", `[直通模式] 上游响应状态: ${upstreamResponse.status} - 耗时 ${duration}ms`, {
-    status: upstreamResponse.status,
-    contentType: upstreamResponse.headers.get("Content-Type")
-  });
-
-  if (abortSignal?.aborted || clientResponse.destroyed) return;
-
-  clientResponse.writeHead(upstreamResponse.status, {
-    "Content-Type": upstreamResponse.headers.get("Content-Type") || "application/json",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive"
-  });
-
-  if (upstreamResponse.body) {
-    const reader = upstreamResponse.body.getReader();
-    try {
-      while (true) {
-        if (abortSignal?.aborted || clientResponse.destroyed) {
-          await reader.cancel().catch(() => {});
-          break;
-        }
-        const { done, value } = await reader.read();
-        if (done) break;
-        clientResponse.write(value);
-      }
-    } catch (err) {
-      if (abortSignal?.aborted || err.name === "AbortError") return;
-      throw err;
-    }
-  }
-  if (!clientResponse.writableEnded) {
-    clientResponse.end();
-  }
-}
-
-function isModelEnabledForMcp(modelName) {
-  if (!modelName || enabledModels.size === 0) return false;
-  const target = modelName.trim().toLowerCase();
-  for (const m of enabledModels) {
-    const pattern = m.trim().toLowerCase();
-    if (!pattern) continue;
-    if (pattern === target) return true;
-    if (pattern.includes("*")) {
-      const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
-      const regex = new RegExp(`^${escaped}$`, "i");
-      if (regex.test(target)) return true;
-    }
-  }
-  return false;
-}
-
 function isTruncatedFinishReason(reason) {
   if (!reason || typeof reason !== "string") return false;
   const r = reason.toLowerCase().trim();
@@ -767,6 +680,249 @@ function extractFinishReason(parsedChunkOrJson) {
     return parsedChunkOrJson.incomplete_details.reason;
   }
   return null;
+}
+
+// 直通模式（全面支持未开 MCP 模型的自动抗截断断点续接）
+async function passThrough(requestBody, clientResponse, reqMeta, abortSignal) {
+  const startTime = Date.now();
+  setCorsHeaders(clientResponse);
+  const isStream = requestBody.stream === true;
+
+  addDebugLog("UPSTREAM", `[直通模式] 转发请求至上游: ${requestBody.model || "default"} - stream=${isStream}`, {
+    url: upstreamChatCompletionsUrl(),
+    model: requestBody.model,
+    stream: isStream,
+    messagesCount: requestBody.messages?.length || 0,
+    upstreamPayloadSummary: {
+      reasoning_effort: requestBody.reasoning_effort,
+      thinkingConfig: requestBody.thinkingConfig,
+      thinking_budget: requestBody.thinking_budget
+    }
+  });
+
+  let currentMessages = [...(requestBody.messages || [])];
+  let continueRound = 0;
+  const MAX_AUTO_CONTINUES = 10;
+  let hasInitiatedStream = false;
+  let fullAccumulatedContent = "";
+
+  while (continueRound <= MAX_AUTO_CONTINUES) {
+    if (abortSignal?.aborted || clientResponse.destroyed) {
+      addDebugLog("DOWNSTREAM", `[直通模式] 客户端已断开，终止请求与续接`);
+      break;
+    }
+
+    let upstreamResponse;
+    const roundStartTime = Date.now();
+    if (continueRound > 0) {
+      addDebugLog("UPSTREAM", `[直通模式] 第 ${continueRound + 1} 轮断点续接上游请求 - 消息量: ${currentMessages.length}`);
+    }
+
+    try {
+      upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${UPSTREAM_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          ...requestBody,
+          messages: currentMessages
+        }),
+        signal: abortSignal
+      });
+    } catch (err) {
+      if (abortSignal?.aborted || err.name === "AbortError") {
+        addDebugLog("DOWNSTREAM", `[直通模式] 客户端已断开，上游请求已中止`);
+        return;
+      }
+      throw err;
+    }
+
+    const duration = Date.now() - roundStartTime;
+    addDebugLog("UPSTREAM", `[直通模式] 上游响应状态: ${upstreamResponse.status} - 耗时 ${duration}ms`, {
+      status: upstreamResponse.status,
+      contentType: upstreamResponse.headers.get("Content-Type")
+    });
+
+    if (abortSignal?.aborted || clientResponse.destroyed) {
+      addDebugLog("DOWNSTREAM", `[直通模式] 客户端已断开，终止处理`);
+      return;
+    }
+
+    if (!upstreamResponse.ok) {
+      const errTxt = await upstreamResponse.text();
+      addDebugLog("ERROR", `[直通模式] 上游报错 (${upstreamResponse.status})`, errTxt);
+      if (isStream && hasInitiatedStream) {
+        const errorChunk = {
+          id: `chatcmpl-${Date.now()}`,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: requestBody.model || "default",
+          choices: [
+            {
+              index: 0,
+              delta: { content: `\n\n⚠️ [上游接口返回错误 ${upstreamResponse.status}]: ${errTxt.slice(0, 500)}` },
+              finish_reason: "stop"
+            }
+          ]
+        };
+        clientResponse.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
+        clientResponse.write("data: [DONE]\n\n");
+        clientResponse.end();
+      } else {
+        sendJson(clientResponse, upstreamResponse.status, {
+          error: { code: upstreamResponse.status, message: errTxt }
+        });
+      }
+      return;
+    }
+
+    if (!isStream) {
+      const json = await upstreamResponse.json();
+      if (abortSignal?.aborted || clientResponse.destroyed) return;
+      const rawReason = extractFinishReason(json);
+      const choice = json.choices?.[0];
+      const content = choice?.message?.content || "";
+      fullAccumulatedContent += content;
+
+      if (isTruncatedFinishReason(rawReason) && content && !abortSignal?.aborted && !clientResponse.destroyed) {
+        continueRound += 1;
+        addDebugLog("AGENT", `⚠️ [抗截断触发] 直通非流式检测到截断 (${rawReason})！正在自动进行第 ${continueRound} 次无感断点续接...`, {
+          round: continueRound,
+          finishReason: rawReason,
+          accumulatedLength: fullAccumulatedContent.length
+        });
+        currentMessages = [
+          ...currentMessages,
+          { role: "assistant", content },
+          { role: "user", content: "请紧接着上一句未说完的内容继续输出，不要重复前面已输出的任何字，不要有任何多余的开场白。" }
+        ];
+        continue;
+      }
+
+      if (continueRound > 0 && choice?.message) {
+        choice.message.content = fullAccumulatedContent;
+      }
+      addDebugLog("UPSTREAM", `[直通模式] 非流式完成输出 - 结束原因: ${rawReason || "stop"}`);
+      sendJson(clientResponse, 200, json);
+      return;
+    }
+
+    if (!hasInitiatedStream) {
+      clientResponse.writeHead(200, {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive"
+      });
+      hasInitiatedStream = true;
+    }
+
+    let buffer = "";
+    let roundContent = "";
+    let lastFinishReason = null;
+    const reader = upstreamResponse.body.getReader();
+    const decoder = new TextDecoder();
+
+    try {
+      while (true) {
+        if (abortSignal?.aborted || clientResponse.destroyed) {
+          addDebugLog("DOWNSTREAM", `[直通模式] 客户端在流式传输中断开连接，已停止上游拉取`);
+          await reader.cancel().catch(() => {});
+          break;
+        }
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith("data:")) continue;
+          const dataStr = trimmed.slice(5).trim();
+          if (dataStr === "[DONE]") continue;
+
+          try {
+            const parsed = JSON.parse(dataStr);
+            const choice = parsed.choices?.[0];
+            const reason = extractFinishReason(parsed);
+            if (reason) {
+              lastFinishReason = reason;
+            }
+            if (choice?.delta?.content) {
+              roundContent += choice.delta.content;
+            }
+
+            if (isTruncatedFinishReason(reason)) {
+              const sanitized = {
+                ...parsed,
+                choices: choice ? [{ ...choice, finish_reason: null, finishReason: null }] : []
+              };
+              clientResponse.write(`data: ${JSON.stringify(sanitized)}\n\n`);
+            } else {
+              clientResponse.write(`${line}\n\n`);
+            }
+          } catch {
+            clientResponse.write(`${line}\n\n`);
+          }
+        }
+      }
+    } catch (err) {
+      if (abortSignal?.aborted || err.name === "AbortError") {
+        addDebugLog("DOWNSTREAM", `[直通模式] 客户端中断传输`);
+        return;
+      }
+      throw err;
+    }
+
+    if (abortSignal?.aborted || clientResponse.destroyed) {
+      addDebugLog("DOWNSTREAM", `[直通模式] 客户端已断开，终止自动续接`);
+      break;
+    }
+
+    fullAccumulatedContent += roundContent;
+
+    if (isTruncatedFinishReason(lastFinishReason) && roundContent && !abortSignal?.aborted && !clientResponse.destroyed) {
+      continueRound += 1;
+      addDebugLog("AGENT", `⚠️ [抗截断触发] 直通流式检测到截断 (${lastFinishReason})！正在自动进行第 ${continueRound} 次无感断点续接...`, {
+        round: continueRound,
+        finishReason: lastFinishReason,
+        accumulatedLength: fullAccumulatedContent.length
+      });
+      currentMessages = [
+        ...currentMessages,
+        { role: "assistant", content: roundContent },
+        { role: "user", content: "请紧接着上一句未说完的内容继续输出，不要重复前面已输出的任何字，不要有任何多余的开场白。" }
+      ];
+      continue;
+    }
+
+    addDebugLog("UPSTREAM", `[直通模式] 流式完成输出 - 结束原因: ${lastFinishReason || "stop"}`);
+    break;
+  }
+
+  if (!abortSignal?.aborted && !clientResponse.destroyed) {
+    clientResponse.write("data: [DONE]\n\n");
+    clientResponse.end();
+  }
+}
+
+function isModelEnabledForMcp(modelName) {
+  if (!modelName || enabledModels.size === 0) return false;
+  const target = modelName.trim().toLowerCase();
+  for (const m of enabledModels) {
+    const pattern = m.trim().toLowerCase();
+    if (!pattern) continue;
+    if (pattern === target) return true;
+    if (pattern.includes("*")) {
+      const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+      const regex = new RegExp(`^${escaped}$`, "i");
+      if (regex.test(target)) return true;
+    }
+  }
+  return false;
 }
 
 // Gemini 原生格式双向转换模块（全面支持文本与多模态图片）
@@ -1054,7 +1210,7 @@ async function passThroughAndTransformGemini(requestBody, clientResponse, isStre
 
   while (continueRound <= MAX_AUTO_CONTINUES) {
     if (abortSignal?.aborted || clientResponse.destroyed) {
-      addDebugLog("AGENT", `[Gemini 直通模式] 客户端已断开，终止续接`);
+      addDebugLog("DOWNSTREAM", `[Gemini 直通模式] 客户端已断开，终止续接`);
       break;
     }
 
@@ -1074,7 +1230,7 @@ async function passThroughAndTransformGemini(requestBody, clientResponse, isStre
       });
     } catch (err) {
       if (abortSignal?.aborted || err.name === "AbortError") {
-        addDebugLog("UPSTREAM", `[Gemini 直通模式] 客户端已中止请求`);
+        addDebugLog("DOWNSTREAM", `[Gemini 直通模式] 客户端已中止请求`);
         return;
       }
       throw err;
@@ -1139,6 +1295,7 @@ async function passThroughAndTransformGemini(requestBody, clientResponse, isStre
     try {
       while (true) {
         if (abortSignal?.aborted || clientResponse.destroyed) {
+          addDebugLog("DOWNSTREAM", `[Gemini 直通模式] 客户端在流式传输中断开连接，已停止上游拉取`);
           await reader.cancel().catch(() => {});
           break;
         }
@@ -1179,12 +1336,15 @@ async function passThroughAndTransformGemini(requestBody, clientResponse, isStre
         }
       }
     } catch (err) {
-      if (abortSignal?.aborted || err.name === "AbortError") return;
+      if (abortSignal?.aborted || err.name === "AbortError") {
+        addDebugLog("DOWNSTREAM", `[Gemini 直通模式] 客户端中断传输`);
+        return;
+      }
       throw err;
     }
 
     if (abortSignal?.aborted || clientResponse.destroyed) {
-      addDebugLog("AGENT", `[Gemini 直通模式] 客户端已断开，终止自动续接`);
+      addDebugLog("DOWNSTREAM", `[Gemini 直通模式] 客户端已断开，终止自动续接`);
       break;
     }
 
@@ -1264,7 +1424,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
   try {
     for (let round = 0; ; round += 1) {
       if (abortSignal?.aborted || clientResponse.destroyed) {
-        addDebugLog("AGENT", `客户端已断开，终止 MCP 调度循环`);
+        addDebugLog("DOWNSTREAM", `客户端已断开，终止 MCP 调度循环`);
         break;
       }
 
@@ -1304,7 +1464,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         });
       } catch (err) {
         if (abortSignal?.aborted || err.name === "AbortError") {
-          addDebugLog("AGENT", `第 ${round + 1} 轮上游请求被客户端中止`);
+          addDebugLog("DOWNSTREAM", `第 ${round + 1} 轮上游请求被客户端中止`);
           return;
         }
         throw err;
@@ -1410,6 +1570,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       try {
         while (true) {
           if (abortSignal?.aborted || clientResponse.destroyed) {
+            addDebugLog("DOWNSTREAM", `[AGENT] 客户端在流式传输中断开连接，已停止上游拉取`);
             await reader.cancel().catch(() => {});
             break;
           }
@@ -1477,12 +1638,15 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
           }
         }
       } catch (err) {
-        if (abortSignal?.aborted || err.name === "AbortError") return;
+        if (abortSignal?.aborted || err.name === "AbortError") {
+          addDebugLog("DOWNSTREAM", `[AGENT] 客户端中断传输`);
+          return;
+        }
         throw err;
       }
 
       if (abortSignal?.aborted || clientResponse.destroyed) {
-        addDebugLog("AGENT", `客户端已断开，终止后续 MCP 处理与续接`);
+        addDebugLog("DOWNSTREAM", `客户端已断开，终止后续 MCP 处理与续接`);
         break;
       }
 
@@ -1903,16 +2067,23 @@ const server = http.createServer(async (request, response) => {
       const body = await readRequestBody(request);
 
       const abortController = new AbortController();
+      let clientDisconnectedLogged = false;
       const onClientClose = () => {
-        if (!response.writableEnded && (response.destroyed || response.socket?.destroyed)) {
+        if (!response.writableEnded && !abortController.signal.aborted) {
+          if (!clientDisconnectedLogged) {
+            clientDisconnectedLogged = true;
+            addDebugLog("DOWNSTREAM", `[连接断开] 客户端已主动断开连接 / 取消请求`);
+          }
           abortController.abort();
         }
       };
+      request.on("close", onClientClose);
       response.on("close", onClientClose);
 
       try {
         await handleGeminiGenerateContent(modelName, isStream, body, response, { ip: request.socket.remoteAddress }, abortController.signal);
       } finally {
+        request.off("close", onClientClose);
         response.off("close", onClientClose);
       }
       return;
@@ -1980,11 +2151,17 @@ const server = http.createServer(async (request, response) => {
         });
 
         const abortController = new AbortController();
+        let clientDisconnectedLogged = false;
         const onClientClose = () => {
-          if (!response.writableEnded && (response.destroyed || response.socket?.destroyed)) {
+          if (!response.writableEnded && !abortController.signal.aborted) {
+            if (!clientDisconnectedLogged) {
+              clientDisconnectedLogged = true;
+              addDebugLog("DOWNSTREAM", `[连接断开] 客户端已主动断开连接 / 取消请求`);
+            }
             abortController.abort();
           }
         };
+        request.on("close", onClientClose);
         response.on("close", onClientClose);
 
         try {
@@ -1994,6 +2171,7 @@ const server = http.createServer(async (request, response) => {
             await passThrough(body, response, { ip: request.socket.remoteAddress }, abortController.signal);
           }
         } finally {
+          request.off("close", onClientClose);
           response.off("close", onClientClose);
         }
         return;
