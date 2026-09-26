@@ -740,6 +740,35 @@ function isModelEnabledForMcp(modelName) {
   return false;
 }
 
+function isTruncatedFinishReason(reason) {
+  if (!reason || typeof reason !== "string") return false;
+  const r = reason.toLowerCase().trim();
+  return (
+    r === "length" ||
+    r === "max_tokens" ||
+    r === "model_length" ||
+    r.includes("max_output_tokens") ||
+    r === "incomplete"
+  );
+}
+
+function extractFinishReason(parsedChunkOrJson) {
+  if (!parsedChunkOrJson || typeof parsedChunkOrJson !== "object") return null;
+  const choice = parsedChunkOrJson.choices?.[0];
+  if (choice) {
+    if (choice.finish_reason) return choice.finish_reason;
+    if (choice.finishReason) return choice.finishReason;
+  }
+  const candidate = parsedChunkOrJson.candidates?.[0];
+  if (candidate?.finishReason) return candidate.finishReason;
+  if (parsedChunkOrJson.finish_reason) return parsedChunkOrJson.finish_reason;
+  if (parsedChunkOrJson.finishReason) return parsedChunkOrJson.finishReason;
+  if (parsedChunkOrJson.status === "incomplete" && parsedChunkOrJson.incomplete_details?.reason) {
+    return parsedChunkOrJson.incomplete_details.reason;
+  }
+  return null;
+}
+
 // Gemini 原生格式双向转换模块（全面支持文本与多模态图片）
 function convertGeminiToOpenAIMessages(body) {
   const messages = [];
@@ -833,9 +862,13 @@ function convertOpenAiChunkToGemini(parsedChunk) {
     });
   }
 
+  const rawReason = extractFinishReason(parsedChunk);
   let finishReason = undefined;
-  if (choice?.finish_reason === "stop") finishReason = "STOP";
-  else if (choice?.finish_reason === "length") finishReason = "MAX_TOKENS";
+  if (rawReason) {
+    const r = String(rawReason).toLowerCase().trim();
+    if (r === "stop") finishReason = "STOP";
+    else if (isTruncatedFinishReason(rawReason)) finishReason = "MAX_TOKENS";
+  }
 
   return {
     candidates: [
@@ -932,11 +965,12 @@ async function handleGeminiGenerateContent(modelName, isStream, geminiBody, clie
           const parts = [];
           if (reasoning) parts.push({ thought: true, text: reasoning });
           if (candidateText) parts.push({ text: candidateText });
+          const rawReason = extractFinishReason(json);
           const geminiResp = {
             candidates: [
               {
                 content: { parts: parts.length > 0 ? parts : [{ text: "" }], role: "model" },
-                finishReason: "STOP",
+                finishReason: isTruncatedFinishReason(rawReason) ? "MAX_TOKENS" : "STOP",
                 index: 0
               }
             ]
@@ -1072,11 +1106,12 @@ async function passThroughAndTransformGemini(requestBody, clientResponse, isStre
       if (reasoning) parts.push({ thought: true, text: reasoning });
       if (candidateText) parts.push({ text: candidateText });
 
+      const rawReason = extractFinishReason(json);
       const geminiResp = {
         candidates: [
           {
             content: { parts: parts.length > 0 ? parts : [{ text: "" }], role: "model" },
-            finishReason: choice?.finish_reason === "length" ? "MAX_TOKENS" : "STOP",
+            finishReason: isTruncatedFinishReason(rawReason) ? "MAX_TOKENS" : "STOP",
             index: 0
           }
         ]
@@ -1122,17 +1157,18 @@ async function passThroughAndTransformGemini(requestBody, clientResponse, isStre
           try {
             const parsed = JSON.parse(dataStr);
             const choice = parsed.choices?.[0];
-            if (choice?.finish_reason) {
-              lastFinishReason = choice.finish_reason;
+            const reason = extractFinishReason(parsed);
+            if (reason) {
+              lastFinishReason = reason;
             }
             if (choice?.delta?.content) {
               accumulatedContent += choice.delta.content;
             }
             // 如果因达到上限被截断，先不发截断的结束状态，准备自动续接
-            if (choice?.finish_reason === "length") {
+            if (isTruncatedFinishReason(reason)) {
               const geminiChunk = convertOpenAiChunkToGemini({
                 ...parsed,
-                choices: [{ ...choice, finish_reason: null }]
+                choices: choice ? [{ ...choice, finish_reason: null, finishReason: null }] : []
               });
               clientResponse.write(`data: ${JSON.stringify(geminiChunk)}\n\n`);
             } else {
@@ -1152,11 +1188,12 @@ async function passThroughAndTransformGemini(requestBody, clientResponse, isStre
       break;
     }
 
-    // 准确检测是否被上游截断（finish_reason === "length"）
-    if (lastFinishReason === "length" && accumulatedContent && !abortSignal?.aborted && !clientResponse.destroyed) {
+    // 准确检测是否被上游截断（兼容 length、max_tokens、MAX_TOKENS 等）
+    if (isTruncatedFinishReason(lastFinishReason) && accumulatedContent && !abortSignal?.aborted && !clientResponse.destroyed) {
       continueRound += 1;
-      addDebugLog("AGENT", `⚠️ [抗截断触发] 检测到上游返回 length 截断！正在自动进行第 ${continueRound} 次无感断点续接...`, {
+      addDebugLog("AGENT", `⚠️ [抗截断触发] 检测到上游返回截断 (${lastFinishReason})！正在自动进行第 ${continueRound} 次无感断点续接...`, {
         round: continueRound,
+        finishReason: lastFinishReason,
         accumulatedLength: accumulatedContent.length
       });
       currentMessages = [
@@ -1311,7 +1348,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         const choice = json.choices?.[0];
         const message = choice?.message;
         const toolCalls = message?.tool_calls || [];
-        finalFinishReason = choice?.finish_reason;
+        finalFinishReason = extractFinishReason(json);
 
         const mcpCalls = toolCalls.filter((tc) => {
           if (!tc || !tc.function?.name) return false;
@@ -1393,8 +1430,9 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
               const parsed = JSON.parse(dataStr);
               const choice = parsed.choices?.[0];
               const delta = choice?.delta;
-              if (choice?.finish_reason) {
-                roundFinishReason = choice.finish_reason;
+              const reason = extractFinishReason(parsed);
+              if (reason) {
+                roundFinishReason = reason;
               }
 
               if (delta?.tool_calls) {
@@ -1419,7 +1457,15 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
                 assistantContent += delta.content;
                 // 关键保护：若本轮检测到工具调用，严禁透传草稿正文，防止下游误判提前截断；只有确定无工具调用时直接流式推送
                 if (!hasToolCalls && !clientResponse.destroyed && !abortSignal?.aborted) {
-                  clientResponse.write(`${line}\n\n`);
+                  if (isTruncatedFinishReason(reason)) {
+                    const sanitized = {
+                      ...parsed,
+                      choices: choice ? [{ ...choice, finish_reason: null, finishReason: null }] : []
+                    };
+                    clientResponse.write(`data: ${JSON.stringify(sanitized)}\n\n`);
+                  } else {
+                    clientResponse.write(`${line}\n\n`);
+                  }
                 }
               } else if (delta?.reasoning_content) {
                 // 深度思考原生内容透传
@@ -1451,9 +1497,10 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
 
       // 没有工具调用，检查是否达到 Token 上限截断：若是且客户端未断开则进行自动无感断点续接
       if (mcpCalls.length === 0) {
-        if (roundFinishReason === "length" && assistantContent && !abortSignal?.aborted && !clientResponse.destroyed) {
-          addDebugLog("AGENT", `⚠️ [抗截断触发] MCP 调度检测到 length 截断！正在自动进行无感断点续接...`, {
+        if (isTruncatedFinishReason(roundFinishReason) && assistantContent && !abortSignal?.aborted && !clientResponse.destroyed) {
+          addDebugLog("AGENT", `⚠️ [抗截断触发] MCP 调度检测到截断 (${roundFinishReason})！正在自动进行无感断点续接...`, {
             round: round + 1,
+            finishReason: roundFinishReason,
             accumulatedLength: assistantContent.length
           });
           messages.push({ role: "assistant", content: assistantContent });
