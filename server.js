@@ -613,50 +613,32 @@ function getAllTools() {
   return tools;
 }
 
-async function evaluateToolRequirement(userText, availableTools, modelName) {
+function evaluateToolRequirementFast(userText, availableTools) {
   if (!availableTools || availableTools.length === 0 || !userText) {
-    return { required: false };
+    return false;
   }
 
-  const toolSummaries = availableTools
-    .map((t) => `- ${t.function.name}: ${t.function.description || "无描述"}`)
-    .join("\n");
-
-  const prompt = [
-    "你是一个工具需求判定网关。下面是当前系统已挂载的 MCP 工具列表：",
-    toolSummaries,
-    "",
-    "用户最新输入如下：",
-    `"""${userText.slice(0, 1500)}"""`,
-    "",
-    "任务指令：判断用户的诉求是否需要调用上述任意工具（例如查询外部信息、读写资源、执行操作、执行指令等）。",
-    "规则：只需回答一个单词。需要调用工具输出 YES，纯打招呼或普通概念咨询输出 NO。严禁输出其他任何解释。"
-  ].join("\n");
-
-  try {
-    const response = await fetch(upstreamChatCompletionsUrl(), {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${UPSTREAM_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: modelName || "default",
-        messages: [{ role: "user", content: prompt }],
-        temperature: 0,
-        max_tokens: 10,
-        stream: false
-      }),
-      signal: AbortSignal.timeout(3500)
-    });
-
-    if (!response.ok) return { required: false };
-    const json = await response.json();
-    const answer = (json.choices?.[0]?.message?.content || "").trim().toUpperCase();
-    return { required: answer.includes("YES") };
-  } catch {
-    return { required: false };
+  const toolNameTokens = new Set();
+  for (const t of availableTools) {
+    const rawName = t.function?.name || "";
+    const parts = rawName.toLowerCase().split(/[^a-z0-9]+/);
+    for (const p of parts) {
+      if (p.length >= 3 && !["mcp", "get", "api", "set", "post"].includes(p)) {
+        toolNameTokens.add(p);
+      }
+    }
   }
+
+  const text = userText.toLowerCase();
+  for (const token of toolNameTokens) {
+    if (text.includes(token)) {
+      return true;
+    }
+  }
+
+  const FAST_ACTION_PATTERN = /(搜索|查询|查一下|找一下|读取|查看|打开|获取|下载|抓取|执行|运行|运行下|操作|写入|修改|更新|覆盖|删除|创建|新建|提交|推送|push|pull|commit|fetch|exec|search|run|read|write|create|update|delete|git|github|http|https|\.js|\.ts|\.json|\.py|\.go|\.html|\.css|仓库|分支|pr|issue|文件|目录|终端|命令|代码库|数据库|表)/i;
+
+  return FAST_ACTION_PATTERN.test(userText);
 }
 
 function upstreamChatCompletionsUrl() {
@@ -1445,10 +1427,9 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
 
   let isToolRequiredForTask = false;
   if (tools.length > 0 && userText) {
-    const evalResult = await evaluateToolRequirement(userText, tools, requestBody.model);
-    isToolRequiredForTask = evalResult.required;
+    isToolRequiredForTask = evaluateToolRequirementFast(userText, tools);
     if (isToolRequiredForTask) {
-      addDebugLog("AGENT", `[前置网关路由] 判定当前用户请求需要调用 MCP 工具，激活协议级锁定 (tool_choice: required)`);
+      addDebugLog("AGENT", `[前置路由] 本地即时判定当前请求需调用工具，激活协议级锁定 (tool_choice: required)`);
     }
   }
 
