@@ -613,6 +613,119 @@ function getAllTools() {
   return tools;
 }
 
+function findWriteTool() {
+  const writeKeywords = [
+    "push_files",
+    "create_or_update_file",
+    "create_file",
+    "update_file",
+    "write_file",
+    "push",
+    "write"
+  ];
+  for (const s of mcpServers.values()) {
+    if (s.status !== "active") continue;
+    for (const t of s.tools) {
+      const lower = t.rawName.toLowerCase();
+      if (writeKeywords.some((kw) => lower.includes(kw))) {
+        return t;
+      }
+    }
+  }
+  return null;
+}
+
+function extractFileBlocksFromText(text) {
+  if (!text || typeof text !== "string") return [];
+  const results = [];
+  const codeBlockRegex = /```(?:[a-zA-Z0-9_-]+)?(?:\s+(?:filepath=|path=|file=)?([^\s\n]+))?\n([\s\S]*?)```/g;
+  let match;
+  while ((match = codeBlockRegex.exec(text)) !== null) {
+    let filePath = match[1] ? match[1].trim() : "";
+    const content = match[2];
+
+    if (!filePath) {
+      const lines = content.split("\n");
+      const firstLine = lines[0] || "";
+      const headerMatch = firstLine.match(/(?:\/\/\s*|#\s*|<!--\s*)(?:filepath:|path:|file:)\s*([^\s\n*]+)/i);
+      if (headerMatch) {
+        filePath = headerMatch[1].trim();
+      }
+    }
+
+    if (!filePath) {
+      const beforeIndex = Math.max(0, match.index - 120);
+      const textBefore = text.slice(beforeIndex, match.index);
+      const beforeMatch = textBefore.match(/(?:文件|路径|file|path)[：:\s`'"]+([a-zA-Z0-9_./\\-]+\.[a-zA-Z0-9]+)/i);
+      if (beforeMatch) {
+        filePath = beforeMatch[1].trim();
+      }
+    }
+
+    if (filePath && content !== undefined && content.trim().length > 0) {
+      results.push({
+        path: filePath.replace(/^[./\\]+/, ""),
+        content: content
+      });
+    }
+  }
+  return results;
+}
+
+async function executeAutoFallbackWrite(files, userText) {
+  const writeTool = findWriteTool();
+  if (!writeTool || !files || files.length === 0) return null;
+
+  const rawName = writeTool.rawName.toLowerCase();
+  let args = {};
+
+  let owner = process.env.GITHUB_OWNER || "";
+  let repo = process.env.GITHUB_REPO || "";
+  let branch = process.env.GITHUB_BRANCH || "main";
+
+  const repoMatch = (userText || "").match(/([a-zA-Z0-9_-]+)\/([a-zA-Z0-9_-]+)/);
+  if (repoMatch) {
+    owner = owner || repoMatch[1];
+    repo = repo || repoMatch[2];
+  }
+
+  if (rawName.includes("push_files")) {
+    args = {
+      owner,
+      repo,
+      branch,
+      message: `Update ${files.map((f) => f.path).join(", ")} via proxy auto-commit`,
+      files: files.map((f) => ({ path: f.path, content: f.content }))
+    };
+  } else if (rawName.includes("create_or_update_file") || rawName.includes("write")) {
+    const targetFile = files[0];
+    args = {
+      owner,
+      repo,
+      path: targetFile.path,
+      content: targetFile.content,
+      message: `Update ${targetFile.path} via proxy auto-commit`,
+      branch
+    };
+  } else {
+    return null;
+  }
+
+  try {
+    addDebugLog("AGENT", `[代偿执行] 检测到模型在正文输出代码但未调用工具，代理层主动触发写入 [${writeTool.key}]`, args);
+    const result = await callMcpTool(writeTool.key, args);
+    return {
+      success: true,
+      toolKey: writeTool.key,
+      files: files.map((f) => f.path),
+      output: result
+    };
+  } catch (err) {
+    addDebugLog("ERROR", `[代偿执行] 自动写入失败: ${err.message}`, { args });
+    return null;
+  }
+}
+
 function upstreamChatCompletionsUrl() {
   if (!UPSTREAM_BASE_URL) throw new Error("未配置 UPSTREAM_BASE_URL 环境变量");
   if (UPSTREAM_BASE_URL.endsWith("/chat/completions")) return UPSTREAM_BASE_URL;
@@ -682,7 +795,7 @@ function extractFinishReason(parsedChunkOrJson) {
   return null;
 }
 
-// 直通模式（全面支持未开 MCP 模型的自动抗截断断点续接）
+// 直通模式
 async function passThrough(requestBody, clientResponse, reqMeta, abortSignal) {
   const startTime = Date.now();
   setCorsHeaders(clientResponse);
@@ -925,7 +1038,7 @@ function isModelEnabledForMcp(modelName) {
   return false;
 }
 
-// Gemini 原生格式双向转换模块（全面支持文本与多模态图片）
+// Gemini 原生格式双向转换
 function convertGeminiToOpenAIMessages(body) {
   const messages = [];
   if (body.systemInstruction?.parts) {
@@ -1050,7 +1163,6 @@ async function handleGeminiGenerateContent(modelName, isStream, geminiBody, clie
     max_tokens: geminiBody.generationConfig?.maxOutputTokens
   };
 
-  // 全方位适配 Chatbox 的 thinkingLevel 与 thinkingBudget
   if (geminiBody.generationConfig?.thinkingConfig) {
     openAiBody.thinkingConfig = geminiBody.generationConfig.thinkingConfig;
     const tc = geminiBody.generationConfig.thinkingConfig;
@@ -1321,7 +1433,6 @@ async function passThroughAndTransformGemini(requestBody, clientResponse, isStre
             if (choice?.delta?.content) {
               accumulatedContent += choice.delta.content;
             }
-            // 如果因达到上限被截断，先不发截断的结束状态，准备自动续接
             if (isTruncatedFinishReason(reason)) {
               const geminiChunk = convertOpenAiChunkToGemini({
                 ...parsed,
@@ -1348,7 +1459,6 @@ async function passThroughAndTransformGemini(requestBody, clientResponse, isStre
       break;
     }
 
-    // 准确检测是否被上游截断（兼容 length、max_tokens、MAX_TOKENS 等）
     if (isTruncatedFinishReason(lastFinishReason) && accumulatedContent && !abortSignal?.aborted && !clientResponse.destroyed) {
       continueRound += 1;
       addDebugLog("AGENT", `⚠️ [抗截断触发] 检测到上游返回截断 (${lastFinishReason})！正在自动进行第 ${continueRound} 次无感断点续接...`, {
@@ -1403,6 +1513,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
     ? lastUserMsg.content
     : (Array.isArray(lastUserMsg?.content) ? lastUserMsg.content.map((c) => c.text || "").join(" ") : "");
   const hasWriteIntent = WRITE_INTENT_PATTERN.test(userText);
+  const detectedWriteTool = findWriteTool();
 
   if (isStream) {
     setCorsHeaders(clientResponse);
@@ -1414,7 +1525,6 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
     });
   }
 
-  // 标准 SSE 注释保活心跳：绝不破坏下游客户端的 JSON 解析，同时确保反代连接永不断开
   let keepAliveTimer = null;
   if (isStream) {
     keepAliveTimer = setInterval(() => {
@@ -1429,6 +1539,8 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
   }
 
   let finalFinishReason = null;
+  let isolatedRetryCount = 0;
+  const MAX_ISOLATED_RETRIES = 1;
 
   try {
     for (let round = 0; ; round += 1) {
@@ -1441,8 +1553,23 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       if (round === 0 && hasWriteIntent) {
         roundMessages.push({
           role: "system",
-          content: "【核心系统约束】检测到写操作指令。你必须直接调用对应的工具执行写入，严禁直接输出“已修改/已提交”等口头文本答复。"
+          content: "【核心系统约束】检测到写操作指令。你必须调用写入工具完成操作，严禁输出任何口头文本答复。"
         });
+      }
+
+      let activeTools = tools;
+      let activeToolChoice = "auto";
+
+      if (tools.length > 0) {
+        if (round === 0 && hasWriteIntent && detectedWriteTool) {
+          activeToolChoice = {
+            type: "function",
+            function: { name: detectedWriteTool.key }
+          };
+          addDebugLog("AGENT", `[协议锁定] 首轮写操作强制锁定写入工具: ${detectedWriteTool.key}`);
+        } else if (round === 0 && hasWriteIntent) {
+          activeToolChoice = "required";
+        }
       }
 
       const payload = {
@@ -1451,26 +1578,17 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         stream: isStream
       };
 
-      if (tools.length > 0) {
-        payload.tools = tools;
-        if (round === 0 && hasWriteIntent) {
-          payload.tool_choice = "required";
-          addDebugLog("AGENT", `[意图拦截] 检测到写入/修改指令，第一轮强制 tool_choice = "required"，阻断虚假文本回复`);
-        } else {
-          payload.tool_choice = "auto";
-        }
+      if (activeTools.length > 0) {
+        payload.tools = activeTools;
+        payload.tool_choice = activeToolChoice;
       }
 
       const roundStartTime = Date.now();
-      addDebugLog("UPSTREAM", `第 ${round + 1} 轮上游调用请求 - 消息量: ${messages.length}`, {
+      addDebugLog("UPSTREAM", `第 ${round + 1} 轮上游调用请求 - 消息量: ${roundMessages.length}`, {
         round: round + 1,
         toolsEnabled: Boolean(payload.tools),
-        messagesCount: messages.length,
-        upstreamPayloadSummary: {
-          reasoning_effort: payload.reasoning_effort,
-          thinkingConfig: payload.thinkingConfig,
-          thinking_budget: payload.thinking_budget
-        }
+        tool_choice: payload.tool_choice,
+        messagesCount: roundMessages.length
       });
 
       let upstreamResponse;
@@ -1493,7 +1611,6 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       }
 
       const roundDuration = Date.now() - roundStartTime;
-
       if (abortSignal?.aborted || clientResponse.destroyed) return;
 
       if (!upstreamResponse.ok) {
@@ -1529,6 +1646,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         if (abortSignal?.aborted || clientResponse.destroyed) return;
         const choice = json.choices?.[0];
         const message = choice?.message;
+        const content = message?.content || "";
         const toolCalls = message?.tool_calls || [];
         finalFinishReason = extractFinishReason(json);
 
@@ -1543,16 +1661,32 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         });
 
         if (mcpCalls.length === 0) {
-          if (round === 0 && hasWriteIntent && FAKE_CONFIRM_PATTERN.test(message?.content || "")) {
-            addDebugLog("AGENT", `⚠️ [假提交拦截] 非流式检测到模型未调用工具直接声称已提交，已拦截并纠偏`, {
-              content: message?.content
-            });
-            messages.push({ role: "assistant", content: message?.content });
-            messages.push({
-              role: "user",
-              content: "【错误拦截】你未调用任何 MCP 工具，严禁文字假装提交。必须立即调用工具执行操作！"
-            });
-            continue;
+          if (hasWriteIntent) {
+            const extractedFiles = extractFileBlocksFromText(content);
+            if (extractedFiles.length > 0) {
+              const fallbackResult = await executeAutoFallbackWrite(extractedFiles, userText);
+              if (fallbackResult && fallbackResult.success) {
+                choice.message.content = `${content}\n\n---\n✅ **[代理层代偿写入]**：已捕获代码并成功调用工具 \`${fallbackResult.toolKey}\` 写入仓库。\n已提交文件: ${fallbackResult.files.join(", ")}`;
+                sendJson(clientResponse, 200, json);
+                return;
+              }
+            }
+
+            if (FAKE_CONFIRM_PATTERN.test(content) && isolatedRetryCount < MAX_ISOLATED_RETRIES && detectedWriteTool) {
+              isolatedRetryCount += 1;
+              addDebugLog("AGENT", `⚠️ [脱毒隔离重试] 丢弃假提交文本，剥离长历史，单轮纯净上下文强制调用写入工具`);
+              messages = [
+                {
+                  role: "system",
+                  content: `【系统强制指令】当前为写操作任务。必须且只能调用工具 [${detectedWriteTool.key}] 提交修改，严禁输出任何自然语言文本！`
+                },
+                {
+                  role: "user",
+                  content: userText
+                }
+              ];
+              continue;
+            }
           }
 
           addDebugLog("AGENT", `第 ${round + 1} 轮最终完成 - 非流式响应返回客户端`, {
@@ -1647,12 +1781,9 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
                 }
               }
 
-              // 遇到正文内容：累计内容
               if (delta?.content) {
                 assistantContent += delta.content;
-                // 关键保护：若本轮检测到工具调用，严禁透传草稿正文，防止下游误判提前截断；
-                // 若首轮存在写操作意图，暂缓冲草稿，防止模型吐出虚假提交词直接被下游看见
-                const shouldBuffer = round === 0 && hasWriteIntent && !hasToolCalls;
+                const shouldBuffer = hasWriteIntent && !hasToolCalls;
                 if (!hasToolCalls && !shouldBuffer && !clientResponse.destroyed && !abortSignal?.aborted) {
                   if (isTruncatedFinishReason(reason)) {
                     const sanitized = {
@@ -1665,7 +1796,6 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
                   }
                 }
               } else if (delta?.reasoning_content) {
-                // 深度思考原生内容透传
                 if (!clientResponse.destroyed && !abortSignal?.aborted) {
                   clientResponse.write(`${line}\n\n`);
                 }
@@ -1695,22 +1825,46 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         return false;
       });
 
-      // 没有工具调用，检查是否达到 Token 上限截断或被拦截的假提交
       if (mcpCalls.length === 0) {
-        if (round === 0 && hasWriteIntent && FAKE_CONFIRM_PATTERN.test(assistantContent)) {
-          addDebugLog("AGENT", `⚠️ [假提交拦截] 流式检测到模型未调用 MCP 工具直接声称已提交，已物理拦截并重试纠偏`, {
-            content: assistantContent
-          });
-          messages.push({ role: "assistant", content: assistantContent });
-          messages.push({
-            role: "user",
-            content: "【错误拦截】你未调用任何 MCP 工具，严禁文字假装提交。必须立即调用工具执行操作！"
-          });
-          continue;
+        if (hasWriteIntent) {
+          const extractedFiles = extractFileBlocksFromText(assistantContent);
+          if (extractedFiles.length > 0) {
+            const fallbackResult = await executeAutoFallbackWrite(extractedFiles, userText);
+            if (fallbackResult && fallbackResult.success) {
+              if (!clientResponse.destroyed && !abortSignal?.aborted) {
+                sendSSEChunk(clientResponse, { content: assistantContent }, requestBody.model);
+                sendSSEChunk(
+                  clientResponse,
+                  {
+                    content: `\n\n---\n✅ **[代理层代偿写入]**：已捕获生成代码并成功调用工具 \`${fallbackResult.toolKey}\` 写入仓库。\n已提交文件: ${fallbackResult.files.join(", ")}`
+                  },
+                  requestBody.model
+                );
+                clientResponse.write("data: [DONE]\n\n");
+                clientResponse.end();
+              }
+              return;
+            }
+          }
+
+          if (FAKE_CONFIRM_PATTERN.test(assistantContent) && isolatedRetryCount < MAX_ISOLATED_RETRIES && detectedWriteTool) {
+            isolatedRetryCount += 1;
+            addDebugLog("AGENT", `⚠️ [脱毒隔离重试] 流式检测到假提交，丢弃脏历史，单轮纯净上下文强制调用写入工具`);
+            messages = [
+              {
+                role: "system",
+                content: `【系统强制指令】当前为写操作任务。必须且只能调用工具 [${detectedWriteTool.key}] 提交修改，严禁输出任何自然语言文本！`
+              },
+              {
+                role: "user",
+                content: userText
+              }
+            ];
+            continue;
+          }
         }
 
-        // 如果此前首轮因写操作意图而缓冲了内容，且确认不是假提交，则一次性向客户端补发该内容
-        if (round === 0 && hasWriteIntent && assistantContent && !clientResponse.destroyed && !abortSignal?.aborted) {
+        if (hasWriteIntent && assistantContent && !clientResponse.destroyed && !abortSignal?.aborted) {
           sendSSEChunk(clientResponse, { content: assistantContent }, requestBody.model);
         }
 
@@ -1737,7 +1891,6 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         return;
       }
 
-      // 如果有工具调用，记录进入历史
       messages.push({
         role: "assistant",
         content: assistantContent || null,
@@ -1971,7 +2124,6 @@ const server = http.createServer(async (request, response) => {
         return;
       }
 
-      // 日志调试接口
       if (request.method === "GET" && reqUrl.pathname === "/api/logs") {
         sendJson(response, 200, {
           enabled: loggingEnabled,
@@ -2099,7 +2251,6 @@ const server = http.createServer(async (request, response) => {
       }
     }
 
-    // Google Gemini 官方格式路由: /(v1|v1beta)/models/...
     const geminiMatch = reqUrl.pathname.match(/^\/(?:v1|v1beta)\/models\/(.+):(generateContent|streamGenerateContent)$/);
     if (geminiMatch) {
       if (!isProxyAuthorized(request)) {
@@ -2142,7 +2293,6 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 只有 /v1/ 下的 OpenAI 客户端接口才进行 PROXY_API_KEY 校验
     if (reqUrl.pathname.startsWith("/v1/")) {
       if (!isProxyAuthorized(request)) {
         const authHeader = request.headers.authorization || "(无 Authorization 请求头)";
