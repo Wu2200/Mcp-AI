@@ -613,14 +613,27 @@ function getAllTools() {
   return tools;
 }
 
-function isExplicitSystemAction(userText) {
-  if (!userText || typeof userText !== "string") return false;
-  const EXPLICIT_PERSIST_PATTERN = /(提交到|推送到|写入仓库|保存到仓库|保存到github|推到github|创建pr|提pr|提issue|创建分支|克隆仓库|git\s*(commit|push|checkout|branch)|在github上(创建|修改|删除|更新)|向(仓库|github|云端|数据库)(提交|写入|推送))/i;
-  return EXPLICIT_PERSIST_PATTERN.test(userText);
+function detectActionIntent(userText) {
+  if (!userText || typeof userText !== "string") {
+    return { needsTool: false, isWrite: false };
+  }
+  const text = userText.trim();
+
+  const writeVerb = /(修改|修改下|改下|改一下|修一下|修复|更新|更新下|添加|增加|加一个|删除|删掉|重写|创建|新建|写入|覆盖|替换|调整|优化下|把.+改成|提交|推送|commit|push|write|update|create|delete)/i;
+  const writeTarget = /(代码|文件|配置|仓库|bug|接口|函数|样式|组件|依赖|项目|分支|pr|github|readme|\.[a-z0-9]{1,5})/i;
+  const isDirectWrite = writeVerb.test(text) && (writeTarget.test(text) || text.length <= 40);
+
+  const readVerb = /(查看|看一下|读取|获取|搜索|查一下|查找|找一下|列出|分析下|读一下|fetch|get|read|search|list)/i;
+  const readTarget = /(文件|代码|目录|仓库|分支|提交|commit|pr|issue|内容|日志|log|\.[a-z0-9]{1,5})/i;
+  const isDirectRead = readVerb.test(text) && readTarget.test(text);
+
+  const isWrite = Boolean(isDirectWrite);
+  const needsTool = Boolean(isDirectWrite || isDirectRead);
+  return { needsTool, isWrite };
 }
 
 function selectRelevantTools(userText, allTools) {
-  if (!allTools || allTools.length <= 12) {
+  if (!allTools || allTools.length <= 15) {
     return allTools || [];
   }
 
@@ -643,6 +656,12 @@ function selectRelevantTools(userText, allTools) {
       }
     }
 
+    if (text.includes("改") || text.includes("写") || text.includes("修") || text.includes("创建") || text.includes("更新")) {
+      if (name.includes("write") || name.includes("push") || name.includes("create") || name.includes("update") || name.includes("edit")) {
+        score += 5;
+      }
+    }
+
     if (text.includes("搜索") || text.includes("查") || text.includes("search")) {
       if (name.includes("search") || desc.includes("search") || desc.includes("搜索")) {
         score += 5;
@@ -655,9 +674,9 @@ function selectRelevantTools(userText, allTools) {
   scored.sort((a, b) => b.score - a.score);
   const relevant = scored.filter((item) => item.score > 0).map((item) => item.tool);
   if (relevant.length >= 3) {
-    return relevant.slice(0, 15);
+    return relevant.slice(0, 20);
   }
-  return allTools.slice(0, 15);
+  return allTools.slice(0, 20);
 }
 
 function upstreamChatCompletionsUrl() {
@@ -1436,13 +1455,14 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
   const relevantMcpTools = selectRelevantTools(userText, rawMcpTools);
   const tools = [...clientTools, ...relevantMcpTools];
 
-  const isExplicitPersist = isExplicitSystemAction(userText);
+  const { needsTool, isWrite } = detectActionIntent(userText);
 
-  addDebugLog("AGENT", `启动 MCP 调度 - 模型 [${requestBody.model}] - 筛选后工具数: ${tools.length} (总挂载: ${rawMcpTools.length}) - 强写操作锁定: ${isExplicitPersist}`, {
+  addDebugLog("AGENT", `启动 MCP 调度 - 模型 [${requestBody.model}] - 筛选后工具数: ${tools.length} (总挂载: ${rawMcpTools.length}) - 动作需求: ${needsTool} (写操作: ${isWrite})`, {
     model: requestBody.model,
     stream: isStream,
     filteredToolCount: tools.length,
-    isExplicitPersist,
+    needsTool,
+    isWrite,
     initialMessages: messages.length
   });
 
@@ -1480,16 +1500,16 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       }
 
       let roundMessages = [...messages];
-      if (round === 0 && isExplicitPersist) {
+      if (round === 0 && isWrite) {
         roundMessages.push({
           role: "system",
-          content: "【强制执行指令】检测到外部仓库/系统写入请求。严禁输出口头假提交，必须直接调用对应的写入工具（function call）完成操作。"
+          content: "【强制执行指令】检测到针对代码、配置或文件的修改/写入任务。严禁输出口头假提交或未执行的解释性答复，必须直接发起对应的工具调用（function call）完成实际写入与保存。"
         });
       }
 
       const activeTools = tools;
       let activeToolChoice = "auto";
-      if (tools.length > 0 && round === 0 && isExplicitPersist) {
+      if (tools.length > 0 && round === 0 && isWrite) {
         activeToolChoice = "required";
       }
 
