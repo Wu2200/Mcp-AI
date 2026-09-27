@@ -613,32 +613,51 @@ function getAllTools() {
   return tools;
 }
 
-function evaluateToolRequirementFast(userText, availableTools) {
-  if (!availableTools || availableTools.length === 0 || !userText) {
-    return false;
+function isExplicitSystemAction(userText) {
+  if (!userText || typeof userText !== "string") return false;
+  const EXPLICIT_PERSIST_PATTERN = /(提交到|推送到|写入仓库|保存到仓库|保存到github|推到github|创建pr|提pr|提issue|创建分支|克隆仓库|git\s*(commit|push|checkout|branch)|在github上(创建|修改|删除|更新)|向(仓库|github|云端|数据库)(提交|写入|推送))/i;
+  return EXPLICIT_PERSIST_PATTERN.test(userText);
+}
+
+function selectRelevantTools(userText, allTools) {
+  if (!allTools || allTools.length <= 12) {
+    return allTools || [];
   }
 
-  const toolNameTokens = new Set();
-  for (const t of availableTools) {
-    const rawName = t.function?.name || "";
-    const parts = rawName.toLowerCase().split(/[^a-z0-9]+/);
+  const text = (userText || "").toLowerCase();
+  const scored = allTools.map((t) => {
+    const name = (t.function?.name || "").toLowerCase();
+    const desc = (t.function?.description || "").toLowerCase();
+    let score = 0;
+
+    const parts = name.split(/[^a-z0-9]+/);
     for (const p of parts) {
-      if (p.length >= 3 && !["mcp", "get", "api", "set", "post"].includes(p)) {
-        toolNameTokens.add(p);
+      if (p.length >= 3 && text.includes(p)) {
+        score += 3;
       }
     }
-  }
 
-  const text = userText.toLowerCase();
-  for (const token of toolNameTokens) {
-    if (text.includes(token)) {
-      return true;
+    if (text.includes("git") || text.includes("github") || text.includes("仓库") || text.includes("提交") || text.includes("push")) {
+      if (name.includes("git") || name.includes("push") || name.includes("commit") || name.includes("file") || name.includes("branch")) {
+        score += 5;
+      }
     }
+
+    if (text.includes("搜索") || text.includes("查") || text.includes("search")) {
+      if (name.includes("search") || desc.includes("search") || desc.includes("搜索")) {
+        score += 5;
+      }
+    }
+
+    return { tool: t, score };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+  const relevant = scored.filter((item) => item.score > 0).map((item) => item.tool);
+  if (relevant.length >= 3) {
+    return relevant.slice(0, 15);
   }
-
-  const FAST_ACTION_PATTERN = /(搜索|查询|查一下|找一下|读取|查看|打开|获取|下载|抓取|执行|运行|运行下|操作|写入|修改|更新|覆盖|删除|创建|新建|提交|推送|push|pull|commit|fetch|exec|search|run|read|write|create|update|delete|git|github|http|https|\.js|\.ts|\.json|\.py|\.go|\.html|\.css|仓库|分支|pr|issue|文件|目录|终端|命令|代码库|数据库|表)/i;
-
-  return FAST_ACTION_PATTERN.test(userText);
+  return allTools.slice(0, 15);
 }
 
 function upstreamChatCompletionsUrl() {
@@ -712,7 +731,6 @@ function extractFinishReason(parsedChunkOrJson) {
 
 // 直通模式
 async function passThrough(requestBody, clientResponse, reqMeta, abortSignal) {
-  const startTime = Date.now();
   setCorsHeaders(clientResponse);
   const isStream = requestBody.stream === true;
 
@@ -1406,32 +1424,27 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
   const isStream = requestBody.stream === true;
   let messages = [...requestBody.messages];
 
-  const clientTools = Array.isArray(requestBody.tools)
-    ? requestBody.tools.filter((t) => t && t.type === "function")
-    : [];
-  const mcpTools = getAllTools();
-  const tools = [...clientTools, ...mcpTools];
-
-  addDebugLog("AGENT", `启动 MCP 调度 - 模型 [${requestBody.model}] - 挂载工具数: ${tools.length}`, {
-    model: requestBody.model,
-    stream: isStream,
-    mcpToolCount: mcpTools.length,
-    clientToolCount: clientTools.length,
-    initialMessages: messages.length
-  });
-
   const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
   const userText = typeof lastUserMsg?.content === "string"
     ? lastUserMsg.content
     : (Array.isArray(lastUserMsg?.content) ? lastUserMsg.content.map((c) => c.text || "").join(" ") : "");
 
-  let isToolRequiredForTask = false;
-  if (tools.length > 0 && userText) {
-    isToolRequiredForTask = evaluateToolRequirementFast(userText, tools);
-    if (isToolRequiredForTask) {
-      addDebugLog("AGENT", `[前置路由] 本地即时判定当前请求需调用工具，激活协议级锁定 (tool_choice: required)`);
-    }
-  }
+  const clientTools = Array.isArray(requestBody.tools)
+    ? requestBody.tools.filter((t) => t && t.type === "function")
+    : [];
+  const rawMcpTools = getAllTools();
+  const relevantMcpTools = selectRelevantTools(userText, rawMcpTools);
+  const tools = [...clientTools, ...relevantMcpTools];
+
+  const isExplicitPersist = isExplicitSystemAction(userText);
+
+  addDebugLog("AGENT", `启动 MCP 调度 - 模型 [${requestBody.model}] - 筛选后工具数: ${tools.length} (总挂载: ${rawMcpTools.length}) - 强写操作锁定: ${isExplicitPersist}`, {
+    model: requestBody.model,
+    stream: isStream,
+    filteredToolCount: tools.length,
+    isExplicitPersist,
+    initialMessages: messages.length
+  });
 
   if (isStream) {
     setCorsHeaders(clientResponse);
@@ -1467,22 +1480,17 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       }
 
       let roundMessages = [...messages];
-      if (round === 0 && isToolRequiredForTask) {
+      if (round === 0 && isExplicitPersist) {
         roundMessages.push({
           role: "system",
-          content: "【协议调度要求】当前任务需使用可用工具获取数据或执行操作。必须直接调用相应的工具（function call），严禁在未经工具调用的情况下直接口头答复操作结果。"
+          content: "【强制执行指令】检测到外部仓库/系统写入请求。严禁输出口头假提交，必须直接调用对应的写入工具（function call）完成操作。"
         });
       }
 
-      let activeTools = tools;
+      const activeTools = tools;
       let activeToolChoice = "auto";
-
-      if (tools.length > 0) {
-        if (round === 0 && isToolRequiredForTask) {
-          activeToolChoice = "required";
-        } else {
-          activeToolChoice = "auto";
-        }
+      if (tools.length > 0 && round === 0 && isExplicitPersist) {
+        activeToolChoice = "required";
       }
 
       const payload = {
@@ -1760,6 +1768,11 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         const args = toolArguments({ function: { arguments: tc.arguments } });
 
         if (!abortSignal?.aborted && !clientResponse.destroyed) {
+          sendSSEChunk(
+            clientResponse,
+            { content: `\n> ⏳ 正在调用 [${displayName}] 执行操作: \`${rawAction}\`...\n` },
+            requestBody.model
+          );
           sendReasoningChunk(
             clientResponse,
             `\n> 正在执行 ${displayName} [${rawAction}]...\n`,
@@ -1780,6 +1793,11 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         }
 
         if (!abortSignal?.aborted && !clientResponse.destroyed) {
+          sendSSEChunk(
+            clientResponse,
+            { content: `> ✅ [${displayName}] 执行完成\n\n` },
+            requestBody.model
+          );
           sendReasoningChunk(
             clientResponse,
             `> ${displayName} [${rawAction}] 完成\n\n`,
