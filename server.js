@@ -613,116 +613,49 @@ function getAllTools() {
   return tools;
 }
 
-function findWriteTool() {
-  const writeKeywords = [
-    "push_files",
-    "create_or_update_file",
-    "create_file",
-    "update_file",
-    "write_file",
-    "push",
-    "write"
-  ];
-  for (const s of mcpServers.values()) {
-    if (s.status !== "active") continue;
-    for (const t of s.tools) {
-      const lower = t.rawName.toLowerCase();
-      if (writeKeywords.some((kw) => lower.includes(kw))) {
-        return t;
-      }
-    }
-  }
-  return null;
-}
-
-function extractFileBlocksFromText(text) {
-  if (!text || typeof text !== "string") return [];
-  const results = [];
-  const codeBlockRegex = /```(?:[a-zA-Z0-9_-]+)?(?:\s+(?:filepath=|path=|file=)?([^\s\n]+))?\n([\s\S]*?)```/g;
-  let match;
-  while ((match = codeBlockRegex.exec(text)) !== null) {
-    let filePath = match[1] ? match[1].trim() : "";
-    const content = match[2];
-
-    if (!filePath) {
-      const lines = content.split("\n");
-      const firstLine = lines[0] || "";
-      const headerMatch = firstLine.match(/(?:\/\/\s*|#\s*|<!--\s*)(?:filepath:|path:|file:)\s*([^\s\n*]+)/i);
-      if (headerMatch) {
-        filePath = headerMatch[1].trim();
-      }
-    }
-
-    if (!filePath) {
-      const beforeIndex = Math.max(0, match.index - 120);
-      const textBefore = text.slice(beforeIndex, match.index);
-      const beforeMatch = textBefore.match(/(?:文件|路径|file|path)[：:\s`'"]+([a-zA-Z0-9_./\\-]+\.[a-zA-Z0-9]+)/i);
-      if (beforeMatch) {
-        filePath = beforeMatch[1].trim();
-      }
-    }
-
-    if (filePath && content !== undefined && content.trim().length > 0) {
-      results.push({
-        path: filePath.replace(/^[./\\]+/, ""),
-        content: content
-      });
-    }
-  }
-  return results;
-}
-
-async function executeAutoFallbackWrite(files, userText) {
-  const writeTool = findWriteTool();
-  if (!writeTool || !files || files.length === 0) return null;
-
-  const rawName = writeTool.rawName.toLowerCase();
-  let args = {};
-
-  let owner = process.env.GITHUB_OWNER || "";
-  let repo = process.env.GITHUB_REPO || "";
-  let branch = process.env.GITHUB_BRANCH || "main";
-
-  const repoMatch = (userText || "").match(/([a-zA-Z0-9_-]+)\/([a-zA-Z0-9_-]+)/);
-  if (repoMatch) {
-    owner = owner || repoMatch[1];
-    repo = repo || repoMatch[2];
+async function evaluateToolRequirement(userText, availableTools, modelName) {
+  if (!availableTools || availableTools.length === 0 || !userText) {
+    return { required: false };
   }
 
-  if (rawName.includes("push_files")) {
-    args = {
-      owner,
-      repo,
-      branch,
-      message: `Update ${files.map((f) => f.path).join(", ")} via proxy auto-commit`,
-      files: files.map((f) => ({ path: f.path, content: f.content }))
-    };
-  } else if (rawName.includes("create_or_update_file") || rawName.includes("write")) {
-    const targetFile = files[0];
-    args = {
-      owner,
-      repo,
-      path: targetFile.path,
-      content: targetFile.content,
-      message: `Update ${targetFile.path} via proxy auto-commit`,
-      branch
-    };
-  } else {
-    return null;
-  }
+  const toolSummaries = availableTools
+    .map((t) => `- ${t.function.name}: ${t.function.description || "无描述"}`)
+    .join("\n");
+
+  const prompt = [
+    "你是一个工具需求判定网关。下面是当前系统已挂载的 MCP 工具列表：",
+    toolSummaries,
+    "",
+    "用户最新输入如下：",
+    `"""${userText.slice(0, 1500)}"""`,
+    "",
+    "任务指令：判断用户的诉求是否需要调用上述任意工具（例如查询外部信息、读写资源、执行操作、执行指令等）。",
+    "规则：只需回答一个单词。需要调用工具输出 YES，纯打招呼或普通概念咨询输出 NO。严禁输出其他任何解释。"
+  ].join("\n");
 
   try {
-    addDebugLog("AGENT", `[代偿执行] 检测到模型在正文输出代码但未调用工具，代理层主动触发写入 [${writeTool.key}]`, args);
-    const result = await callMcpTool(writeTool.key, args);
-    return {
-      success: true,
-      toolKey: writeTool.key,
-      files: files.map((f) => f.path),
-      output: result
-    };
-  } catch (err) {
-    addDebugLog("ERROR", `[代偿执行] 自动写入失败: ${err.message}`, { args });
-    return null;
+    const response = await fetch(upstreamChatCompletionsUrl(), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${UPSTREAM_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: modelName || "default",
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0,
+        max_tokens: 10,
+        stream: false
+      }),
+      signal: AbortSignal.timeout(3500)
+    });
+
+    if (!response.ok) return { required: false };
+    const json = await response.json();
+    const answer = (json.choices?.[0]?.message?.content || "").trim().toUpperCase();
+    return { required: answer.includes("YES") };
+  } catch {
+    return { required: false };
   }
 }
 
@@ -1505,15 +1438,19 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
     initialMessages: messages.length
   });
 
-  const WRITE_INTENT_PATTERN = /(修改|提交|写入|更新|覆盖|删除|创建|推送|新建|修复|写进|commit|push|write|update|delete|create|edit|save|patch|modify)/i;
-  const FAKE_CONFIRM_PATTERN = /(已提交|已修改|已更新|已创建|已保存|已推送|已删除|已修复|已成功修改|已经修改)/;
-
   const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
   const userText = typeof lastUserMsg?.content === "string"
     ? lastUserMsg.content
     : (Array.isArray(lastUserMsg?.content) ? lastUserMsg.content.map((c) => c.text || "").join(" ") : "");
-  const hasWriteIntent = WRITE_INTENT_PATTERN.test(userText);
-  const detectedWriteTool = findWriteTool();
+
+  let isToolRequiredForTask = false;
+  if (tools.length > 0 && userText) {
+    const evalResult = await evaluateToolRequirement(userText, tools, requestBody.model);
+    isToolRequiredForTask = evalResult.required;
+    if (isToolRequiredForTask) {
+      addDebugLog("AGENT", `[前置网关路由] 判定当前用户请求需要调用 MCP 工具，激活协议级锁定 (tool_choice: required)`);
+    }
+  }
 
   if (isStream) {
     setCorsHeaders(clientResponse);
@@ -1539,8 +1476,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
   }
 
   let finalFinishReason = null;
-  let isolatedRetryCount = 0;
-  const MAX_ISOLATED_RETRIES = 1;
+  let executedToolCount = 0;
 
   try {
     for (let round = 0; ; round += 1) {
@@ -1550,10 +1486,10 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       }
 
       let roundMessages = [...messages];
-      if (round === 0 && hasWriteIntent) {
+      if (round === 0 && isToolRequiredForTask) {
         roundMessages.push({
           role: "system",
-          content: "【核心系统约束】检测到写操作指令。你必须调用写入工具完成操作，严禁输出任何口头文本答复。"
+          content: "【协议调度要求】当前任务需使用可用工具获取数据或执行操作。必须直接调用相应的工具（function call），严禁在未经工具调用的情况下直接口头答复操作结果。"
         });
       }
 
@@ -1561,14 +1497,10 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       let activeToolChoice = "auto";
 
       if (tools.length > 0) {
-        if (round === 0 && hasWriteIntent && detectedWriteTool) {
-          activeToolChoice = {
-            type: "function",
-            function: { name: detectedWriteTool.key }
-          };
-          addDebugLog("AGENT", `[协议锁定] 首轮写操作强制锁定写入工具: ${detectedWriteTool.key}`);
-        } else if (round === 0 && hasWriteIntent) {
+        if (round === 0 && isToolRequiredForTask) {
           activeToolChoice = "required";
+        } else {
+          activeToolChoice = "auto";
         }
       }
 
@@ -1646,7 +1578,6 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         if (abortSignal?.aborted || clientResponse.destroyed) return;
         const choice = json.choices?.[0];
         const message = choice?.message;
-        const content = message?.content || "";
         const toolCalls = message?.tool_calls || [];
         finalFinishReason = extractFinishReason(json);
 
@@ -1661,35 +1592,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         });
 
         if (mcpCalls.length === 0) {
-          if (hasWriteIntent) {
-            const extractedFiles = extractFileBlocksFromText(content);
-            if (extractedFiles.length > 0) {
-              const fallbackResult = await executeAutoFallbackWrite(extractedFiles, userText);
-              if (fallbackResult && fallbackResult.success) {
-                choice.message.content = `${content}\n\n---\n✅ **[代理层代偿写入]**：已捕获代码并成功调用工具 \`${fallbackResult.toolKey}\` 写入仓库。\n已提交文件: ${fallbackResult.files.join(", ")}`;
-                sendJson(clientResponse, 200, json);
-                return;
-              }
-            }
-
-            if (FAKE_CONFIRM_PATTERN.test(content) && isolatedRetryCount < MAX_ISOLATED_RETRIES && detectedWriteTool) {
-              isolatedRetryCount += 1;
-              addDebugLog("AGENT", `⚠️ [脱毒隔离重试] 丢弃假提交文本，剥离长历史，单轮纯净上下文强制调用写入工具`);
-              messages = [
-                {
-                  role: "system",
-                  content: `【系统强制指令】当前为写操作任务。必须且只能调用工具 [${detectedWriteTool.key}] 提交修改，严禁输出任何自然语言文本！`
-                },
-                {
-                  role: "user",
-                  content: userText
-                }
-              ];
-              continue;
-            }
-          }
-
-          addDebugLog("AGENT", `第 ${round + 1} 轮最终完成 - 非流式响应返回客户端`, {
+          addDebugLog("AGENT", `第 ${round + 1} 轮完成 - 非流式响应返回客户端 (累计执行工具 ${executedToolCount} 次)`, {
             finishReason: finalFinishReason,
             contentLength: message?.content?.length || 0
           });
@@ -1714,6 +1617,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
           let result;
           try {
             result = await callMcpTool(tc.function.name, args);
+            executedToolCount += 1;
           } catch (err) {
             result = JSON.stringify({ error: err.message });
           }
@@ -1783,8 +1687,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
 
               if (delta?.content) {
                 assistantContent += delta.content;
-                const shouldBuffer = hasWriteIntent && !hasToolCalls;
-                if (!hasToolCalls && !shouldBuffer && !clientResponse.destroyed && !abortSignal?.aborted) {
+                if (!hasToolCalls && !clientResponse.destroyed && !abortSignal?.aborted) {
                   if (isTruncatedFinishReason(reason)) {
                     const sanitized = {
                       ...parsed,
@@ -1826,48 +1729,6 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       });
 
       if (mcpCalls.length === 0) {
-        if (hasWriteIntent) {
-          const extractedFiles = extractFileBlocksFromText(assistantContent);
-          if (extractedFiles.length > 0) {
-            const fallbackResult = await executeAutoFallbackWrite(extractedFiles, userText);
-            if (fallbackResult && fallbackResult.success) {
-              if (!clientResponse.destroyed && !abortSignal?.aborted) {
-                sendSSEChunk(clientResponse, { content: assistantContent }, requestBody.model);
-                sendSSEChunk(
-                  clientResponse,
-                  {
-                    content: `\n\n---\n✅ **[代理层代偿写入]**：已捕获生成代码并成功调用工具 \`${fallbackResult.toolKey}\` 写入仓库。\n已提交文件: ${fallbackResult.files.join(", ")}`
-                  },
-                  requestBody.model
-                );
-                clientResponse.write("data: [DONE]\n\n");
-                clientResponse.end();
-              }
-              return;
-            }
-          }
-
-          if (FAKE_CONFIRM_PATTERN.test(assistantContent) && isolatedRetryCount < MAX_ISOLATED_RETRIES && detectedWriteTool) {
-            isolatedRetryCount += 1;
-            addDebugLog("AGENT", `⚠️ [脱毒隔离重试] 流式检测到假提交，丢弃脏历史，单轮纯净上下文强制调用写入工具`);
-            messages = [
-              {
-                role: "system",
-                content: `【系统强制指令】当前为写操作任务。必须且只能调用工具 [${detectedWriteTool.key}] 提交修改，严禁输出任何自然语言文本！`
-              },
-              {
-                role: "user",
-                content: userText
-              }
-            ];
-            continue;
-          }
-        }
-
-        if (hasWriteIntent && assistantContent && !clientResponse.destroyed && !abortSignal?.aborted) {
-          sendSSEChunk(clientResponse, { content: assistantContent }, requestBody.model);
-        }
-
         if (isTruncatedFinishReason(roundFinishReason) && assistantContent && !abortSignal?.aborted && !clientResponse.destroyed) {
           addDebugLog("AGENT", `⚠️ [抗截断触发] MCP 调度检测到截断 (${roundFinishReason})！正在自动进行无感断点续接...`, {
             round: round + 1,
@@ -1883,7 +1744,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
           clientResponse.write("data: [DONE]\n\n");
           clientResponse.end();
         }
-        addDebugLog("AGENT", `第 ${round + 1} 轮流式完成输出 - 结束原因: ${roundFinishReason || "stop"}`, {
+        addDebugLog("AGENT", `第 ${round + 1} 轮流式完成输出 - 结束原因: ${roundFinishReason || "stop"} (累计执行工具 ${executedToolCount} 次)`, {
           round: round + 1,
           finishReason: roundFinishReason,
           totalRounds: round + 1
@@ -1931,6 +1792,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         } else {
           try {
             result = await callMcpTool(tc.name, args);
+            executedToolCount += 1;
           } catch (err) {
             result = JSON.stringify({ error: err instanceof Error ? err.message : "Tool execution failed" });
           }
