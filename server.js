@@ -1395,6 +1395,15 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
     initialMessages: messages.length
   });
 
+  const WRITE_INTENT_PATTERN = /(修改|提交|写入|更新|覆盖|删除|创建|推送|新建|修复|写进|commit|push|write|update|delete|create|edit|save|patch|modify)/i;
+  const FAKE_CONFIRM_PATTERN = /(已提交|已修改|已更新|已创建|已保存|已推送|已删除|已修复|已成功修改|已经修改)/;
+
+  const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
+  const userText = typeof lastUserMsg?.content === "string"
+    ? lastUserMsg.content
+    : (Array.isArray(lastUserMsg?.content) ? lastUserMsg.content.map((c) => c.text || "").join(" ") : "");
+  const hasWriteIntent = WRITE_INTENT_PATTERN.test(userText);
+
   if (isStream) {
     setCorsHeaders(clientResponse);
     clientResponse.writeHead(200, {
@@ -1428,15 +1437,28 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         break;
       }
 
+      let roundMessages = [...messages];
+      if (round === 0 && hasWriteIntent) {
+        roundMessages.push({
+          role: "system",
+          content: "【核心系统约束】检测到写操作指令。你必须直接调用对应的工具执行写入，严禁直接输出“已修改/已提交”等口头文本答复。"
+        });
+      }
+
       const payload = {
         ...requestBody,
-        messages,
+        messages: roundMessages,
         stream: isStream
       };
 
       if (tools.length > 0) {
         payload.tools = tools;
-        payload.tool_choice = "auto";
+        if (round === 0 && hasWriteIntent) {
+          payload.tool_choice = "required";
+          addDebugLog("AGENT", `[意图拦截] 检测到写入/修改指令，第一轮强制 tool_choice = "required"，阻断虚假文本回复`);
+        } else {
+          payload.tool_choice = "auto";
+        }
       }
 
       const roundStartTime = Date.now();
@@ -1521,6 +1543,18 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         });
 
         if (mcpCalls.length === 0) {
+          if (round === 0 && hasWriteIntent && FAKE_CONFIRM_PATTERN.test(message?.content || "")) {
+            addDebugLog("AGENT", `⚠️ [假提交拦截] 非流式检测到模型未调用工具直接声称已提交，已拦截并纠偏`, {
+              content: message?.content
+            });
+            messages.push({ role: "assistant", content: message?.content });
+            messages.push({
+              role: "user",
+              content: "【错误拦截】你未调用任何 MCP 工具，严禁文字假装提交。必须立即调用工具执行操作！"
+            });
+            continue;
+          }
+
           addDebugLog("AGENT", `第 ${round + 1} 轮最终完成 - 非流式响应返回客户端`, {
             finishReason: finalFinishReason,
             contentLength: message?.content?.length || 0
@@ -1616,8 +1650,10 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
               // 遇到正文内容：累计内容
               if (delta?.content) {
                 assistantContent += delta.content;
-                // 关键保护：若本轮检测到工具调用，严禁透传草稿正文，防止下游误判提前截断；只有确定无工具调用时直接流式推送
-                if (!hasToolCalls && !clientResponse.destroyed && !abortSignal?.aborted) {
+                // 关键保护：若本轮检测到工具调用，严禁透传草稿正文，防止下游误判提前截断；
+                // 若首轮存在写操作意图，暂缓冲草稿，防止模型吐出虚假提交词直接被下游看见
+                const shouldBuffer = round === 0 && hasWriteIntent && !hasToolCalls;
+                if (!hasToolCalls && !shouldBuffer && !clientResponse.destroyed && !abortSignal?.aborted) {
                   if (isTruncatedFinishReason(reason)) {
                     const sanitized = {
                       ...parsed,
@@ -1659,8 +1695,25 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         return false;
       });
 
-      // 没有工具调用，检查是否达到 Token 上限截断：若是且客户端未断开则进行自动无感断点续接
+      // 没有工具调用，检查是否达到 Token 上限截断或被拦截的假提交
       if (mcpCalls.length === 0) {
+        if (round === 0 && hasWriteIntent && FAKE_CONFIRM_PATTERN.test(assistantContent)) {
+          addDebugLog("AGENT", `⚠️ [假提交拦截] 流式检测到模型未调用 MCP 工具直接声称已提交，已物理拦截并重试纠偏`, {
+            content: assistantContent
+          });
+          messages.push({ role: "assistant", content: assistantContent });
+          messages.push({
+            role: "user",
+            content: "【错误拦截】你未调用任何 MCP 工具，严禁文字假装提交。必须立即调用工具执行操作！"
+          });
+          continue;
+        }
+
+        // 如果此前首轮因写操作意图而缓冲了内容，且确认不是假提交，则一次性向客户端补发该内容
+        if (round === 0 && hasWriteIntent && assistantContent && !clientResponse.destroyed && !abortSignal?.aborted) {
+          sendSSEChunk(clientResponse, { content: assistantContent }, requestBody.model);
+        }
+
         if (isTruncatedFinishReason(roundFinishReason) && assistantContent && !abortSignal?.aborted && !clientResponse.destroyed) {
           addDebugLog("AGENT", `⚠️ [抗截断触发] MCP 调度检测到截断 (${roundFinishReason})！正在自动进行无感断点续接...`, {
             round: round + 1,
