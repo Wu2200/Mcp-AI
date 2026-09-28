@@ -61,8 +61,6 @@
       margin-bottom: 14px;
       box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05);
     }
-    
-    /* 彻底重构标题栏排版：移动端友好，绝不产生单字竖排 */
     .card-title {
       font-size: 15px;
       font-weight: 600;
@@ -170,7 +168,6 @@
       color: #0f172a;
     }
 
-    /* 优化操作按钮条：手机端自动多行并列自适应 */
     .action-group {
       display: flex;
       flex-wrap: wrap;
@@ -265,9 +262,10 @@
       font-size: 12px;
       color: #475569;
       display: flex;
+      flex-wrap: wrap;
       align-items: center;
-      gap: 6px;
-      margin-top: 4px;
+      gap: 8px;
+      margin-top: 6px;
     }
     .tool-toggle-btn {
       background: none;
@@ -276,7 +274,7 @@
       font-size: 12px;
       cursor: pointer;
       padding: 0;
-      font-weight: 500;
+      font-weight: 600;
       white-space: nowrap;
     }
     .tool-toggle-btn:hover {
@@ -290,14 +288,37 @@
     }
     .tag {
       display: inline-block;
-      background: #e2e8f0;
-      color: #334155;
       font-size: 11px;
       font-family: monospace;
-      padding: 3px 6px;
+      padding: 3px 7px;
       border-radius: 4px;
       margin: 2px 4px 4px 0;
       word-break: break-all;
+      cursor: pointer;
+      user-select: none;
+      transition: all 0.15s;
+    }
+    .tag-enabled {
+      background: #e0f2fe;
+      color: #0369a1;
+      border: 1px solid #bae6fd;
+    }
+    .tag-enabled:hover {
+      background: #fee2e2;
+      color: #dc2626;
+      border-color: #fecaca;
+    }
+    .tag-disabled {
+      background: #f1f5f9;
+      color: #94a3b8;
+      border: 1px solid #e2e8f0;
+      text-decoration: line-through;
+    }
+    .tag-disabled:hover {
+      background: #dcfce7;
+      color: #166534;
+      border-color: #bbf7d0;
+      text-decoration: none;
     }
     .model-tag {
       display: inline-flex;
@@ -355,7 +376,6 @@
       font-size: 13px;
     }
 
-    /* 日志控制台样式：移动端完美展示 */
     .log-panel-container {
       background: #0f172a;
       border: 1px solid #334155;
@@ -457,16 +477,15 @@
         </div>
       </div>
       <div class="group">
-        <label>API 域名 (Base URL)</label>
+        <label>API 域名</label>
         <div class="box" id="proxy-url"></div>
       </div>
       <div class="group">
-        <label>模型 (Model)</label>
-        <div class="box">跟随你的上游设置（如 gpt-4o、claude-3-5-sonnet、gemini-2.5-flash 等）</div>
+        <label>模型</label>
+        <div class="box">跟随你的上游设置</div>
       </div>
     </div>
 
-    <!-- 全链路调试抓包日志卡片 -->
     <div class="card">
       <div class="card-title">
         <div class="card-title-left">
@@ -489,37 +508,36 @@
       <span id="log-msg"></span>
     </div>
 
-    <!-- 启用模型配置卡片（白名单模式） -->
     <div class="card">
       <div class="card-title">
         <div class="card-title-left">
-          <span>启用 MCP 的模型设置（白名单模式）</span>
+          <span>启用 MCP 的模型设置</span>
           <span class="badge badge-green">仅选中模型支持 MCP</span>
         </div>
       </div>
       <p style="font-size: 12px; color: #64748b; margin-bottom: 12px;">
-        <strong>白名单规则</strong>：只有加入此列表的模型才会挂载 MCP 工具。未在此列表中的其他所有模型将<strong>完全纯净直通上游</strong>（绝不携带任何 tools 参数），从而 100% 触发上游网关自带的原生网络搜索。
+        白名单规则：只有加入此列表的模型才会挂载 MCP 工具。未在此列表中的其他所有模型将完全纯净直通上游，绝不携带任何 tools 参数，从而 100% 触发上游网关自带的原生网络搜索。
       </p>
 
       <div class="group">
-        <label>当前支持 MCP 的模型列表（支持完全匹配或通配符，如 claude*、gpt-4o*）：</label>
+        <label>当前支持 MCP 的模型列表：</label>
         <div id="enabled-tags" style="min-height: 34px; padding: 4px 0;">
           <span style="font-size: 12px; color: #94a3b8;">暂未启用任何模型，所有请求默认直通上游网关。</span>
         </div>
       </div>
 
       <div class="group" style="display: flex; gap: 8px; margin-top: 8px;">
-        <input id="custom-model-input" placeholder="输入模型名称或通配符（如 claude*，回车添加）" onkeydown="if(event.key==='Enter')addCustomModel()">
+        <input id="custom-model-input" placeholder="输入模型名称或通配符回车添加" onkeydown="if(event.key==='Enter')addCustomModel()">
         <button class="btn btn-secondary" onclick="addCustomModel()">添加</button>
       </div>
 
       <div class="group" style="margin-top: 12px;">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-          <label style="margin: 0;">从上游所有模型中选择（点击即可开启 MCP）：</label>
+          <label style="margin: 0;">从上游所有模型中选择：</label>
           <button class="btn-action btn-start" onclick="fetchUpstreamModels()">刷新上游模型</button>
         </div>
         <div id="upstream-candidates" style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px; max-height: 120px; overflow-y: auto;">
-          <span style="font-size: 12px; color: #94a3b8;">点击上方“刷新上游模型”按钮获取上游所有可用模型</span>
+          <span style="font-size: 12px; color: #94a3b8;">点击上方刷新上游模型按钮获取上游所有可用模型</span>
         </div>
       </div>
 
@@ -529,24 +547,23 @@
       </div>
     </div>
 
-    <!-- 手动挂载 MCP 服务卡片 -->
     <div class="card">
       <div class="card-title">
         <div class="card-title-left">
-          <span>手动挂载 MCP 服务（支持添加多个）</span>
+          <span>手动挂载 MCP 服务</span>
         </div>
       </div>
       <div class="group">
-        <label>服务前缀名称（如 Github、Gitlab、Notion 等）</label>
+        <label>服务前缀名称</label>
         <input id="mcp-name" value="Github" placeholder="输入唯一标识名称">
       </div>
       <div class="group">
-        <label>MCP 服务地址 (HTTP / SSE 端点)</label>
+        <label>MCP 服务地址</label>
         <input id="mcp-url" value="https://api.githubcopilot.com/mcp/" placeholder="https://...">
       </div>
       <div class="group">
-        <label>认证令牌 (Token，可选)</label>
-        <input id="mcp-token" type="password" placeholder="如需认证请粘贴 Token（如 ghu_、ghp_）">
+        <label>认证令牌</label>
+        <input id="mcp-token" type="password" placeholder="如需认证请粘贴 Token">
       </div>
       <div style="display: flex; align-items: center; margin-top: 14px;">
         <button id="btn-conn" class="btn" onclick="handleConnect()">添加服务</button>
@@ -554,7 +571,6 @@
       </div>
     </div>
 
-    <!-- 已挂载 MCP 服务列表 -->
     <div class="card">
       <div class="card-title">
         <div class="card-title-left">
@@ -674,11 +690,37 @@
       if (!el || !btn) return;
       if (el.style.display === "block") {
         el.style.display = "none";
-        btn.innerText = "[展开查看]";
+        btn.innerText = "展开查看";
       } else {
         el.style.display = "block";
-        btn.innerText = "[点击收起]";
+        btn.innerText = "点击收起";
       }
+    }
+
+    async function setToolsMode(serverId, action) {
+      try {
+        const res = await fetch(`/api/mcp/servers/${serverId}/tools`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action })
+        });
+        if (res.ok) {
+          loadServers();
+        }
+      } catch {}
+    }
+
+    async function toggleSingleTool(serverId, toolKey, nextState) {
+      try {
+        const res = await fetch(`/api/mcp/servers/${serverId}/tools`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "toggle", toolKey, enabled: nextState })
+        });
+        if (res.ok) {
+          loadServers();
+        }
+      } catch {}
     }
 
     function toggleLogDetail(id) {
@@ -820,7 +862,14 @@
             ? `<button class="btn-action btn-stop" onclick="handleStop('${s.id}')">断开</button>`
             : `<button class="btn-action btn-start" onclick="handleStart('${s.id}')">启动</button>`;
 
-          let tags = s.tools.map(t => '<span class="tag">' + t.key + '</span>').join("");
+          const enabledCount = s.tools.filter(t => t.enabled !== false).length;
+
+          let tags = s.tools.map(t => {
+            const isEnabled = t.enabled !== false;
+            return isEnabled
+              ? `<span class="tag tag-enabled" onclick="toggleSingleTool('${s.id}', '${t.key}', false)" title="点击禁用">✓ ${t.key}</span>`
+              : `<span class="tag tag-disabled" onclick="toggleSingleTool('${s.id}', '${t.key}', true)" title="点击启用">✕ ${t.key}</span>`;
+          }).join("");
 
           html += `
             <div class="server-item ${isActive ? '' : 'disabled'}">
@@ -836,8 +885,11 @@
               </div>
               <div class="server-item-url">${s.url}</div>
               <div class="tool-toggle-bar">
-                <span>工具清单 (${s.toolCount})</span>
-                <button id="toggle-btn-${s.id}" class="tool-toggle-btn" onclick="toggleTools('${s.id}')">[展开查看]</button>
+                <span>工具清单: ${enabledCount} / ${s.toolCount} 启用</span>
+                <button id="toggle-btn-${s.id}" class="tool-toggle-btn" onclick="toggleTools('${s.id}')">展开查看</button>
+                <button class="tool-toggle-btn" style="color: #16a34a;" onclick="setToolsMode('${s.id}', 'readonly')">一键只读</button>
+                <button class="tool-toggle-btn" style="color: #2563eb;" onclick="setToolsMode('${s.id}', 'enable_all')">全选</button>
+                <button class="tool-toggle-btn" style="color: #dc2626;" onclick="setToolsMode('${s.id}', 'disable_all')">清空</button>
               </div>
               <div id="tools-${s.id}" class="tools-container">
                 ${tags}
