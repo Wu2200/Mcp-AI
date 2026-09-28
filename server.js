@@ -1583,7 +1583,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
             choices: [
               {
                 index: 0,
-                delta: { content: `\n\n⚠️ [上游接口返回错误 ${upstreamResponse.status}]: ${errText.slice(0, 500)}` },
+                delta: { content: `\n\n⚠️ [上游接口返回错误 ${upstreamResponse.status}]: ${errTxt.slice(0, 500)}` },
                 finish_reason: "stop"
               }
             ]
@@ -2112,6 +2112,84 @@ const server = http.createServer(async (request, response) => {
             const raw = (t.rawName || t.key).toLowerCase();
             t.enabled = !writePattern.test(raw);
           }
+        } else if (action === "auto_detect") {
+          let detectedScopes = [];
+          let isFullRepo = false;
+          let isReadOnlyToken = false;
+          let testUser = "";
+
+          if (s.rawToken) {
+            try {
+              const tokenHeader = s.rawToken.startsWith("Bearer ") ? s.rawToken : `Bearer ${s.rawToken}`;
+              const testRes = await fetch("https://api.github.com/user", {
+                headers: {
+                  Authorization: tokenHeader,
+                  "User-Agent": "mcp-agent-proxy/1.0.0"
+                }
+              });
+              if (testRes.ok) {
+                const uData = await testRes.json();
+                testUser = uData.login || "";
+                const scopes = testRes.headers.get("x-oauth-scopes");
+                if (scopes !== null) {
+                  detectedScopes = scopes.split(",").map((x) => x.trim()).filter(Boolean);
+                  isFullRepo = detectedScopes.includes("repo");
+                  isReadOnlyToken = !isFullRepo && !detectedScopes.includes("public_repo");
+                }
+              }
+            } catch {}
+          }
+
+          const writePattern = /(create|update|delete|write|push|merge|add_|reply|fork|run_)/i;
+          let disabledCount = 0;
+          let enabledCount = 0;
+
+          if (isReadOnlyToken || (!isFullRepo && detectedScopes.length > 0)) {
+            for (const t of s.tools) {
+              const raw = (t.rawName || t.key).toLowerCase();
+              if (writePattern.test(raw)) {
+                t.enabled = false;
+                disabledCount++;
+              } else {
+                t.enabled = true;
+                enabledCount++;
+              }
+            }
+          } else {
+            for (const t of s.tools) {
+              t.enabled = true;
+              enabledCount++;
+            }
+          }
+
+          for (const [key, val] of mcpToolRegistry.entries()) {
+            if (val.serverId === id) {
+              mcpToolRegistry.delete(key);
+            }
+          }
+          if (s.status === "active") {
+            for (const t of s.tools) {
+              if (t.enabled !== false) {
+                mcpToolRegistry.set(t.key, {
+                  serverId: s.id,
+                  serverName: s.name,
+                  rawName: t.rawName,
+                  postEndpoint: s.postEndpoint,
+                  headers: s.headers
+                });
+              }
+            }
+          }
+          await saveServerToStorage(s);
+          sendJson(response, 200, {
+            success: true,
+            server: s,
+            user: testUser,
+            scopes: detectedScopes,
+            enabledCount,
+            disabledCount
+          });
+          return;
         } else if (action === "enable_all") {
           for (const t of s.tools) {
             t.enabled = true;
