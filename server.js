@@ -633,7 +633,7 @@ function detectActionIntent(userText) {
 }
 
 function selectRelevantTools(userText, allTools) {
-  if (!allTools || allTools.length <= 15) {
+  if (!allTools || allTools.length <= 80) {
     return allTools || [];
   }
 
@@ -650,21 +650,30 @@ function selectRelevantTools(userText, allTools) {
       }
     }
 
-    if (text.includes("git") || text.includes("github") || text.includes("仓库") || text.includes("提交") || text.includes("push")) {
-      if (name.includes("git") || name.includes("push") || name.includes("commit") || name.includes("file") || name.includes("branch")) {
-        score += 5;
+    if (text.includes("git") || text.includes("github") || text.includes("仓库") || text.includes("提交") || text.includes("push") || text.includes("repo")) {
+      if (
+        name.includes("git") ||
+        name.includes("push") ||
+        name.includes("commit") ||
+        name.includes("file") ||
+        name.includes("branch") ||
+        name.includes("repo") ||
+        desc.includes("repo") ||
+        desc.includes("仓库")
+      ) {
+        score += 8;
       }
     }
 
-    if (text.includes("改") || text.includes("写") || text.includes("修") || text.includes("创建") || text.includes("更新")) {
+    if (text.includes("改") || text.includes("写") || text.includes("修") || text.includes("创建") || text.includes("更新") || text.includes("增加")) {
       if (name.includes("write") || name.includes("push") || name.includes("create") || name.includes("update") || name.includes("edit")) {
         score += 5;
       }
     }
 
-    if (text.includes("搜索") || text.includes("查") || text.includes("search")) {
-      if (name.includes("search") || desc.includes("search") || desc.includes("搜索")) {
-        score += 5;
+    if (text.includes("搜索") || text.includes("查") || text.includes("search") || text.includes("找") || text.includes("列出") || text.includes("list")) {
+      if (name.includes("search") || desc.includes("search") || desc.includes("搜索") || name.includes("list") || desc.includes("list") || desc.includes("列出")) {
+        score += 8;
       }
     }
 
@@ -673,10 +682,10 @@ function selectRelevantTools(userText, allTools) {
 
   scored.sort((a, b) => b.score - a.score);
   const relevant = scored.filter((item) => item.score > 0).map((item) => item.tool);
-  if (relevant.length >= 3) {
-    return relevant.slice(0, 20);
+  if (relevant.length >= 10) {
+    return relevant.slice(0, 50);
   }
-  return allTools.slice(0, 20);
+  return allTools.slice(0, 50);
 }
 
 function upstreamChatCompletionsUrl() {
