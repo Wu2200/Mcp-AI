@@ -272,13 +272,15 @@ async function loadConfigFromStorage() {
           mcpServers.set(row.id, serverInfo);
           if (status === "active") {
             for (const t of tools) {
-              mcpToolRegistry.set(t.key, {
-                serverId: row.id,
-                serverName: row.name,
-                rawName: t.rawName,
-                postEndpoint: row.post_endpoint,
-                headers
-              });
+              if (t.enabled !== false) {
+                mcpToolRegistry.set(t.key, {
+                  serverId: row.id,
+                  serverName: row.name,
+                  rawName: t.rawName,
+                  postEndpoint: row.post_endpoint,
+                  headers
+                });
+              }
             }
           }
         }
@@ -297,13 +299,15 @@ async function loadConfigFromStorage() {
       mcpServers.set(item.id, item);
       if (status === "active") {
         for (const t of item.tools) {
-          mcpToolRegistry.set(t.key, {
-            serverId: item.id,
-            serverName: item.name,
-            rawName: t.rawName,
-            postEndpoint: item.postEndpoint,
-            headers: item.headers
-          });
+          if (t.enabled !== false) {
+            mcpToolRegistry.set(t.key, {
+              serverId: item.id,
+              serverName: item.name,
+              rawName: t.rawName,
+              postEndpoint: item.postEndpoint,
+              headers: item.headers
+            });
+          }
         }
       }
     }
@@ -475,6 +479,7 @@ async function connectToMcpServer({ name, url, token }) {
     registeredTools.push({
       key: toolKey,
       rawName: t.name,
+      enabled: true,
       openAiTool: {
         type: "function",
         function: {
@@ -607,7 +612,11 @@ function getAllTools() {
   const tools = [];
   for (const s of mcpServers.values()) {
     if (s.status === "active") {
-      for (const t of s.tools) tools.push(t.openAiTool);
+      for (const t of s.tools) {
+        if (t.enabled !== false) {
+          tools.push(t.openAiTool);
+        }
+      }
     }
   }
   return tools;
@@ -757,7 +766,6 @@ function extractFinishReason(parsedChunkOrJson) {
   return null;
 }
 
-// 直通模式
 async function passThrough(requestBody, clientResponse, reqMeta, abortSignal) {
   setCorsHeaders(clientResponse);
   const isStream = requestBody.stream === true;
@@ -999,7 +1007,6 @@ function isModelEnabledForMcp(modelName) {
   return false;
 }
 
-// Gemini 原生格式双向转换
 function convertGeminiToOpenAIMessages(body) {
   const messages = [];
   if (body.systemInstruction?.parts) {
@@ -1648,7 +1655,6 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         continue;
       }
 
-      // 流式处理逻辑
       const reader = upstreamResponse.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
@@ -2084,6 +2090,61 @@ const server = http.createServer(async (request, response) => {
         return;
       }
 
+      const matchTools = reqUrl.pathname.match(/^\/api\/mcp\/servers\/([^/]+)\/tools$/);
+      if (request.method === "POST" && matchTools) {
+        const id = decodeURIComponent(matchTools[1]);
+        const s = mcpServers.get(id);
+        if (!s) {
+          sendJson(response, 404, { error: "未找到该服务" });
+          return;
+        }
+        const body = await readRequestBody(request);
+        const action = body.action;
+
+        if (action === "toggle") {
+          const targetTool = s.tools.find((t) => t.key === body.toolKey);
+          if (targetTool) {
+            targetTool.enabled = Boolean(body.enabled);
+          }
+        } else if (action === "readonly") {
+          const writePattern = /(create|update|delete|write|push|merge|add_|reply|fork|run_)/i;
+          for (const t of s.tools) {
+            const raw = (t.rawName || t.key).toLowerCase();
+            t.enabled = !writePattern.test(raw);
+          }
+        } else if (action === "enable_all") {
+          for (const t of s.tools) {
+            t.enabled = true;
+          }
+        } else if (action === "disable_all") {
+          for (const t of s.tools) {
+            t.enabled = false;
+          }
+        }
+
+        for (const [key, val] of mcpToolRegistry.entries()) {
+          if (val.serverId === id) {
+            mcpToolRegistry.delete(key);
+          }
+        }
+        if (s.status === "active") {
+          for (const t of s.tools) {
+            if (t.enabled !== false) {
+              mcpToolRegistry.set(t.key, {
+                serverId: s.id,
+                serverName: s.name,
+                rawName: t.rawName,
+                postEndpoint: s.postEndpoint,
+                headers: s.headers
+              });
+            }
+          }
+        }
+        await saveServerToStorage(s);
+        sendJson(response, 200, { success: true, server: s });
+        return;
+      }
+
       const matchStart = reqUrl.pathname.match(/^\/api\/mcp\/servers\/([^/]+)\/start$/);
       if (request.method === "POST" && matchStart) {
         const id = decodeURIComponent(matchStart[1]);
@@ -2094,13 +2155,15 @@ const server = http.createServer(async (request, response) => {
         }
         s.status = "active";
         for (const t of s.tools) {
-          mcpToolRegistry.set(t.key, {
-            serverId: s.id,
-            serverName: s.name,
-            rawName: t.rawName,
-            postEndpoint: s.postEndpoint,
-            headers: s.headers
-          });
+          if (t.enabled !== false) {
+            mcpToolRegistry.set(t.key, {
+              serverId: s.id,
+              serverName: s.name,
+              rawName: t.rawName,
+              postEndpoint: s.postEndpoint,
+              headers: s.headers
+            });
+          }
         }
         await saveServerToStorage(s);
         sendJson(response, 200, { success: true, status: "active" });
