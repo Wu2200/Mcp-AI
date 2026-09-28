@@ -259,8 +259,9 @@ async function loadConfigFromStorage() {
           const headers = typeof row.headers === "string" ? JSON.parse(row.headers) : (row.headers || {});
           const status = row.status || "active";
           for (const t of tools) {
-            if (t.enabled === undefined) t.enabled = true;
-            if (!t.status) t.status = "unchecked";
+            t.enabled = true;
+            t.status = "unchecked";
+            t.statusMessage = "";
           }
           const serverInfo = {
             id: row.id,
@@ -276,15 +277,13 @@ async function loadConfigFromStorage() {
           mcpServers.set(row.id, serverInfo);
           if (status === "active") {
             for (const t of tools) {
-              if (t.enabled !== false) {
-                mcpToolRegistry.set(t.key, {
-                  serverId: row.id,
-                  serverName: row.name,
-                  rawName: t.rawName,
-                  postEndpoint: row.post_endpoint,
-                  headers
-                });
-              }
+              mcpToolRegistry.set(t.key, {
+                serverId: row.id,
+                serverName: row.name,
+                rawName: t.rawName,
+                postEndpoint: row.post_endpoint,
+                headers
+              });
             }
           }
         }
@@ -301,21 +300,20 @@ async function loadConfigFromStorage() {
       const status = item.status || "active";
       item.status = status;
       for (const t of item.tools) {
-        if (t.enabled === undefined) t.enabled = true;
-        if (!t.status) t.status = "unchecked";
+        t.enabled = true;
+        t.status = "unchecked";
+        t.statusMessage = "";
       }
       mcpServers.set(item.id, item);
       if (status === "active") {
         for (const t of item.tools) {
-          if (t.enabled !== false) {
-            mcpToolRegistry.set(t.key, {
-              serverId: item.id,
-              serverName: item.name,
-              rawName: t.rawName,
-              postEndpoint: item.postEndpoint,
-              headers: item.headers
-            });
-          }
+          mcpToolRegistry.set(t.key, {
+            serverId: item.id,
+            serverName: item.name,
+            rawName: t.rawName,
+            postEndpoint: item.postEndpoint,
+            headers: item.headers
+          });
         }
       }
     }
@@ -760,7 +758,7 @@ function extractFinishReason(parsedChunkOrJson) {
   const candidate = parsedChunkOrJson.candidates?.[0];
   if (candidate?.finishReason) return candidate.finishReason;
   if (parsedChunkOrJson.finish_reason) return parsedChunkOrJson.finish_reason;
-  if (parsedChunkOrJson.finishReason) return parsedChunkOrJson.finishReason;
+  if (parsedChunkOrJson.finishReason) return parsedChunkOrJson.finish_reason;
   if (parsedChunkOrJson.status === "incomplete" && parsedChunkOrJson.incomplete_details?.reason) {
     return parsedChunkOrJson.incomplete_details.reason;
   }
@@ -1520,7 +1518,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       if (round === 0 && isWrite) {
         roundMessages.push({
           role: "system",
-          content: "【强制执行指令】检测到针对代码、配置或文件的修改/写入任务。严禁输出口头假提交或未执行的解释性答复，必须直接发起对应的工具调用（function call）完成实际写入与保存。"
+          content: "【强制执行指令】检测到针对代码、配置或文件的修改/写入任务。严禁输出口头假提交或未执行的解释性答复，必须直接发起对应的工具调用完成实际写入与保存。"
         });
       }
 
@@ -1853,75 +1851,55 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
   }
 }
 
-async function getTestModel() {
-  if (enabledModels.size > 0) {
+async function checkAllTools(modelName) {
+  if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
+    throw new Error("请先配置 UPSTREAM_BASE_URL 与 UPSTREAM_API_KEY 环境变量");
+  }
+
+  let targetModel = (modelName || "").trim();
+  if (!targetModel && enabledModels.size > 0) {
     for (const m of enabledModels) {
       const clean = m.replace(/\*/g, "").trim();
-      if (clean) return clean;
-    }
-  }
-  if (UPSTREAM_BASE_URL && UPSTREAM_API_KEY) {
-    const modelsUrl = UPSTREAM_BASE_URL.endsWith("/v1")
-      ? `${UPSTREAM_BASE_URL}/models`
-      : `${UPSTREAM_BASE_URL}/v1/models`;
-    try {
-      const res = await fetch(modelsUrl, {
-        headers: { Authorization: `Bearer ${UPSTREAM_API_KEY}` },
-        signal: AbortSignal.timeout(6000)
-      });
-      if (res.ok) {
-        const data = await res.json();
-        if (Array.isArray(data.data) && data.data.length > 0 && data.data[0].id) {
-          return data.data[0].id;
-        }
+      if (clean) {
+        targetModel = clean;
+        break;
       }
-    } catch {}
-  }
-  return "gpt-4o-mini";
-}
-
-async function testSingleToolWithUpstream(tool, modelName) {
-  if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
-    if (!tool.openAiTool?.function?.name) {
-      return { supported: false, reason: "工具格式无效" };
     }
-    return { supported: true, reason: "格式通过" };
   }
+
+  if (!targetModel) {
+    throw new Error("未指定检测模型，请在输入框中指定要测试的上游模型名称");
+  }
+
+  let pingRes;
   try {
-    const res = await fetch(upstreamChatCompletionsUrl(), {
+    pingRes = await fetch(upstreamChatCompletionsUrl(), {
       method: "POST",
       headers: {
         Authorization: `Bearer ${UPSTREAM_API_KEY}`,
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        model: modelName,
-        messages: [{ role: "user", content: "test" }],
-        tools: [tool.openAiTool],
+        model: targetModel,
+        messages: [{ role: "user", content: "ping" }],
         max_tokens: 1
       }),
       signal: AbortSignal.timeout(10000)
     });
-    if (res.ok) {
-      return { supported: true, reason: "支持" };
-    }
-    const errText = await res.text();
+  } catch (err) {
+    throw new Error(`上游请求失败: ${err.message}。未修改任何工具状态`);
+  }
+
+  if (!pingRes.ok) {
+    const errText = await pingRes.text();
     let msg = errText;
     try {
       const errJson = JSON.parse(errText);
       msg = errJson.error?.message || errText;
     } catch {}
-    if (res.status === 400 || res.status === 422 || /tool|function|schema|parameter/i.test(msg)) {
-      return { supported: false, reason: msg.slice(0, 100) };
-    }
-    return { supported: true, reason: "支持" };
-  } catch (err) {
-    return { supported: false, reason: err.message.slice(0, 100) };
+    throw new Error(`上游模型 [${targetModel}] 调用报错 (${pingRes.status}): ${msg.slice(0, 120)}。未修改任何工具状态`);
   }
-}
 
-async function checkAllTools() {
-  const modelName = await getTestModel();
   let total = 0;
   let supported = 0;
   let unsupported = 0;
@@ -1929,32 +1907,48 @@ async function checkAllTools() {
   for (const s of mcpServers.values()) {
     if (!Array.isArray(s.tools) || s.tools.length === 0) continue;
 
-    let allToolsValid = false;
-    if (UPSTREAM_BASE_URL && UPSTREAM_API_KEY) {
+    for (const t of s.tools) {
+      total += 1;
+      let isSupported = true;
+      let reason = "";
+
       try {
-        const batchRes = await fetch(upstreamChatCompletionsUrl(), {
+        const testRes = await fetch(upstreamChatCompletionsUrl(), {
           method: "POST",
           headers: {
             Authorization: `Bearer ${UPSTREAM_API_KEY}`,
             "Content-Type": "application/json"
           },
           body: JSON.stringify({
-            model: modelName,
+            model: targetModel,
             messages: [{ role: "user", content: "test" }],
-            tools: s.tools.map((t) => t.openAiTool),
+            tools: [t.openAiTool],
             max_tokens: 1
           }),
-          signal: AbortSignal.timeout(12000)
+          signal: AbortSignal.timeout(10000)
         });
-        if (batchRes.ok) {
-          allToolsValid = true;
-        }
-      } catch {}
-    }
 
-    if (allToolsValid) {
-      for (const t of s.tools) {
-        total += 1;
+        if (testRes.ok) {
+          isSupported = true;
+        } else {
+          const errText = await testRes.text();
+          let msg = errText;
+          try {
+            const errJson = JSON.parse(errText);
+            msg = errJson.error?.message || errText;
+          } catch {}
+          if (testRes.status === 400 || testRes.status === 422) {
+            isSupported = false;
+            reason = msg.slice(0, 100);
+          } else {
+            isSupported = true;
+          }
+        }
+      } catch {
+        isSupported = true;
+      }
+
+      if (isSupported) {
         supported += 1;
         t.status = "supported";
         t.statusMessage = "支持";
@@ -1968,40 +1962,20 @@ async function checkAllTools() {
             headers: s.headers
           });
         }
-      }
-    } else {
-      for (const t of s.tools) {
-        total += 1;
-        const testRes = await testSingleToolWithUpstream(t, modelName);
-        if (testRes.supported) {
-          supported += 1;
-          t.status = "supported";
-          t.statusMessage = "支持";
-          t.enabled = true;
-          if (s.status === "active") {
-            mcpToolRegistry.set(t.key, {
-              serverId: s.id,
-              serverName: s.name,
-              rawName: t.rawName,
-              postEndpoint: s.postEndpoint,
-              headers: s.headers
-            });
-          }
-        } else {
-          unsupported += 1;
-          t.status = "unsupported";
-          t.statusMessage = testRes.reason;
-          t.enabled = false;
-          mcpToolRegistry.delete(t.key);
-        }
+      } else {
+        unsupported += 1;
+        t.status = "unsupported";
+        t.statusMessage = reason || "参数格式不支持";
+        t.enabled = false;
+        mcpToolRegistry.delete(t.key);
       }
     }
 
     await saveServerToStorage(s);
   }
 
-  addDebugLog("AGENT", `AI一键检测完成，共 ${total} 个工具，支持 ${supported} 个，不支持并已自动禁用 ${unsupported} 个`);
-  return { total, supported, unsupported, model: modelName };
+  addDebugLog("AGENT", `AI一键检测完成 - 测试模型 [${targetModel}] - 共 ${total} 个工具，支持 ${supported} 个，不支持已自动禁用 ${unsupported} 个`);
+  return { total, supported, unsupported, model: targetModel };
 }
 
 function getLoginHtml() {
@@ -2242,9 +2216,40 @@ const server = http.createServer(async (request, response) => {
         return;
       }
 
+      if (request.method === "POST" && reqUrl.pathname === "/api/mcp/tools/enable-all") {
+        let count = 0;
+        for (const s of mcpServers.values()) {
+          if (!Array.isArray(s.tools)) continue;
+          for (const t of s.tools) {
+            t.enabled = true;
+            t.status = "unchecked";
+            t.statusMessage = "";
+            count += 1;
+            if (s.status === "active") {
+              mcpToolRegistry.set(t.key, {
+                serverId: s.id,
+                serverName: s.name,
+                rawName: t.rawName,
+                postEndpoint: s.postEndpoint,
+                headers: s.headers
+              });
+            }
+          }
+          await saveServerToStorage(s);
+        }
+        sendJson(response, 200, { success: true, count });
+        return;
+      }
+
       if (request.method === "POST" && reqUrl.pathname === "/api/mcp/check-tools") {
-        const result = await checkAllTools();
-        sendJson(response, 200, { success: true, ...result });
+        const body = await readRequestBody(request);
+        const modelName = (body.model || "").trim();
+        try {
+          const result = await checkAllTools(modelName);
+          sendJson(response, 200, { success: true, ...result });
+        } catch (e) {
+          sendJson(response, 400, { success: false, error: e.message });
+        }
         return;
       }
 
