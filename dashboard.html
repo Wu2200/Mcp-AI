@@ -61,8 +61,6 @@
       margin-bottom: 14px;
       box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05);
     }
-    
-    /* 彻底重构标题栏排版：移动端友好，绝不产生单字竖排 */
     .card-title {
       font-size: 15px;
       font-weight: 600;
@@ -170,7 +168,6 @@
       color: #0f172a;
     }
 
-    /* 优化操作按钮条：手机端自动多行并列自适应 */
     .action-group {
       display: flex;
       flex-wrap: wrap;
@@ -216,6 +213,16 @@
       background: #dc2626;
       color: #ffffff;
       border-color: #dc2626;
+    }
+    .btn-check {
+      background: #e0e7ff;
+      color: #3730a3;
+      border: 1px solid #c7d2fe;
+    }
+    .btn-check:hover {
+      background: #4f46e5;
+      color: #ffffff;
+      border-color: #4f46e5;
     }
 
     .server-item {
@@ -288,16 +295,57 @@
       border-top: 1px dashed #cbd5e1;
       display: none;
     }
-    .tag {
-      display: inline-block;
-      background: #e2e8f0;
-      color: #334155;
-      font-size: 11px;
+    .tool-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 6px 8px;
+      background: #ffffff;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      margin-bottom: 5px;
+      font-size: 12px;
+      gap: 8px;
+    }
+    .tool-row.disabled {
+      opacity: 0.6;
+      background: #f8fafc;
+    }
+    .tool-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      flex: 1;
+    }
+    .tool-checkbox {
+      width: 15px;
+      height: 15px;
+      cursor: pointer;
+      accent-color: #2563eb;
+      flex-shrink: 0;
+    }
+    .tool-name {
       font-family: monospace;
-      padding: 3px 6px;
-      border-radius: 4px;
-      margin: 2px 4px 4px 0;
-      word-break: break-all;
+      font-weight: 500;
+      color: #0f172a;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .tool-right {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+    .tool-reason {
+      font-size: 11px;
+      color: #dc2626;
+      max-width: 200px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     .model-tag {
       display: inline-flex;
@@ -343,7 +391,7 @@
       color: #166534;
       border-color: #86efac;
     }
-    #conn-msg, #enable-msg, #log-msg {
+    #conn-msg, #enable-msg, #log-msg, #check-msg {
       margin-left: 10px;
       font-size: 12px;
       font-weight: 500;
@@ -355,7 +403,6 @@
       font-size: 13px;
     }
 
-    /* 日志控制台样式：移动端完美展示 */
     .log-panel-container {
       background: #0f172a;
       border: 1px solid #334155;
@@ -453,20 +500,18 @@
       <div class="card-title">
         <div class="card-title-left">
           <span>客户端连接配置</span>
-          <span class="badge badge-blue">Chatbox 专用</span>
         </div>
       </div>
       <div class="group">
-        <label>API 域名 (Base URL)</label>
+        <label>API 域名</label>
         <div class="box" id="proxy-url"></div>
       </div>
       <div class="group">
-        <label>模型 (Model)</label>
-        <div class="box">跟随你的上游设置（如 gpt-4o、claude-3-5-sonnet、gemini-2.5-flash 等）</div>
+        <label>模型</label>
+        <div class="box">跟随你的上游设置，例如 gpt-4o、claude-3-5-sonnet、gemini-2.5-flash</div>
       </div>
     </div>
 
-    <!-- 全链路调试抓包日志卡片 -->
     <div class="card">
       <div class="card-title">
         <div class="card-title-left">
@@ -481,7 +526,7 @@
         </div>
       </div>
       <p style="font-size: 12px; color: #64748b; margin-bottom: 10px;">
-        捕获下游客户端请求、上游响应状态、工具执行耗时与截断诊断。若因达到最大 Token 发生截断会在此特别标红展示。点击任意记录可展开完整报文。
+        捕获下游客户端请求、上游响应状态、工具执行耗时与截断诊断。点击任意记录可展开完整报文。
       </p>
       <div id="log-panel" class="log-panel-container">
         <div class="empty-state" style="color: #64748b;">正在加载抓包记录...</div>
@@ -489,37 +534,35 @@
       <span id="log-msg"></span>
     </div>
 
-    <!-- 启用模型配置卡片（白名单模式） -->
     <div class="card">
       <div class="card-title">
         <div class="card-title-left">
-          <span>启用 MCP 的模型设置（白名单模式）</span>
-          <span class="badge badge-green">仅选中模型支持 MCP</span>
+          <span>启用 MCP 的模型设置</span>
         </div>
       </div>
       <p style="font-size: 12px; color: #64748b; margin-bottom: 12px;">
-        <strong>白名单规则</strong>：只有加入此列表的模型才会挂载 MCP 工具。未在此列表中的其他所有模型将<strong>完全纯净直通上游</strong>（绝不携带任何 tools 参数），从而 100% 触发上游网关自带的原生网络搜索。
+        只有加入此列表的模型才会挂载 MCP 工具。未在此列表中的其他所有模型将完全纯净直通上游网关。
       </p>
 
       <div class="group">
-        <label>当前支持 MCP 的模型列表（支持完全匹配或通配符，如 claude*、gpt-4o*）：</label>
+        <label>当前支持 MCP 的模型列表：</label>
         <div id="enabled-tags" style="min-height: 34px; padding: 4px 0;">
           <span style="font-size: 12px; color: #94a3b8;">暂未启用任何模型，所有请求默认直通上游网关。</span>
         </div>
       </div>
 
       <div class="group" style="display: flex; gap: 8px; margin-top: 8px;">
-        <input id="custom-model-input" placeholder="输入模型名称或通配符（如 claude*，回车添加）" onkeydown="if(event.key==='Enter')addCustomModel()">
+        <input id="custom-model-input" placeholder="输入模型名称后回车添加" onkeydown="if(event.key==='Enter')addCustomModel()">
         <button class="btn btn-secondary" onclick="addCustomModel()">添加</button>
       </div>
 
       <div class="group" style="margin-top: 12px;">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-          <label style="margin: 0;">从上游所有模型中选择（点击即可开启 MCP）：</label>
+          <label style="margin: 0;">从上游所有模型中选择：</label>
           <button class="btn-action btn-start" onclick="fetchUpstreamModels()">刷新上游模型</button>
         </div>
         <div id="upstream-candidates" style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px; max-height: 120px; overflow-y: auto;">
-          <span style="font-size: 12px; color: #94a3b8;">点击上方“刷新上游模型”按钮获取上游所有可用模型</span>
+          <span style="font-size: 12px; color: #94a3b8;">点击上方刷新上游模型按钮获取可用模型</span>
         </div>
       </div>
 
@@ -529,24 +572,23 @@
       </div>
     </div>
 
-    <!-- 手动挂载 MCP 服务卡片 -->
     <div class="card">
       <div class="card-title">
         <div class="card-title-left">
-          <span>手动挂载 MCP 服务（支持添加多个）</span>
+          <span>手动挂载 MCP 服务</span>
         </div>
       </div>
       <div class="group">
-        <label>服务前缀名称（如 Github、Gitlab、Notion 等）</label>
+        <label>服务前缀名称</label>
         <input id="mcp-name" value="Github" placeholder="输入唯一标识名称">
       </div>
       <div class="group">
-        <label>MCP 服务地址 (HTTP / SSE 端点)</label>
+        <label>MCP 服务地址</label>
         <input id="mcp-url" value="https://api.githubcopilot.com/mcp/" placeholder="https://...">
       </div>
       <div class="group">
-        <label>认证令牌 (Token，可选)</label>
-        <input id="mcp-token" type="password" placeholder="如需认证请粘贴 Token（如 ghu_、ghp_）">
+        <label>认证令牌</label>
+        <input id="mcp-token" type="password" placeholder="粘贴令牌">
       </div>
       <div style="display: flex; align-items: center; margin-top: 14px;">
         <button id="btn-conn" class="btn" onclick="handleConnect()">添加服务</button>
@@ -554,15 +596,23 @@
       </div>
     </div>
 
-    <!-- 已挂载 MCP 服务列表 -->
     <div class="card">
       <div class="card-title">
         <div class="card-title-left">
           <span>已挂载 MCP 服务列表</span>
         </div>
+        <div class="action-group">
+          <button id="btn-check-tools" class="btn-action btn-check" onclick="handleCheckTools()">AI一键检测</button>
+        </div>
       </div>
+      <p style="font-size: 12px; color: #64748b; margin-bottom: 10px;">
+        点击 AI一键检测 可检测当前上游模型对挂载工具的兼容度，不支持的工具将自动标记并禁用。
+      </p>
       <div id="mcp-list">
         <div class="empty-state">正在加载服务列表...</div>
+      </div>
+      <div style="margin-top: 8px;">
+        <span id="check-msg"></span>
       </div>
     </div>
   </div>
@@ -631,7 +681,7 @@
           body: JSON.stringify({ models: currentEnabledList })
         });
         if (res.ok) {
-          msg.innerText = "配置保存成功！仅选中的模型将启用 MCP。";
+          msg.innerText = "配置保存成功";
           msg.style.color = "#16a34a";
         } else {
           throw new Error("保存失败");
@@ -650,7 +700,7 @@
         const data = await res.json();
         const list = data.models || [];
         if (list.length === 0) {
-          container.innerHTML = '<span style="font-size: 12px; color: #94a3b8;">未获取到模型，请检查上游 UPSTREAM_BASE_URL 与 API KEY 配置。</span>';
+          container.innerHTML = '<span style="font-size: 12px; color: #94a3b8;">未获取到模型，请检查上游环境变量配置。</span>';
           return;
         }
         container.innerHTML = list.map(m => `
@@ -674,10 +724,10 @@
       if (!el || !btn) return;
       if (el.style.display === "block") {
         el.style.display = "none";
-        btn.innerText = "[展开查看]";
+        btn.innerText = "展开查看";
       } else {
         el.style.display = "block";
-        btn.innerText = "[点击收起]";
+        btn.innerText = "点击收起";
       }
     }
 
@@ -788,12 +838,51 @@
       const text = cachedLogs.map(l => `[${l.time}] [${l.type}] ${l.summary}\n${l.detail}\n----------------------------------------`).join("\n\n");
       navigator.clipboard.writeText(text).then(() => {
         const msg = document.getElementById("log-msg");
-        msg.innerText = "已复制全量抓包日志！";
+        msg.innerText = "已复制全量抓包日志";
         msg.style.color = "#16a34a";
         setTimeout(() => { msg.innerText = ""; }, 3000);
       }).catch(() => {
-        alert("复制失败，请手动在控制台查看。");
+        alert("复制失败，请手动在控制台查看");
       });
+    }
+
+    async function handleToggleTool(serverId, toolKey, isChecked) {
+      try {
+        await fetch(`/api/mcp/servers/${encodeURIComponent(serverId)}/tools/${encodeURIComponent(toolKey)}/toggle`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: isChecked })
+        });
+        loadServers();
+      } catch {}
+    }
+
+    async function handleCheckTools() {
+      const btn = document.getElementById("btn-check-tools");
+      const msg = document.getElementById("check-msg");
+      btn.disabled = true;
+      btn.innerText = "正在检测中...";
+      msg.innerText = "正在通过 AI 模型全面检测工具兼容性...";
+      msg.style.color = "#2563eb";
+
+      try {
+        const res = await fetch("/api/mcp/check-tools", { method: "POST" });
+        const data = await res.json();
+        if (res.ok && data.success) {
+          msg.innerText = `检测完成：共检测 ${data.total} 个工具，支持 ${data.supported} 个，不支持已自动禁用 ${data.unsupported} 个`;
+          msg.style.color = "#16a34a";
+        } else {
+          msg.innerText = "检测失败: " + (data.error || "未知原因");
+          msg.style.color = "#dc2626";
+        }
+        await loadServers();
+      } catch (err) {
+        msg.innerText = "检测异常: " + err.message;
+        msg.style.color = "#dc2626";
+      } finally {
+        btn.disabled = false;
+        btn.innerText = "AI一键检测";
+      }
     }
 
     async function loadServers() {
@@ -820,7 +909,36 @@
             ? `<button class="btn-action btn-stop" onclick="handleStop('${s.id}')">断开</button>`
             : `<button class="btn-action btn-start" onclick="handleStart('${s.id}')">启动</button>`;
 
-          let tags = s.tools.map(t => '<span class="tag">' + t.key + '</span>').join("");
+          let toolsHtml = "";
+          for (let t of s.tools) {
+            const isToolEnabled = t.enabled !== false;
+            let statusTag = '<span class="badge badge-gray">未检测</span>';
+            if (t.status === "supported") {
+              statusTag = '<span class="badge badge-green">支持</span>';
+            } else if (t.status === "unsupported") {
+              statusTag = '<span class="badge badge-red">不支持</span>';
+            }
+
+            const reasonHtml = t.status === "unsupported" && t.statusMessage
+              ? `<span class="tool-reason" title="${escapeHtml(t.statusMessage)}">${escapeHtml(t.statusMessage)}</span>`
+              : "";
+
+            toolsHtml += `
+              <div class="tool-row ${isToolEnabled ? '' : 'disabled'}">
+                <div class="tool-left">
+                  <input type="checkbox" class="tool-checkbox" ${isToolEnabled ? 'checked' : ''} onchange="handleToggleTool('${s.id}', '${t.key}', this.checked)">
+                  <span class="tool-name" title="${t.key}">${t.key}</span>
+                </div>
+                <div class="tool-right">
+                  ${reasonHtml}
+                  ${statusTag}
+                </div>
+              </div>
+            `;
+          }
+
+          const existingDisplay = document.getElementById("tools-" + s.id)?.style.display || "none";
+          const btnText = existingDisplay === "block" ? "点击收起" : "展开查看";
 
           html += `
             <div class="server-item ${isActive ? '' : 'disabled'}">
@@ -836,11 +954,11 @@
               </div>
               <div class="server-item-url">${s.url}</div>
               <div class="tool-toggle-bar">
-                <span>工具清单 (${s.toolCount})</span>
-                <button id="toggle-btn-${s.id}" class="tool-toggle-btn" onclick="toggleTools('${s.id}')">[展开查看]</button>
+                <span>工具清单 ${s.toolCount}</span>
+                <button id="toggle-btn-${s.id}" class="tool-toggle-btn" onclick="toggleTools('${s.id}')">${btnText}</button>
               </div>
-              <div id="tools-${s.id}" class="tools-container">
-                ${tags}
+              <div id="tools-${s.id}" class="tools-container" style="display: ${existingDisplay};">
+                ${toolsHtml}
               </div>
             </div>
           `;
@@ -874,7 +992,7 @@
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || "连接失败");
-        msg.innerText = "成功载入 " + data.toolCount + " 个工具！";
+        msg.innerText = "成功载入 " + data.toolCount + " 个工具";
         msg.style.color = "#16a34a";
         document.getElementById("mcp-token").value = "";
         loadServers();
