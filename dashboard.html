@@ -602,11 +602,14 @@
           <span>已挂载 MCP 服务列表</span>
         </div>
         <div class="action-group">
+          <input id="check-tool-model" list="check-model-list" placeholder="选择或输入检测模型" style="width: 170px; padding: 5px 8px; font-size: 12px; height: 28px; border: 1px solid #cbd5e1; border-radius: 6px; outline: none;">
+          <datalist id="check-model-list"></datalist>
           <button id="btn-check-tools" class="btn-action btn-check" onclick="handleCheckTools()">AI一键检测</button>
+          <button id="btn-enable-all" class="btn-action btn-start" onclick="handleEnableAllTools()">一键启用全部</button>
         </div>
       </div>
       <p style="font-size: 12px; color: #64748b; margin-bottom: 10px;">
-        点击 AI一键检测 可检测当前上游模型对挂载工具的兼容度，不支持的工具将自动标记并禁用。
+        输入或选择指定模型进行工具兼容性检测，检测不通过的工具会自动禁用。
       </p>
       <div id="mcp-list">
         <div class="empty-state">正在加载服务列表...</div>
@@ -629,10 +632,28 @@
       location.reload();
     }
 
+    function updateModelCandidatesList(extraModels = []) {
+      const datalist = document.getElementById("check-model-list");
+      if (!datalist) return;
+      const set = new Set();
+      for (const m of currentEnabledList) {
+        if (m && !m.includes("*")) set.add(m);
+      }
+      for (const m of extraModels) {
+        if (m) set.add(m);
+      }
+      datalist.innerHTML = Array.from(set).map(m => `<option value="${m}"></option>`).join("");
+      const input = document.getElementById("check-tool-model");
+      if (input && !input.value && set.size > 0) {
+        input.value = Array.from(set)[0];
+      }
+    }
+
     function renderEnabledTags() {
       const container = document.getElementById("enabled-tags");
       if (!currentEnabledList || currentEnabledList.length === 0) {
         container.innerHTML = '<span style="font-size: 12px; color: #94a3b8;">暂未启用任何模型，所有请求默认直通上游网关。</span>';
+        updateModelCandidatesList();
         return;
       }
       container.innerHTML = currentEnabledList.map((m, idx) => `
@@ -641,6 +662,7 @@
           <button class="model-tag-del" onclick="removeEnabledModel(${idx})">×</button>
         </span>
       `).join("");
+      updateModelCandidatesList();
     }
 
     function addCustomModel() {
@@ -706,6 +728,7 @@
         container.innerHTML = list.map(m => `
           <span class="candidate-tag" onclick="selectCandidate('${m}')">+ ${m}</span>
         `).join("");
+        updateModelCandidatesList(list);
       } catch (e) {
         container.innerHTML = `<span style="font-size: 12px; color: #dc2626;">拉取失败: ${e.message}</span>`;
       }
@@ -857,19 +880,52 @@
       } catch {}
     }
 
-    async function handleCheckTools() {
-      const btn = document.getElementById("btn-check-tools");
+    async function handleEnableAllTools() {
       const msg = document.getElementById("check-msg");
+      msg.innerText = "正在启用所有工具...";
+      msg.style.color = "#2563eb";
+      try {
+        const res = await fetch("/api/mcp/tools/enable-all", { method: "POST" });
+        const data = await res.json();
+        if (res.ok && data.success) {
+          msg.innerText = "已成功恢复全部 " + data.count + " 个工具为启用状态";
+          msg.style.color = "#16a34a";
+          loadServers();
+        } else {
+          msg.innerText = "恢复失败";
+          msg.style.color = "#dc2626";
+        }
+      } catch (e) {
+        msg.innerText = "操作异常: " + e.message;
+        msg.style.color = "#dc2626";
+      }
+    }
+
+    async function handleCheckTools() {
+      const modelInput = document.getElementById("check-tool-model");
+      const targetModel = modelInput ? modelInput.value.trim() : "";
+      const msg = document.getElementById("check-msg");
+      if (!targetModel) {
+        msg.innerText = "请先选择或输入检测模型";
+        msg.style.color = "#dc2626";
+        if (modelInput) modelInput.focus();
+        return;
+      }
+      const btn = document.getElementById("btn-check-tools");
       btn.disabled = true;
       btn.innerText = "正在检测中...";
-      msg.innerText = "正在通过 AI 模型全面检测工具兼容性...";
+      msg.innerText = "正在使用模型 " + targetModel + " 检测工具兼容性...";
       msg.style.color = "#2563eb";
 
       try {
-        const res = await fetch("/api/mcp/check-tools", { method: "POST" });
+        const res = await fetch("/api/mcp/check-tools", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: targetModel })
+        });
         const data = await res.json();
         if (res.ok && data.success) {
-          msg.innerText = `检测完成：共检测 ${data.total} 个工具，支持 ${data.supported} 个，不支持已自动禁用 ${data.unsupported} 个`;
+          msg.innerText = "检测完成：共检测 " + data.total + " 个工具，支持 " + data.supported + " 个，已自动禁用 " + data.unsupported + " 个";
           msg.style.color = "#16a34a";
         } else {
           msg.innerText = "检测失败: " + (data.error || "未知原因");
