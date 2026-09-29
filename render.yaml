@@ -7,13 +7,11 @@ services:
     startCommand: npm start
     healthCheckPath: /health
     envVars:
-      - key: UPSTREAM_BASE_URL
+      - key: UPSTREAM_1
         sync: false
-      - key: UPSTREAM_API_KEY
+      - key: UPSTREAM_2
         sync: false
       - key: PROXY_API_KEY
         sync: false
       - key: PANEL_PASSWORD
-        sync: false
-      - key: DATABASE_URL
         sync: false

@@ -8,11 +8,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT || 10000);
-const UPSTREAM_BASE_URL = (process.env.UPSTREAM_BASE_URL || "").trim().replace(/\/+$/, "");
-const UPSTREAM_API_KEY = (process.env.UPSTREAM_API_KEY || "").trim();
 const PROXY_API_KEY = (process.env.PROXY_API_KEY || "").trim();
 const PANEL_PASSWORD = (process.env.PANEL_PASSWORD || "").trim();
-const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
 
 const DATA_FILE = path.join(__dirname, "mcp-config.json");
 const SETTINGS_FILE = path.join(__dirname, "mcp-settings.json");
@@ -20,6 +17,9 @@ const SETTINGS_FILE = path.join(__dirname, "mcp-settings.json");
 const mcpServers = new Map();
 const mcpToolRegistry = new Map();
 let enabledModels = new Set();
+
+const upstreamChannels = [];
+let activeChannelId = "";
 
 let loggingEnabled = true;
 const MAX_LOGS = 1000;
@@ -43,6 +43,181 @@ function addDebugLog(type, summary, detail = "") {
   if (debugLogs.length > MAX_LOGS) {
     debugLogs.shift();
   }
+}
+
+const chineseNums = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十"];
+function getGroupDefaultName(index) {
+  const num = index + 1;
+  if (num <= 10) return `第${chineseNums[index]}组`;
+  return `第${num}组`;
+}
+
+function maskApiKey(key) {
+  if (!key || typeof key !== "string") return "";
+  const trimmed = key.trim();
+  if (trimmed.length <= 8) return "****";
+  return `${trimmed.slice(0, 4)}****${trimmed.slice(-4)}`;
+}
+
+function parseSingleChannelValue(rawVal, defaultName, id, envKey) {
+  if (!rawVal || typeof rawVal !== "string") return null;
+  const trimmed = rawVal.trim();
+  if (!trimmed) return null;
+
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    try {
+      const obj = JSON.parse(trimmed);
+      const baseUrl = String(obj.url || obj.baseUrl || obj.base_url || "").trim().replace(/\/+$/, "");
+      const rawKey = String(obj.key || obj.apiKey || obj.api_key || obj.token || "").trim();
+      const apiKey = rawKey.replace(/^Bearer\s+/i, "").trim();
+      const name = String(obj.name || obj.label || defaultName).trim();
+      if (baseUrl && apiKey) {
+        return { id, name, envKey, baseUrl, apiKey };
+      }
+    } catch {}
+  }
+
+  let parts = [];
+  if (trimmed.includes("|")) {
+    parts = trimmed.split("|").map((s) => s.trim()).filter(Boolean);
+  } else if (trimmed.includes(",")) {
+    parts = trimmed.split(",").map((s) => s.trim()).filter(Boolean);
+  } else {
+    parts = trimmed.split(/\s+/).map((s) => s.trim()).filter(Boolean);
+  }
+
+  if (parts.length < 2) return null;
+
+  const urlIndex = parts.findIndex((p) => /^https?:\/\//i.test(p));
+  if (urlIndex === -1) return null;
+
+  const baseUrl = parts[urlIndex].replace(/\/+$/, "");
+  let name = defaultName;
+  let rawKey = "";
+
+  if (parts.length === 2) {
+    rawKey = parts[urlIndex === 0 ? 1 : 0];
+  } else if (urlIndex === 0) {
+    rawKey = parts[1];
+    name = parts.slice(2).join(" ") || defaultName;
+  } else if (urlIndex === 1) {
+    name = parts[0] || defaultName;
+    rawKey = parts.slice(2).join(" ");
+  } else {
+    name = parts[0] || defaultName;
+    rawKey = parts[urlIndex + 1] || parts[1];
+  }
+
+  const apiKey = rawKey.replace(/^Bearer\s+/i, "").trim();
+  if (!baseUrl || !apiKey) return null;
+  return { id, name, envKey, baseUrl, apiKey };
+}
+
+function loadUpstreamChannelsFromEnv() {
+  upstreamChannels.length = 0;
+  const envKeys = Object.keys(process.env);
+  const reservedKeys = new Set([
+    "UPSTREAM_BASE_URL",
+    "UPSTREAM_API_KEY",
+    "PROXY_API_KEY",
+    "PANEL_PASSWORD",
+    "PORT",
+    "NODE_ENV"
+  ]);
+
+  const groupKeys = envKeys
+    .filter((k) => {
+      const upper = k.toUpperCase();
+      if (reservedKeys.has(upper)) return false;
+      if (/^UPSTREAM_BASE_URL_/i.test(upper) || /^UPSTREAM_API_KEY_/i.test(upper)) return false;
+      return /^(?:UPSTREAM|OPENAI|CHANNEL|GROUP)(?:_[A-Z0-9]+|\d+)$/i.test(upper);
+    })
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }));
+
+  for (const key of groupKeys) {
+    const val = process.env[key];
+    const index = upstreamChannels.length;
+    const defaultName = getGroupDefaultName(index);
+    const id = `ch_${key.toLowerCase()}`;
+    const parsed = parseSingleChannelValue(val, defaultName, id, key);
+    if (parsed) {
+      upstreamChannels.push(parsed);
+    }
+  }
+
+  const pairedUrlKeys = envKeys
+    .filter((k) => /^UPSTREAM_BASE_URL_([A-Z0-9]+)$/i.test(k))
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }));
+
+  for (const urlKey of pairedUrlKeys) {
+    const suffix = urlKey.replace(/^UPSTREAM_BASE_URL_/i, "");
+    const keyVarName = `UPSTREAM_API_KEY_${suffix}`;
+    const rawUrl = (process.env[urlKey] || "").trim().replace(/\/+$/, "");
+    const rawKey = (process.env[keyVarName] || "").trim().replace(/^Bearer\s+/i, "").trim();
+    if (rawUrl && rawKey) {
+      const index = upstreamChannels.length;
+      upstreamChannels.push({
+        id: `ch_pair_${suffix.toLowerCase()}`,
+        name: getGroupDefaultName(index),
+        envKey: urlKey,
+        baseUrl: rawUrl,
+        apiKey: rawKey
+      });
+    }
+  }
+
+  const legacyBaseUrl = (process.env.UPSTREAM_BASE_URL || "").trim();
+  const legacyApiKey = (process.env.UPSTREAM_API_KEY || "").trim().replace(/^Bearer\s+/i, "").trim();
+
+  if (legacyBaseUrl) {
+    const index = upstreamChannels.length;
+    const combinedParsed = parseSingleChannelValue(
+      legacyBaseUrl,
+      getGroupDefaultName(index),
+      "ch_legacy",
+      "UPSTREAM_BASE_URL"
+    );
+    if (combinedParsed) {
+      const exists = upstreamChannels.some(
+        (c) => c.baseUrl === combinedParsed.baseUrl && c.apiKey === combinedParsed.apiKey
+      );
+      if (!exists) {
+        upstreamChannels.push(combinedParsed);
+      }
+    } else if (legacyApiKey) {
+      const cleanUrl = legacyBaseUrl.replace(/\/+$/, "");
+      const exists = upstreamChannels.some(
+        (c) => c.baseUrl === cleanUrl && c.apiKey === legacyApiKey
+      );
+      if (!exists) {
+        upstreamChannels.push({
+          id: "ch_legacy",
+          name: getGroupDefaultName(index),
+          envKey: "UPSTREAM_BASE_URL",
+          baseUrl: cleanUrl,
+          apiKey: legacyApiKey
+        });
+      }
+    }
+  }
+
+  if (upstreamChannels.length > 0) {
+    if (!activeChannelId || !upstreamChannels.some((c) => c.id === activeChannelId)) {
+      activeChannelId = upstreamChannels[0].id;
+    }
+  } else {
+    activeChannelId = "";
+  }
+}
+
+function getActiveChannel() {
+  if (upstreamChannels.length === 0) return null;
+  if (activeChannelId) {
+    const found = upstreamChannels.find((c) => c.id === activeChannelId);
+    if (found) return found;
+  }
+  activeChannelId = upstreamChannels[0].id;
+  return upstreamChannels[0];
 }
 
 const SESSION_SECRET = PANEL_PASSWORD
@@ -82,167 +257,61 @@ function parseCookies(request) {
   return list;
 }
 
-let pgPool = null;
-
-async function initDatabase() {
-  if (!DATABASE_URL) return;
+function writeSettingsFile(patch) {
   try {
-    const { default: pg } = await import("pg");
-    pgPool = new pg.Pool({
-      connectionString: DATABASE_URL,
-      ssl: { rejectUnauthorized: false }
-    });
-    pgPool.on("error", () => {});
-    await pgPool.query(`
-      CREATE TABLE IF NOT EXISTS mcp_servers (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        url TEXT NOT NULL,
-        raw_token TEXT,
-        status TEXT DEFAULT 'active',
-        post_endpoint TEXT,
-        headers JSONB,
-        tool_count INT,
-        tools JSONB,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-      CREATE TABLE IF NOT EXISTS mcp_settings (
-        key TEXT PRIMARY KEY,
-        value JSONB,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-  } catch {
-    pgPool = null;
-  }
+    let current = {};
+    if (fs.existsSync(SETTINGS_FILE)) {
+      try {
+        current = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf8"));
+      } catch {}
+    }
+    Object.assign(current, patch);
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(current, null, 2), "utf8");
+  } catch {}
 }
 
 async function saveLoggingConfigToStorage(enabled) {
   loggingEnabled = enabled;
-  if (pgPool) {
-    try {
-      await pgPool.query(
-        `INSERT INTO mcp_settings (key, value, updated_at)
-         VALUES ('logging_enabled', $1, CURRENT_TIMESTAMP)
-         ON CONFLICT (key) DO UPDATE SET
-           value = EXCLUDED.value,
-           updated_at = CURRENT_TIMESTAMP`,
-        [JSON.stringify(enabled)]
-      );
-    } catch {}
-  }
-  try {
-    let current = {};
-    if (fs.existsSync(SETTINGS_FILE)) {
-      try {
-        current = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf8"));
-      } catch {}
-    }
-    current.loggingEnabled = enabled;
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(current, null, 2), "utf8");
-  } catch {}
+  writeSettingsFile({ loggingEnabled: enabled });
 }
 
 async function saveEnabledModelsToStorage(modelsArray) {
   enabledModels = new Set(modelsArray);
-  if (pgPool) {
-    try {
-      await pgPool.query(
-        `INSERT INTO mcp_settings (key, value, updated_at)
-         VALUES ('enabled_models', $1, CURRENT_TIMESTAMP)
-         ON CONFLICT (key) DO UPDATE SET
-           value = EXCLUDED.value,
-           updated_at = CURRENT_TIMESTAMP`,
-        [JSON.stringify(modelsArray)]
-      );
-    } catch {}
-  }
-  try {
-    let current = {};
-    if (fs.existsSync(SETTINGS_FILE)) {
-      try {
-        current = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf8"));
-      } catch {}
-    }
-    current.enabledModels = modelsArray;
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(current, null, 2), "utf8");
-  } catch {}
+  writeSettingsFile({ enabledModels: modelsArray });
+}
+
+async function saveActiveChannelToStorage(channelId) {
+  activeChannelId = channelId;
+  writeSettingsFile({ activeChannelId: channelId });
 }
 
 async function loadSettingsFromStorage() {
-  if (pgPool) {
-    try {
-      const res = await pgPool.query("SELECT key, value FROM mcp_settings WHERE key IN ('enabled_models', 'logging_enabled')");
-      if (res.rows && res.rows.length > 0) {
-        for (const r of res.rows) {
-          if (r.key === "enabled_models") {
-            const list = Array.isArray(r.value) ? r.value : (typeof r.value === "string" ? JSON.parse(r.value) : []);
-            enabledModels = new Set(list);
-          } else if (r.key === "logging_enabled") {
-            loggingEnabled = r.value !== false && r.value !== "false";
-          }
-        }
-        return;
+  if (!fs.existsSync(SETTINGS_FILE)) return;
+  try {
+    const raw = fs.readFileSync(SETTINGS_FILE, "utf8");
+    const data = JSON.parse(raw);
+    if (Array.isArray(data.enabledModels)) {
+      enabledModels = new Set(data.enabledModels);
+    }
+    if (data.loggingEnabled !== undefined) {
+      loggingEnabled = data.loggingEnabled === true;
+    }
+    if (typeof data.activeChannelId === "string" && data.activeChannelId) {
+      if (upstreamChannels.some((c) => c.id === data.activeChannelId)) {
+        activeChannelId = data.activeChannelId;
       }
-    } catch {}
-  }
-
-  if (fs.existsSync(SETTINGS_FILE)) {
-    try {
-      const raw = fs.readFileSync(SETTINGS_FILE, "utf8");
-      const data = JSON.parse(raw);
-      if (Array.isArray(data.enabledModels)) {
-        enabledModels = new Set(data.enabledModels);
-      }
-      if (data.loggingEnabled !== undefined) {
-        loggingEnabled = data.loggingEnabled === true;
-      }
-    } catch {}
-  }
+    }
+  } catch {}
 }
 
-async function saveServerToStorage(serverItem) {
-  if (pgPool) {
-    try {
-      await pgPool.query(
-        `INSERT INTO mcp_servers (id, name, url, raw_token, status, post_endpoint, headers, tool_count, tools, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)
-         ON CONFLICT (id) DO UPDATE SET
-           name = EXCLUDED.name,
-           url = EXCLUDED.url,
-           raw_token = EXCLUDED.raw_token,
-           status = EXCLUDED.status,
-           post_endpoint = EXCLUDED.post_endpoint,
-           headers = EXCLUDED.headers,
-           tool_count = EXCLUDED.tool_count,
-           tools = EXCLUDED.tools,
-           updated_at = CURRENT_TIMESTAMP`,
-        [
-          serverItem.id,
-          serverItem.name,
-          serverItem.url,
-          serverItem.rawToken,
-          serverItem.status || "active",
-          serverItem.postEndpoint,
-          JSON.stringify(serverItem.headers || {}),
-          serverItem.toolCount,
-          JSON.stringify(serverItem.tools || [])
-        ]
-      );
-    } catch {}
-  }
+async function saveServerToStorage() {
   try {
     const data = Array.from(mcpServers.values());
     fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf8");
   } catch {}
 }
 
-async function deleteServerFromStorage(id) {
-  if (pgPool) {
-    try {
-      await pgPool.query("DELETE FROM mcp_servers WHERE id = $1", [id]);
-    } catch {}
-  }
+async function deleteServerFromStorage() {
   try {
     const data = Array.from(mcpServers.values());
     fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf8");
@@ -250,48 +319,6 @@ async function deleteServerFromStorage(id) {
 }
 
 async function loadConfigFromStorage() {
-  if (pgPool) {
-    try {
-      const res = await pgPool.query("SELECT * FROM mcp_servers ORDER BY updated_at ASC");
-      if (res.rows && res.rows.length > 0) {
-        for (const row of res.rows) {
-          const tools = typeof row.tools === "string" ? JSON.parse(row.tools) : (row.tools || []);
-          const headers = typeof row.headers === "string" ? JSON.parse(row.headers) : (row.headers || {});
-          const status = row.status || "active";
-          for (const t of tools) {
-            t.enabled = true;
-            t.status = "unchecked";
-            t.statusMessage = "";
-          }
-          const serverInfo = {
-            id: row.id,
-            name: row.name,
-            url: row.url,
-            rawToken: row.raw_token,
-            status,
-            postEndpoint: row.post_endpoint,
-            headers,
-            toolCount: tools.length,
-            tools
-          };
-          mcpServers.set(row.id, serverInfo);
-          if (status === "active") {
-            for (const t of tools) {
-              mcpToolRegistry.set(t.key, {
-                serverId: row.id,
-                serverName: row.name,
-                rawName: t.rawName,
-                postEndpoint: row.post_endpoint,
-                headers
-              });
-            }
-          }
-        }
-        return;
-      }
-    } catch {}
-  }
-
   if (!fs.existsSync(DATA_FILE)) return;
   try {
     const raw = fs.readFileSync(DATA_FILE, "utf8");
@@ -736,11 +763,28 @@ function selectRelevantTools(userText, allTools) {
   return scored.map((item) => item.tool);
 }
 
-function upstreamChatCompletionsUrl() {
-  if (!UPSTREAM_BASE_URL) throw new Error("未配置 UPSTREAM_BASE_URL 环境变量");
-  if (UPSTREAM_BASE_URL.endsWith("/chat/completions")) return UPSTREAM_BASE_URL;
-  if (UPSTREAM_BASE_URL.endsWith("/v1")) return `${UPSTREAM_BASE_URL}/chat/completions`;
-  return `${UPSTREAM_BASE_URL}/v1/chat/completions`;
+function upstreamChatCompletionsUrl(channel) {
+  const active = channel || getActiveChannel();
+  if (!active || !active.baseUrl) {
+    throw new Error("未配置上游渠道环境变量");
+  }
+  const base = active.baseUrl;
+  if (base.endsWith("/chat/completions")) return base;
+  if (base.endsWith("/v1")) return `${base}/chat/completions`;
+  return `${base}/v1/chat/completions`;
+}
+
+function upstreamModelsUrl(channel) {
+  const active = channel || getActiveChannel();
+  if (!active || !active.baseUrl) {
+    throw new Error("未配置上游渠道环境变量");
+  }
+  const base = active.baseUrl;
+  if (base.endsWith("/chat/completions")) {
+    return base.replace(/\/chat\/completions$/, "/models");
+  }
+  if (base.endsWith("/v1")) return `${base}/models`;
+  return `${base}/v1/models`;
 }
 
 function toolArguments(toolCall) {
@@ -808,9 +852,15 @@ function extractFinishReason(parsedChunkOrJson) {
 async function passThrough(requestBody, clientResponse, reqMeta, abortSignal) {
   setCorsHeaders(clientResponse);
   const isStream = requestBody.stream === true;
+  const channel = getActiveChannel();
+  if (!channel) {
+    throw new Error("未配置上游渠道环境变量");
+  }
+  const targetUrl = upstreamChatCompletionsUrl(channel);
 
-  addDebugLog("UPSTREAM", `[直通模式] 转发请求至上游: ${requestBody.model || "default"} - stream=${isStream}`, {
-    url: upstreamChatCompletionsUrl(),
+  addDebugLog("UPSTREAM", `[直通模式] [${channel.name}] 转发请求至上游: ${requestBody.model || "default"} - stream=${isStream}`, {
+    channel: channel.name,
+    url: targetUrl,
     model: requestBody.model,
     stream: isStream,
     messagesCount: requestBody.messages?.length || 0,
@@ -836,14 +886,14 @@ async function passThrough(requestBody, clientResponse, reqMeta, abortSignal) {
     let upstreamResponse;
     const roundStartTime = Date.now();
     if (continueRound > 0) {
-      addDebugLog("UPSTREAM", `[直通模式] 第 ${continueRound + 1} 轮断点续接上游请求 - 消息量: ${currentMessages.length}`);
+      addDebugLog("UPSTREAM", `[直通模式] [${channel.name}] 第 ${continueRound + 1} 轮断点续接上游请求 - 消息量: ${currentMessages.length}`);
     }
 
     try {
-      upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
+      upstreamResponse = await fetch(targetUrl, {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${UPSTREAM_API_KEY}`,
+          Authorization: `Bearer ${channel.apiKey}`,
           "Content-Type": "application/json"
         },
         body: JSON.stringify({
@@ -861,7 +911,8 @@ async function passThrough(requestBody, clientResponse, reqMeta, abortSignal) {
     }
 
     const duration = Date.now() - roundStartTime;
-    addDebugLog("UPSTREAM", `[直通模式] 上游响应状态: ${upstreamResponse.status} - 耗时 ${duration}ms`, {
+    addDebugLog("UPSTREAM", `[直通模式] [${channel.name}] 上游响应状态: ${upstreamResponse.status} - 耗时 ${duration}ms`, {
+      channel: channel.name,
       status: upstreamResponse.status,
       contentType: upstreamResponse.headers.get("Content-Type")
     });
@@ -873,7 +924,7 @@ async function passThrough(requestBody, clientResponse, reqMeta, abortSignal) {
 
     if (!upstreamResponse.ok) {
       const errTxt = await upstreamResponse.text();
-      addDebugLog("ERROR", `[直通模式] 上游报错 (${upstreamResponse.status})`, errTxt);
+      addDebugLog("ERROR", `[直通模式] [${channel.name}] 上游报错 (${upstreamResponse.status})`, errTxt);
       if (isStream && hasInitiatedStream) {
         const errorChunk = {
           id: `chatcmpl-${Date.now()}`,
@@ -925,7 +976,7 @@ async function passThrough(requestBody, clientResponse, reqMeta, abortSignal) {
       if (continueRound > 0 && choice?.message) {
         choice.message.content = fullAccumulatedContent;
       }
-      addDebugLog("UPSTREAM", `[直通模式] 非流式完成输出 - 结束原因: ${rawReason || "stop"}`);
+      addDebugLog("UPSTREAM", `[直通模式] [${channel.name}] 非流式完成输出 - 结束原因: ${rawReason || "stop"}`);
       sendJson(clientResponse, 200, json);
       return;
     }
@@ -1020,7 +1071,7 @@ async function passThrough(requestBody, clientResponse, reqMeta, abortSignal) {
       continue;
     }
 
-    addDebugLog("UPSTREAM", `[直通模式] 流式完成输出 - 结束原因: ${lastFinishReason || "stop"}`);
+    addDebugLog("UPSTREAM", `[直通模式] [${channel.name}] 流式完成输出 - 结束原因: ${lastFinishReason || "stop"}`);
     break;
   }
 
@@ -1049,7 +1100,7 @@ function isModelEnabledForMcp(modelName) {
 function convertGeminiToOpenAIMessages(body) {
   const messages = [];
   if (body.systemInstruction?.parts) {
-    const sysText = body.systemInstruction.parts.map(p => p.text || "").join("\n");
+    const sysText = body.systemInstruction.parts.map((p) => p.text || "").join("\n");
     if (sysText) messages.push({ role: "system", content: sysText });
   }
   if (Array.isArray(body.contents)) {
@@ -1107,7 +1158,7 @@ function convertGeminiToOpenAIMessages(body) {
       if (hasImage) {
         finalContent = contentItems;
       } else if (contentItems.length > 0) {
-        finalContent = contentItems.map(item => item.text).join("");
+        finalContent = contentItems.map((item) => item.text).join("");
       }
 
       if (finalContent !== null || toolCalls.length > 0) {
@@ -1314,9 +1365,15 @@ async function handleGeminiGenerateContent(modelName, isStream, geminiBody, clie
 
 async function passThroughAndTransformGemini(requestBody, clientResponse, isStream, abortSignal) {
   const startTime = Date.now();
+  const channel = getActiveChannel();
+  if (!channel) {
+    throw new Error("未配置上游渠道环境变量");
+  }
+  const targetUrl = upstreamChatCompletionsUrl(channel);
 
-  addDebugLog("UPSTREAM", `[Gemini 直通模式] 转发转换至上游: ${requestBody.model || "default"}`, {
-    url: upstreamChatCompletionsUrl(),
+  addDebugLog("UPSTREAM", `[Gemini 直通模式] [${channel.name}] 转发转换至上游: ${requestBody.model || "default"}`, {
+    channel: channel.name,
+    url: targetUrl,
     model: requestBody.model,
     stream: isStream,
     messagesCount: requestBody.messages?.length || 0
@@ -1335,10 +1392,10 @@ async function passThroughAndTransformGemini(requestBody, clientResponse, isStre
 
     let upstreamResponse;
     try {
-      upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
+      upstreamResponse = await fetch(targetUrl, {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${UPSTREAM_API_KEY}`,
+          Authorization: `Bearer ${channel.apiKey}`,
           "Content-Type": "application/json"
         },
         body: JSON.stringify({
@@ -1356,7 +1413,8 @@ async function passThroughAndTransformGemini(requestBody, clientResponse, isStre
     }
 
     const duration = Date.now() - startTime;
-    addDebugLog("UPSTREAM", `[Gemini 直通模式] 上游响应状态: ${upstreamResponse.status} - 耗时 ${duration}ms`, {
+    addDebugLog("UPSTREAM", `[Gemini 直通模式] [${channel.name}] 上游响应状态: ${upstreamResponse.status} - 耗时 ${duration}ms`, {
+      channel: channel.name,
       status: upstreamResponse.status,
       contentType: upstreamResponse.headers.get("Content-Type")
     });
@@ -1495,6 +1553,12 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
     throw new Error("messages 必须是非空数组");
   }
 
+  const channel = getActiveChannel();
+  if (!channel) {
+    throw new Error("未配置上游渠道环境变量");
+  }
+  const targetUrl = upstreamChatCompletionsUrl(channel);
+
   const isStream = requestBody.stream === true;
   let messages = [...requestBody.messages];
 
@@ -1512,7 +1576,8 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
 
   const { needsTool, isWrite } = detectActionIntent(userText);
 
-  addDebugLog("AGENT", `启动 MCP 调度 - 模型 [${requestBody.model}] - 挂载工具数: ${tools.length} - 动作需求: ${needsTool} (写操作: ${isWrite})`, {
+  addDebugLog("AGENT", `启动 MCP 调度 [${channel.name}] - 模型 [${requestBody.model}] - 挂载工具数: ${tools.length} - 动作需求: ${needsTool} (写操作: ${isWrite})`, {
+    channel: channel.name,
     model: requestBody.model,
     stream: isStream,
     toolCount: tools.length,
@@ -1603,7 +1668,8 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       }
 
       const roundStartTime = Date.now();
-      addDebugLog("UPSTREAM", `第 ${round + 1} 轮上游调用请求 - 消息量: ${roundMessages.length}`, {
+      addDebugLog("UPSTREAM", `[${channel.name}] 第 ${round + 1} 轮上游调用请求 - 消息量: ${roundMessages.length}`, {
+        channel: channel.name,
         round: round + 1,
         toolsEnabled: Boolean(payload.tools),
         tool_choice: payload.tool_choice,
@@ -1612,10 +1678,10 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
 
       let upstreamResponse;
       try {
-        upstreamResponse = await fetch(upstreamChatCompletionsUrl(), {
+        upstreamResponse = await fetch(targetUrl, {
           method: "POST",
           headers: {
-            Authorization: `Bearer ${UPSTREAM_API_KEY}`,
+            Authorization: `Bearer ${channel.apiKey}`,
             "Content-Type": "application/json"
           },
           body: JSON.stringify(payload),
@@ -1634,8 +1700,8 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
 
       if (!upstreamResponse.ok) {
         const errText = await upstreamResponse.text();
-        addDebugLog("ERROR", `第 ${round + 1} 轮上游报错 (${upstreamResponse.status}) - 耗时 ${roundDuration}ms`, errText);
-        
+        addDebugLog("ERROR", `[${channel.name}] 第 ${round + 1} 轮上游报错 (${upstreamResponse.status}) - 耗时 ${roundDuration}ms`, errText);
+
         if (isStream) {
           const errorChunk = {
             id: `chatcmpl-${Date.now()}`,
@@ -1993,9 +2059,11 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
 }
 
 async function checkAllTools(modelName) {
-  if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
-    throw new Error("请先配置 UPSTREAM_BASE_URL 与 UPSTREAM_API_KEY 环境变量");
+  const channel = getActiveChannel();
+  if (!channel) {
+    throw new Error("请先配置 UPSTREAM_1 等上游渠道环境变量");
   }
+  const targetUrl = upstreamChatCompletionsUrl(channel);
 
   let targetModel = (modelName || "").trim();
   if (!targetModel && enabledModels.size > 0) {
@@ -2014,10 +2082,10 @@ async function checkAllTools(modelName) {
 
   let pingRes;
   try {
-    pingRes = await fetch(upstreamChatCompletionsUrl(), {
+    pingRes = await fetch(targetUrl, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${UPSTREAM_API_KEY}`,
+        Authorization: `Bearer ${channel.apiKey}`,
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
@@ -2054,10 +2122,10 @@ async function checkAllTools(modelName) {
       let reason = "";
 
       try {
-        const testRes = await fetch(upstreamChatCompletionsUrl(), {
+        const testRes = await fetch(targetUrl, {
           method: "POST",
           headers: {
-            Authorization: `Bearer ${UPSTREAM_API_KEY}`,
+            Authorization: `Bearer ${channel.apiKey}`,
             "Content-Type": "application/json"
           },
           body: JSON.stringify({
@@ -2115,7 +2183,7 @@ async function checkAllTools(modelName) {
     await saveServerToStorage(s);
   }
 
-  addDebugLog("AGENT", `AI一键检测完成 - 测试模型 [${targetModel}] - 共 ${total} 个工具，支持 ${supported} 个，不支持已自动禁用 ${unsupported} 个`);
+  addDebugLog("AGENT", `AI一键检测完成 - 渠道 [${channel.name}] - 测试模型 [${targetModel}] - 共 ${total} 个工具，支持 ${supported} 个，不支持已自动禁用 ${unsupported} 个`);
   return { total, supported, unsupported, model: targetModel };
 }
 
@@ -2125,7 +2193,7 @@ function getLoginHtml() {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>MCP 控制台 - 登录认证</title>
+  <title>MCP 控制台</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -2209,7 +2277,7 @@ function getLoginHtml() {
 </html>`;
 }
 
-await initDatabase();
+loadUpstreamChannelsFromEnv();
 await loadConfigFromStorage();
 await loadSettingsFromStorage();
 
@@ -2287,6 +2355,45 @@ const server = http.createServer(async (request, response) => {
         return;
       }
 
+      if (request.method === "GET" && reqUrl.pathname === "/api/upstream/channels") {
+        const active = getActiveChannel();
+        sendJson(response, 200, {
+          activeChannelId: active ? active.id : "",
+          channels: upstreamChannels.map((c) => ({
+            id: c.id,
+            name: c.name,
+            envKey: c.envKey,
+            baseUrl: c.baseUrl,
+            maskedKey: maskApiKey(c.apiKey),
+            active: Boolean(active && active.id === c.id)
+          }))
+        });
+        return;
+      }
+
+      if (request.method === "POST" && reqUrl.pathname === "/api/upstream/channels/switch") {
+        const body = await readRequestBody(request);
+        const targetId = String(body.id || "").trim();
+        const found = upstreamChannels.find((c) => c.id === targetId);
+        if (!found) {
+          sendJson(response, 404, { error: "未找到指定的上游渠道" });
+          return;
+        }
+        await saveActiveChannelToStorage(found.id);
+        addDebugLog("UPSTREAM", `已切换当前上游渠道至 [${found.name}]`, {
+          id: found.id,
+          name: found.name,
+          envKey: found.envKey,
+          baseUrl: found.baseUrl
+        });
+        sendJson(response, 200, {
+          success: true,
+          activeChannelId: found.id,
+          name: found.name
+        });
+        return;
+      }
+
       if (request.method === "GET" && reqUrl.pathname === "/api/logs") {
         sendJson(response, 200, {
           enabled: loggingEnabled,
@@ -2323,22 +2430,21 @@ const server = http.createServer(async (request, response) => {
       }
 
       if (request.method === "GET" && reqUrl.pathname === "/api/upstream/models") {
-        if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
+        const channel = getActiveChannel();
+        if (!channel) {
           sendJson(response, 200, { models: [] });
           return;
         }
-        const modelsUrl = UPSTREAM_BASE_URL.endsWith("/v1")
-          ? `${UPSTREAM_BASE_URL}/models`
-          : `${UPSTREAM_BASE_URL}/v1/models`;
+        const modelsUrl = upstreamModelsUrl(channel);
 
         try {
           const upstreamResponse = await fetch(modelsUrl, {
-            headers: { Authorization: `Bearer ${UPSTREAM_API_KEY}` },
+            headers: { Authorization: `Bearer ${channel.apiKey}` },
             signal: AbortSignal.timeout(10000)
           });
           const data = await upstreamResponse.json();
           const list = Array.isArray(data.data) ? data.data.map((m) => m.id).filter(Boolean) : [];
-          sendJson(response, 200, { models: list });
+          sendJson(response, 200, { models: list, channelName: channel.name });
         } catch (e) {
           sendJson(response, 500, { error: e.message, models: [] });
         }
@@ -2499,6 +2605,11 @@ const server = http.createServer(async (request, response) => {
         return;
       }
 
+      if (!getActiveChannel()) {
+        sendOpenAIError(response, 500, "服务端未配置上游渠道环境变量，请配置 UPSTREAM_1 等变量");
+        return;
+      }
+
       const rawModel = geminiMatch[1];
       const modelName = decodeURIComponent(rawModel).replace(/^models\//, "");
       const action = geminiMatch[2];
@@ -2542,7 +2653,8 @@ const server = http.createServer(async (request, response) => {
       }
 
       if (request.method === "GET" && reqUrl.pathname === "/v1/models") {
-        if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
+        const channel = getActiveChannel();
+        if (!channel) {
           sendJson(response, 200, {
             object: "list",
             data: [{ id: "default", object: "model", created: 0, owned_by: "proxy" }]
@@ -2550,13 +2662,11 @@ const server = http.createServer(async (request, response) => {
           return;
         }
 
-        const modelsUrl = UPSTREAM_BASE_URL.endsWith("/v1")
-          ? `${UPSTREAM_BASE_URL}/models`
-          : `${UPSTREAM_BASE_URL}/v1/models`;
+        const modelsUrl = upstreamModelsUrl(channel);
 
         try {
           const upstreamResponse = await fetch(modelsUrl, {
-            headers: { Authorization: `Bearer ${UPSTREAM_API_KEY}` },
+            headers: { Authorization: `Bearer ${channel.apiKey}` },
             signal: AbortSignal.timeout(10000)
           });
           const data = await upstreamResponse.json();
@@ -2571,8 +2681,9 @@ const server = http.createServer(async (request, response) => {
       }
 
       if (request.method === "POST" && reqUrl.pathname === "/v1/chat/completions") {
-        if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
-          sendOpenAIError(response, 500, "服务端未配置环境变量：UPSTREAM_BASE_URL 或 UPSTREAM_API_KEY");
+        const channel = getActiveChannel();
+        if (!channel) {
+          sendOpenAIError(response, 500, "服务端未配置上游渠道环境变量，请配置 UPSTREAM_1 等变量");
           return;
         }
 
@@ -2580,7 +2691,8 @@ const server = http.createServer(async (request, response) => {
         const mcpEnabled = isModelEnabledForMcp(body.model) && mcpToolRegistry.size > 0;
         const lastMsg = Array.isArray(body.messages) ? body.messages[body.messages.length - 1] : null;
 
-        addDebugLog("DOWNSTREAM", `收到客户端请求 [${body.model || "default"}] - stream=${body.stream === true}`, {
+        addDebugLog("DOWNSTREAM", `收到客户端请求 [${body.model || "default"}] -> 渠道 [${channel.name}] - stream=${body.stream === true}`, {
+          channel: channel.name,
           model: body.model,
           stream: body.stream,
           mcpEnabled,

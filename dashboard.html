@@ -194,6 +194,12 @@
       color: #ffffff;
       border-color: #16a34a;
     }
+    .btn-active-channel {
+      background: #2563eb;
+      color: #ffffff;
+      border: 1px solid #2563eb;
+      cursor: default;
+    }
     .btn-stop {
       background: #fef3c7;
       color: #92400e;
@@ -213,6 +219,32 @@
       background: #dc2626;
       color: #ffffff;
       border-color: #dc2626;
+    }
+
+    .channel-item {
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      padding: 12px;
+      border-radius: 10px;
+      margin-bottom: 10px;
+      transition: all 0.15s;
+    }
+    .channel-item:last-child {
+      margin-bottom: 0;
+    }
+    .channel-item.active {
+      background: #eff6ff;
+      border-color: #93c5fd;
+    }
+    .channel-meta {
+      font-size: 12px;
+      color: #64748b;
+      font-family: monospace;
+      word-break: break-all;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 4px;
     }
 
     .server-item {
@@ -367,7 +399,7 @@
       color: #166534;
       border-color: #86efac;
     }
-    #conn-msg, #enable-msg, #log-msg {
+    #conn-msg, #enable-msg, #log-msg, #channel-msg {
       margin-left: 10px;
       font-size: 12px;
       font-weight: 500;
@@ -467,9 +499,25 @@
     <div class="header">
       <div>
         <h1>MCP 代理控制台</h1>
-        <p>多 MCP 工具接入与模型精准调度</p>
+        <p>多渠道自由切换与 MCP 工具精准调度</p>
       </div>
       <button class="btn-logout" onclick="handleLogout()">退出登录</button>
+    </div>
+
+    <div class="card">
+      <div class="card-title">
+        <div class="card-title-left">
+          <span>上游渠道切换</span>
+          <span id="active-channel-badge" class="badge badge-blue">加载中</span>
+        </div>
+      </div>
+      <p style="font-size: 12px; color: #64748b; margin-bottom: 12px;">
+        通过环境变量 UPSTREAM_1、UPSTREAM_2 等配置多组渠道，格式为 链接|密钥 或 名称|链接|密钥。点击下方按钮可随时切换当前生效渠道。
+      </p>
+      <div id="channel-list">
+        <div class="empty-state">正在加载上游渠道...</div>
+      </div>
+      <span id="channel-msg"></span>
     </div>
 
     <div class="card">
@@ -484,7 +532,7 @@
       </div>
       <div class="group">
         <label>模型</label>
-        <div class="box">跟随你的上游设置，例如 gpt-4o、claude-3-5-sonnet、gemini-2.5-flash</div>
+        <div class="box">跟随当前所选上游渠道支持的模型，例如 gpt-4o、claude-3-5-sonnet、gemini-2.5-flash</div>
       </div>
     </div>
 
@@ -517,7 +565,7 @@
         </div>
       </div>
       <p style="font-size: 12px; color: #64748b; margin-bottom: 12px;">
-        只有加入此列表的模型才会挂载 MCP 工具。未在此列表中的其他所有模型将完全纯净直通上游网关。
+        只有加入此列表的模型才会挂载 MCP 工具。未在此列表中的其他所有模型将完全纯净直通当前上游渠道。
       </p>
 
       <div class="group">
@@ -534,7 +582,7 @@
 
       <div class="group" style="margin-top: 12px;">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-          <label style="margin: 0;">从上游所有模型中选择：</label>
+          <label style="margin: 0;">从当前上游渠道所有模型中选择：</label>
           <button class="btn-action btn-start" onclick="fetchUpstreamModels()">刷新上游模型</button>
         </div>
         <div id="upstream-candidates" style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px; max-height: 120px; overflow-y: auto;">
@@ -594,6 +642,81 @@
     async function handleLogout() {
       await fetch("/api/panel/logout", { method: "POST" });
       location.reload();
+    }
+
+    async function loadChannels() {
+      const container = document.getElementById("channel-list");
+      const badge = document.getElementById("active-channel-badge");
+      try {
+        const res = await fetch("/api/upstream/channels");
+        if (!res.ok) throw new Error("获取渠道失败");
+        const data = await res.json();
+        const channels = data.channels || [];
+
+        if (channels.length === 0) {
+          badge.className = "badge badge-red";
+          badge.innerText = "未配置";
+          container.innerHTML = '<div class="empty-state">尚未检测到上游渠道环境变量。请在环境变量中添加 UPSTREAM_1，值为 链接|密钥。</div>';
+          return;
+        }
+
+        const activeItem = channels.find(c => c.active) || channels[0];
+        badge.className = "badge badge-green";
+        badge.innerText = activeItem.name;
+
+        container.innerHTML = channels.map(c => {
+          const statusBadge = c.active
+            ? '<span class="badge badge-green">使用中</span>'
+            : '<span class="badge badge-gray">备用</span>';
+          const actionBtn = c.active
+            ? '<button class="btn-action btn-active-channel" disabled>当前使用</button>'
+            : `<button class="btn-action btn-start" onclick="switchChannel('${c.id}')">切换使用</button>`;
+
+          return `
+            <div class="channel-item ${c.active ? 'active' : ''}">
+              <div class="server-item-head">
+                <div class="server-item-title">
+                  <span class="server-name-text">${escapeHtml(c.name)}</span>
+                  <span class="badge badge-blue">${escapeHtml(c.envKey)}</span>
+                  ${statusBadge}
+                </div>
+                <div class="action-group">
+                  ${actionBtn}
+                </div>
+              </div>
+              <div class="channel-meta">
+                <span>地址: ${escapeHtml(c.baseUrl)}</span>
+                <span>密钥: ${escapeHtml(c.maskedKey)}</span>
+              </div>
+            </div>
+          `;
+        }).join("");
+      } catch (e) {
+        badge.className = "badge badge-red";
+        badge.innerText = "异常";
+        container.innerHTML = `<div class="empty-state" style="color: #ef4444;">加载失败: ${escapeHtml(e.message)}</div>`;
+      }
+    }
+
+    async function switchChannel(id) {
+      const msg = document.getElementById("channel-msg");
+      try {
+        const res = await fetch("/api/upstream/channels/switch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "切换失败");
+        msg.innerText = `已切换至 ${data.name}`;
+        msg.style.color = "#16a34a";
+        setTimeout(() => { msg.innerText = ""; }, 3000);
+        await loadChannels();
+        await loadLogs();
+      } catch (e) {
+        msg.innerText = e.message;
+        msg.style.color = "#dc2626";
+      }
     }
 
     function renderEnabledTags() {
@@ -661,13 +784,13 @@
 
     async function fetchUpstreamModels() {
       const container = document.getElementById("upstream-candidates");
-      container.innerHTML = '<span style="font-size: 12px; color: #64748b;">正在拉取上游所有模型...</span>';
+      container.innerHTML = '<span style="font-size: 12px; color: #64748b;">正在拉取当前渠道所有模型...</span>';
       try {
         const res = await fetch("/api/upstream/models");
         const data = await res.json();
         const list = data.models || [];
         if (list.length === 0) {
-          container.innerHTML = '<span style="font-size: 12px; color: #94a3b8;">未获取到模型，请检查上游环境变量配置。</span>';
+          container.innerHTML = '<span style="font-size: 12px; color: #94a3b8;">未获取到模型，请检查当前上游渠道配置或切换到其他渠道。</span>';
           return;
         }
         container.innerHTML = list.map(m => `
@@ -942,6 +1065,7 @@
       loadServers();
     }
 
+    loadChannels();
     loadEnabledSettings();
     loadServers();
     loadLogs();
