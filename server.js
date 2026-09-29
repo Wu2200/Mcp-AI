@@ -1879,14 +1879,9 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         const args = toolArguments({ function: { arguments: tc.arguments } });
 
         if (!abortSignal?.aborted && !clientResponse.destroyed) {
-          sendSSEChunk(
-            clientResponse,
-            { content: `\n> ⏳ 正在调用 [${displayName}] 执行操作: \`${rawAction}\`...\n` },
-            requestBody.model
-          );
           sendReasoningChunk(
             clientResponse,
-            `\n> 正在执行 ${displayName} [${rawAction}]...\n`,
+            `\n> ⏳ 正在调用 [${displayName}] 执行操作: \`${rawAction}\`...\n`,
             requestBody.model
           );
         }
@@ -1928,25 +1923,15 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
 
         if (!abortSignal?.aborted && !clientResponse.destroyed) {
           if (isToolError) {
-            sendSSEChunk(
-              clientResponse,
-              { content: `> ❌ [${displayName}] 执行失败\n\n` },
-              requestBody.model
-            );
             sendReasoningChunk(
               clientResponse,
-              `> ${displayName} [${rawAction}] 失败\n\n`,
+              `> ❌ [${displayName}] 执行失败\n\n`,
               requestBody.model
             );
           } else {
-            sendSSEChunk(
-              clientResponse,
-              { content: `> ✅ [${displayName}] 执行完成\n\n` },
-              requestBody.model
-            );
             sendReasoningChunk(
               clientResponse,
-              `> ${displayName} [${rawAction}] 完成\n\n`,
+              `> ✅ [${displayName}] 执行完成\n\n`,
               requestBody.model
             );
           }
