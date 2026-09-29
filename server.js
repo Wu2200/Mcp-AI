@@ -609,12 +609,23 @@ async function callMcpTool(toolKey, args) {
     throw new Error(data.error.message || JSON.stringify(data.error));
   }
 
+  const rawResult = data.result !== undefined ? data.result : data;
+  const isToolError = Boolean(rawResult && (rawResult.isError === true || rawResult.is_error === true));
   const resultText = extractMcpResultContent(data);
+
+  if (isToolError) {
+    addDebugLog("ERROR", `MCP 工具 [${toolKey}] 返回错误 - 耗时 ${duration}ms`, {
+      arguments: args,
+      errorOutput: resultText.slice(0, 500)
+    });
+    return { isError: true, content: resultText };
+  }
+
   addDebugLog("TOOL", `MCP 工具 [${toolKey}] 执行成功 - 耗时 ${duration}ms, 输出 ${resultText.length} 字符`, {
     arguments: args,
     outputPreview: resultText.slice(0, 500)
   });
-  return resultText;
+  return { isError: false, content: resultText };
 }
 
 function getAllTools() {
@@ -1506,23 +1517,46 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
 
   let finalFinishReason = null;
   let executedToolCount = 0;
+  const toolCallHistory = new Map();
+  let hasWriteSuccess = false;
+  let consecutiveFailures = 0;
+  const MAX_AGENT_ROUNDS = 60;
 
   try {
-    for (let round = 0; ; round += 1) {
+    for (let round = 0; round < MAX_AGENT_ROUNDS; round += 1) {
       if (abortSignal?.aborted || clientResponse.destroyed) {
         addDebugLog("DOWNSTREAM", `客户端已断开，终止 MCP 调度循环`);
         break;
       }
 
+      if (messages.length > 30) {
+        for (let i = 0; i < messages.length - 15; i += 1) {
+          const m = messages[i];
+          if (m && m.role === "tool" && typeof m.content === "string" && m.content.length > 2000) {
+            m.content = m.content.slice(0, 1000) + "\n\n[历史输出已精简]";
+          }
+        }
+      }
+
       let roundMessages = [...messages];
-      if (round === 0 && isWrite) {
+      if (hasWriteSuccess) {
+        roundMessages.push({
+          role: "system",
+          content: "【写入完成提示】相关修改与写入操作已确认成功。禁止再次进行多余的重复读取、校验或重复修改，请直接向用户完整输出最终的修改说明与交付结果。"
+        });
+      } else if (consecutiveFailures >= 2) {
+        roundMessages.push({
+          role: "system",
+          content: "【错误排查提示】上一轮工具调用存在失败。请仔细检查错误原因并调整策略；若无法解决或属于权限、冲突等外部限制，请停止重复盲目调用，直接向用户说明具体原因。"
+        });
+      } else if (round === 0 && isWrite) {
         roundMessages.push({
           role: "system",
           content: "【强制执行指令】检测到针对代码、配置或文件的修改/写入任务。严禁输出口头假提交或未执行的解释性答复，必须直接发起对应的工具调用完成实际写入与保存。"
         });
       }
 
-      const activeTools = tools;
+      const activeTools = consecutiveFailures >= 3 ? [] : tools;
       let activeToolChoice = "auto";
       if (tools.length > 0 && round === 0 && isWrite) {
         activeToolChoice = "required";
@@ -1626,8 +1660,13 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
 
         messages.push(message);
 
-        for (const tc of mcpCalls) {
+        let roundHasFailure = false;
+        for (let i = 0; i < mcpCalls.length; i += 1) {
+          const tc = mcpCalls[i];
           if (abortSignal?.aborted || clientResponse.destroyed) break;
+          if (i > 0) {
+            await new Promise((resolve) => setTimeout(resolve, 300));
+          }
           let toolInfo = mcpToolRegistry.get(tc.function.name);
           if (!toolInfo) {
             for (const [k, v] of mcpToolRegistry.entries()) {
@@ -1638,18 +1677,50 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
             }
           }
           const args = toolArguments(tc);
-          let result;
-          try {
-            result = await callMcpTool(tc.function.name, args);
-            executedToolCount += 1;
-          } catch (err) {
-            result = JSON.stringify({ error: err.message });
+          let resultText = "";
+          let isToolError = false;
+          if (args === null) {
+            resultText = JSON.stringify({ error: "Invalid tool arguments" });
+            isToolError = true;
+          } else {
+            const callKey = `${tc.function.name}:${JSON.stringify(args)}`;
+            const prevAttempts = toolCallHistory.get(callKey) || 0;
+            if (prevAttempts >= 2) {
+              resultText = JSON.stringify({ error: "该工具已使用完全相同的参数重复调用多次，系统已拦截重复执行。请勿继续重复调用，请根据当前信息直接回答用户。" });
+              isToolError = true;
+            } else {
+              toolCallHistory.set(callKey, prevAttempts + 1);
+              try {
+                const toolRes = await callMcpTool(tc.function.name, args);
+                resultText = toolRes.content;
+                isToolError = toolRes.isError;
+                if (!isToolError) {
+                  executedToolCount += 1;
+                  const fnLower = tc.function.name.toLowerCase();
+                  if (fnLower.includes("write") || fnLower.includes("create") || fnLower.includes("update") || fnLower.includes("push") || fnLower.includes("delete")) {
+                    hasWriteSuccess = true;
+                  }
+                }
+              } catch (err) {
+                resultText = JSON.stringify({ error: err instanceof Error ? err.message : "Tool execution failed" });
+                isToolError = true;
+              }
+            }
+          }
+          if (isToolError) {
+            roundHasFailure = true;
           }
           messages.push({
             role: "tool",
             tool_call_id: tc.id,
-            content: typeof result === "string" ? result : JSON.stringify(result)
+            content: resultText
           });
+        }
+
+        if (roundHasFailure) {
+          consecutiveFailures += 1;
+        } else {
+          consecutiveFailures = 0;
         }
         continue;
       }
@@ -1785,8 +1856,14 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         }))
       });
 
-      for (const tc of mcpCalls) {
+      let roundHasFailure = false;
+      for (let i = 0; i < mcpCalls.length; i += 1) {
+        const tc = mcpCalls[i];
         if (abortSignal?.aborted || clientResponse.destroyed) break;
+        if (i > 0) {
+          await new Promise((resolve) => setTimeout(resolve, 300));
+        }
+
         let toolInfo = mcpToolRegistry.get(tc.name);
         if (!toolInfo) {
           for (const [k, v] of mcpToolRegistry.entries()) {
@@ -1814,36 +1891,78 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
           );
         }
 
-        let result;
+        let resultText = "";
+        let isToolError = false;
         if (args === null) {
-          result = JSON.stringify({ error: "Invalid tool arguments" });
+          resultText = JSON.stringify({ error: "Invalid tool arguments" });
+          isToolError = true;
         } else {
-          try {
-            result = await callMcpTool(tc.name, args);
-            executedToolCount += 1;
-          } catch (err) {
-            result = JSON.stringify({ error: err instanceof Error ? err.message : "Tool execution failed" });
+          const callKey = `${tc.name}:${JSON.stringify(args)}`;
+          const prevAttempts = toolCallHistory.get(callKey) || 0;
+          if (prevAttempts >= 2) {
+            resultText = JSON.stringify({ error: "该工具已使用完全相同的参数重复调用多次，系统已拦截重复执行。请勿继续重复调用，请根据当前信息直接回答用户。" });
+            isToolError = true;
+          } else {
+            toolCallHistory.set(callKey, prevAttempts + 1);
+            try {
+              const toolRes = await callMcpTool(tc.name, args);
+              resultText = toolRes.content;
+              isToolError = toolRes.isError;
+              if (!isToolError) {
+                executedToolCount += 1;
+                const fnLower = tc.name.toLowerCase();
+                if (fnLower.includes("write") || fnLower.includes("create") || fnLower.includes("update") || fnLower.includes("push") || fnLower.includes("delete")) {
+                  hasWriteSuccess = true;
+                }
+              }
+            } catch (err) {
+              resultText = JSON.stringify({ error: err instanceof Error ? err.message : "Tool execution failed" });
+              isToolError = true;
+            }
           }
         }
 
+        if (isToolError) {
+          roundHasFailure = true;
+        }
+
         if (!abortSignal?.aborted && !clientResponse.destroyed) {
-          sendSSEChunk(
-            clientResponse,
-            { content: `> ✅ [${displayName}] 执行完成\n\n` },
-            requestBody.model
-          );
-          sendReasoningChunk(
-            clientResponse,
-            `> ${displayName} [${rawAction}] 完成\n\n`,
-            requestBody.model
-          );
+          if (isToolError) {
+            sendSSEChunk(
+              clientResponse,
+              { content: `> ❌ [${displayName}] 执行失败\n\n` },
+              requestBody.model
+            );
+            sendReasoningChunk(
+              clientResponse,
+              `> ${displayName} [${rawAction}] 失败\n\n`,
+              requestBody.model
+            );
+          } else {
+            sendSSEChunk(
+              clientResponse,
+              { content: `> ✅ [${displayName}] 执行完成\n\n` },
+              requestBody.model
+            );
+            sendReasoningChunk(
+              clientResponse,
+              `> ${displayName} [${rawAction}] 完成\n\n`,
+              requestBody.model
+            );
+          }
         }
 
         messages.push({
           role: "tool",
           tool_call_id: tc.id || `call_${crypto.randomUUID()}`,
-          content: typeof result === "string" ? result : JSON.stringify(result)
+          content: resultText
         });
+      }
+
+      if (roundHasFailure) {
+        consecutiveFailures += 1;
+      } else {
+        consecutiveFailures = 0;
       }
     }
   } finally {
