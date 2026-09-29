@@ -572,6 +572,35 @@ function extractMcpResultContent(data) {
   return contentStr;
 }
 
+function extractErrorMessage(text) {
+  if (!text) return "";
+  if (typeof text === "object") {
+    if (typeof text.error === "string") return text.error;
+    if (text.error?.message) return text.error.message;
+    if (typeof text.message === "string") return text.message;
+    return JSON.stringify(text).slice(0, 200);
+  }
+  let str = String(text).trim();
+  str = str.replace(/^(?:执行失败\s*[:：]?\s*)+/i, "");
+  try {
+    const parsed = JSON.parse(str);
+    return extractErrorMessage(parsed);
+  } catch {}
+  const jsonMatch = str.match(/\{[\s\S]*\}/);
+  if (jsonMatch) {
+    try {
+      const parsed = JSON.parse(jsonMatch[0]);
+      const inner = parsed.error?.message || parsed.message || parsed.error;
+      if (typeof inner === "string") {
+        const prefix = str.slice(0, jsonMatch.index).replace(/^(?:执行失败\s*[:：]?\s*)+/i, "").trim();
+        return prefix ? `${prefix} ${inner}` : inner;
+      }
+    } catch {}
+  }
+  const singleLine = str.replace(/[\r\n\t]+/g, " ").trim();
+  return singleLine.length > 200 ? `${singleLine.slice(0, 200)}...` : singleLine;
+}
+
 async function callMcpTool(toolKey, args) {
   let info = mcpToolRegistry.get(toolKey);
   if (!info) {
@@ -600,7 +629,7 @@ async function callMcpTool(toolKey, args) {
   if (!res.ok) {
     const txt = await res.text();
     addDebugLog("ERROR", `MCP 工具 [${toolKey}] 执行失败 (${res.status}) - 耗时 ${duration}ms`, { error: txt });
-    throw new Error(`执行失败 (${res.status}): ${txt.slice(0, 300)}`);
+    throw new Error(`HTTP ${res.status}: ${txt.slice(0, 300)}`);
   }
 
   const data = await parseMcpResponse(res);
@@ -1888,13 +1917,16 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
 
         let resultText = "";
         let isToolError = false;
+        let errorMessage = "";
         if (args === null) {
-          resultText = JSON.stringify({ error: "Invalid tool arguments" });
+          errorMessage = "无效参数";
+          resultText = JSON.stringify({ error: errorMessage });
           isToolError = true;
         } else {
           const callKey = `${tc.name}:${JSON.stringify(args)}`;
           const prevAttempts = toolCallHistory.get(callKey) || 0;
           if (prevAttempts >= 2) {
+            errorMessage = "重复调用已被系统拦截";
             resultText = JSON.stringify({ error: "该工具已使用完全相同的参数重复调用多次，系统已拦截重复执行。请勿继续重复调用，请根据当前信息直接回答用户。" });
             isToolError = true;
           } else {
@@ -1903,7 +1935,9 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
               const toolRes = await callMcpTool(tc.name, args);
               resultText = toolRes.content;
               isToolError = toolRes.isError;
-              if (!isToolError) {
+              if (isToolError) {
+                errorMessage = extractErrorMessage(toolRes.content);
+              } else {
                 executedToolCount += 1;
                 const fnLower = tc.name.toLowerCase();
                 if (fnLower.includes("write") || fnLower.includes("create") || fnLower.includes("update") || fnLower.includes("push") || fnLower.includes("delete")) {
@@ -1911,7 +1945,9 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
                 }
               }
             } catch (err) {
-              resultText = JSON.stringify({ error: err instanceof Error ? err.message : "Tool execution failed" });
+              const msg = err instanceof Error ? err.message : "Tool execution failed";
+              errorMessage = extractErrorMessage(msg);
+              resultText = JSON.stringify({ error: msg });
               isToolError = true;
             }
           }
@@ -1923,9 +1959,10 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
 
         if (!abortSignal?.aborted && !clientResponse.destroyed) {
           if (isToolError) {
+            const failReason = errorMessage ? `: ${errorMessage}` : "";
             sendReasoningChunk(
               clientResponse,
-              `> ❌ [${displayName}] 执行失败\n\n`,
+              `> ❌ [${displayName}] 执行失败${failReason}\n\n`,
               requestBody.model
             );
           } else {
