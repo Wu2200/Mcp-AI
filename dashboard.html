@@ -214,16 +214,6 @@
       color: #ffffff;
       border-color: #dc2626;
     }
-    .btn-check {
-      background: #e0e7ff;
-      color: #3730a3;
-      border: 1px solid #c7d2fe;
-    }
-    .btn-check:hover {
-      background: #4f46e5;
-      color: #ffffff;
-      border-color: #4f46e5;
-    }
 
     .server-item {
       background: #f8fafc;
@@ -333,20 +323,6 @@
       overflow: hidden;
       text-overflow: ellipsis;
     }
-    .tool-right {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      flex-shrink: 0;
-    }
-    .tool-reason {
-      font-size: 11px;
-      color: #dc2626;
-      max-width: 200px;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
     .model-tag {
       display: inline-flex;
       align-items: center;
@@ -391,7 +367,7 @@
       color: #166534;
       border-color: #86efac;
     }
-    #conn-msg, #enable-msg, #log-msg, #check-msg {
+    #conn-msg, #enable-msg, #log-msg {
       margin-left: 10px;
       font-size: 12px;
       font-weight: 500;
@@ -601,21 +577,9 @@
         <div class="card-title-left">
           <span>已挂载 MCP 服务列表</span>
         </div>
-        <div class="action-group">
-          <input id="check-tool-model" list="check-model-list" placeholder="选择或输入检测模型" style="width: 170px; padding: 5px 8px; font-size: 12px; height: 28px; border: 1px solid #cbd5e1; border-radius: 6px; outline: none;">
-          <datalist id="check-model-list"></datalist>
-          <button id="btn-check-tools" class="btn-action btn-check" onclick="handleCheckTools()">AI一键检测</button>
-          <button id="btn-enable-all" class="btn-action btn-start" onclick="handleEnableAllTools()">一键启用全部</button>
-        </div>
       </div>
-      <p style="font-size: 12px; color: #64748b; margin-bottom: 10px;">
-        输入或选择指定模型进行工具兼容性检测，检测不通过的工具会自动禁用。
-      </p>
       <div id="mcp-list">
         <div class="empty-state">正在加载服务列表...</div>
-      </div>
-      <div style="margin-top: 8px;">
-        <span id="check-msg"></span>
       </div>
     </div>
   </div>
@@ -632,28 +596,10 @@
       location.reload();
     }
 
-    function updateModelCandidatesList(extraModels = []) {
-      const datalist = document.getElementById("check-model-list");
-      if (!datalist) return;
-      const set = new Set();
-      for (const m of currentEnabledList) {
-        if (m && !m.includes("*")) set.add(m);
-      }
-      for (const m of extraModels) {
-        if (m) set.add(m);
-      }
-      datalist.innerHTML = Array.from(set).map(m => `<option value="${m}"></option>`).join("");
-      const input = document.getElementById("check-tool-model");
-      if (input && !input.value && set.size > 0) {
-        input.value = Array.from(set)[0];
-      }
-    }
-
     function renderEnabledTags() {
       const container = document.getElementById("enabled-tags");
       if (!currentEnabledList || currentEnabledList.length === 0) {
         container.innerHTML = '<span style="font-size: 12px; color: #94a3b8;">暂未启用任何模型，所有请求默认直通上游网关。</span>';
-        updateModelCandidatesList();
         return;
       }
       container.innerHTML = currentEnabledList.map((m, idx) => `
@@ -662,7 +608,6 @@
           <button class="model-tag-del" onclick="removeEnabledModel(${idx})">×</button>
         </span>
       `).join("");
-      updateModelCandidatesList();
     }
 
     function addCustomModel() {
@@ -728,7 +673,6 @@
         container.innerHTML = list.map(m => `
           <span class="candidate-tag" onclick="selectCandidate('${m}')">+ ${m}</span>
         `).join("");
-        updateModelCandidatesList(list);
       } catch (e) {
         container.innerHTML = `<span style="font-size: 12px; color: #dc2626;">拉取失败: ${e.message}</span>`;
       }
@@ -880,67 +824,6 @@
       } catch {}
     }
 
-    async function handleEnableAllTools() {
-      const msg = document.getElementById("check-msg");
-      msg.innerText = "正在启用所有工具...";
-      msg.style.color = "#2563eb";
-      try {
-        const res = await fetch("/api/mcp/tools/enable-all", { method: "POST" });
-        const data = await res.json();
-        if (res.ok && data.success) {
-          msg.innerText = "已成功恢复全部 " + data.count + " 个工具为启用状态";
-          msg.style.color = "#16a34a";
-          loadServers();
-        } else {
-          msg.innerText = "恢复失败";
-          msg.style.color = "#dc2626";
-        }
-      } catch (e) {
-        msg.innerText = "操作异常: " + e.message;
-        msg.style.color = "#dc2626";
-      }
-    }
-
-    async function handleCheckTools() {
-      const modelInput = document.getElementById("check-tool-model");
-      const targetModel = modelInput ? modelInput.value.trim() : "";
-      const msg = document.getElementById("check-msg");
-      if (!targetModel) {
-        msg.innerText = "请先选择或输入检测模型";
-        msg.style.color = "#dc2626";
-        if (modelInput) modelInput.focus();
-        return;
-      }
-      const btn = document.getElementById("btn-check-tools");
-      btn.disabled = true;
-      btn.innerText = "正在检测中...";
-      msg.innerText = "正在使用模型 " + targetModel + " 检测工具兼容性...";
-      msg.style.color = "#2563eb";
-
-      try {
-        const res = await fetch("/api/mcp/check-tools", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ model: targetModel })
-        });
-        const data = await res.json();
-        if (res.ok && data.success) {
-          msg.innerText = "检测完成：共检测 " + data.total + " 个工具，支持 " + data.supported + " 个，已自动禁用 " + data.unsupported + " 个";
-          msg.style.color = "#16a34a";
-        } else {
-          msg.innerText = "检测失败: " + (data.error || "未知原因");
-          msg.style.color = "#dc2626";
-        }
-        await loadServers();
-      } catch (err) {
-        msg.innerText = "检测异常: " + err.message;
-        msg.style.color = "#dc2626";
-      } finally {
-        btn.disabled = false;
-        btn.innerText = "AI一键检测";
-      }
-    }
-
     async function loadServers() {
       try {
         const res = await fetch("/api/mcp/servers");
@@ -968,26 +851,11 @@
           let toolsHtml = "";
           for (let t of s.tools) {
             const isToolEnabled = t.enabled !== false;
-            let statusTag = '<span class="badge badge-gray">未检测</span>';
-            if (t.status === "supported") {
-              statusTag = '<span class="badge badge-green">支持</span>';
-            } else if (t.status === "unsupported") {
-              statusTag = '<span class="badge badge-red">不支持</span>';
-            }
-
-            const reasonHtml = t.status === "unsupported" && t.statusMessage
-              ? `<span class="tool-reason" title="${escapeHtml(t.statusMessage)}">${escapeHtml(t.statusMessage)}</span>`
-              : "";
-
             toolsHtml += `
               <div class="tool-row ${isToolEnabled ? '' : 'disabled'}">
                 <div class="tool-left">
                   <input type="checkbox" class="tool-checkbox" ${isToolEnabled ? 'checked' : ''} onchange="handleToggleTool('${s.id}', '${t.key}', this.checked)">
                   <span class="tool-name" title="${t.key}">${t.key}</span>
-                </div>
-                <div class="tool-right">
-                  ${reasonHtml}
-                  ${statusTag}
                 </div>
               </div>
             `;
