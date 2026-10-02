@@ -873,7 +873,7 @@ async function passThrough(requestBody, clientResponse, reqMeta, abortSignal) {
 
   let currentMessages = [...(requestBody.messages || [])];
   let continueRound = 0;
-  const MAX_AUTO_CONTINUES = 10;
+  const MAX_AUTO_CONTINUES = 30;
   let hasInitiatedStream = false;
   let fullAccumulatedContent = "";
 
@@ -1381,7 +1381,7 @@ async function passThroughAndTransformGemini(requestBody, clientResponse, isStre
 
   let currentMessages = [...requestBody.messages];
   let continueRound = 0;
-  const MAX_AUTO_CONTINUES = 10;
+  const MAX_AUTO_CONTINUES = 30;
   let hasInitiatedStream = false;
 
   while (continueRound <= MAX_AUTO_CONTINUES) {
