@@ -464,7 +464,7 @@ async function connectToMcpServer({ name, url, token }) {
       method: "POST",
       headers,
       body: JSON.stringify(initPayload),
-      signal: AbortSignal.timeout(8000)
+      signal: AbortSignal.timeout(20000)
     });
 
     await fetch(cleanUrl, {
@@ -474,7 +474,7 @@ async function connectToMcpServer({ name, url, token }) {
         jsonrpc: "2.0",
         method: "notifications/initialized"
       }),
-      signal: AbortSignal.timeout(5000)
+      signal: AbortSignal.timeout(20000)
     }).catch(() => {});
   } catch {}
 
@@ -483,7 +483,7 @@ async function connectToMcpServer({ name, url, token }) {
     method: "POST",
     headers,
     body: JSON.stringify(listPayload),
-    signal: AbortSignal.timeout(10000)
+    signal: AbortSignal.timeout(20000)
   });
 
   if (!listRes.ok) {
@@ -2093,7 +2093,7 @@ async function checkAllTools(modelName) {
         messages: [{ role: "user", content: "ping" }],
         max_tokens: 1
       }),
-      signal: AbortSignal.timeout(10000)
+      signal: AbortSignal.timeout(20000)
     });
   } catch (err) {
     throw new Error(`上游请求失败: ${err.message}。未修改任何工具状态`);
@@ -2134,7 +2134,7 @@ async function checkAllTools(modelName) {
             tools: [t.openAiTool],
             max_tokens: 1
           }),
-          signal: AbortSignal.timeout(10000)
+          signal: AbortSignal.timeout(20000)
         });
 
         if (testRes.ok) {
@@ -2440,7 +2440,7 @@ const server = http.createServer(async (request, response) => {
         try {
           const upstreamResponse = await fetch(modelsUrl, {
             headers: { Authorization: `Bearer ${channel.apiKey}` },
-            signal: AbortSignal.timeout(10000)
+            signal: AbortSignal.timeout(20000)
           });
           const data = await upstreamResponse.json();
           const list = Array.isArray(data.data) ? data.data.map((m) => m.id).filter(Boolean) : [];
@@ -2667,7 +2667,7 @@ const server = http.createServer(async (request, response) => {
         try {
           const upstreamResponse = await fetch(modelsUrl, {
             headers: { Authorization: `Bearer ${channel.apiKey}` },
-            signal: AbortSignal.timeout(10000)
+            signal: AbortSignal.timeout(20000)
           });
           const data = await upstreamResponse.json();
           sendJson(response, 200, data);
@@ -2759,8 +2759,8 @@ const server = http.createServer(async (request, response) => {
   }
 });
 
-server.keepAliveTimeout = 600000;
-server.requestTimeout = 600000;
-server.headersTimeout = 600000;
+server.keepAliveTimeout = 1800000;
+server.requestTimeout = 1800000;
+server.headersTimeout = 1800000;
 
 server.listen(PORT, "0.0.0.0");
