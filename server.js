@@ -799,6 +799,78 @@ function toolArguments(toolCall) {
   }
 }
 
+function formatToolCallDetails(args) {
+  if (!args || typeof args !== "object") return "";
+  const parts = [];
+
+  if (args.owner && args.repo) {
+    parts.push(`仓库: ${args.owner}/${args.repo}`);
+  } else if (args.repo) {
+    parts.push(`仓库: ${args.repo}`);
+  } else if (args.owner) {
+    parts.push(`所有者: ${args.owner}`);
+  }
+
+  if (args.path) {
+    parts.push(`路径: ${args.path}`);
+  } else if (args.file || args.filePath || args.filename) {
+    parts.push(`文件: ${args.file || args.filePath || args.filename}`);
+  }
+
+  if (Array.isArray(args.files) && args.files.length > 0) {
+    const filePaths = args.files
+      .map((f) => (typeof f === "string" ? f : f?.path || ""))
+      .filter(Boolean);
+    if (filePaths.length > 0) {
+      parts.push(`涉及文件: ${filePaths.slice(0, 3).join(", ")}${filePaths.length > 3 ? " 等" : ""}`);
+    }
+  }
+
+  if (args.query) {
+    const q = String(args.query).replace(/[\r\n\t]+/g, " ").trim();
+    parts.push(`查询: ${q.length > 60 ? `${q.slice(0, 60)}...` : q}`);
+  } else if (args.q) {
+    const q = String(args.q).replace(/[\r\n\t]+/g, " ").trim();
+    parts.push(`查询: ${q.length > 60 ? `${q.slice(0, 60)}...` : q}`);
+  }
+
+  if (args.branch) {
+    parts.push(`分支: ${args.branch}`);
+  } else if (args.ref) {
+    parts.push(`引用: ${args.ref}`);
+  }
+
+  if (args.pullNumber || args.pull_number) {
+    parts.push(`PR #${args.pullNumber || args.pull_number}`);
+  }
+
+  if (args.issue_number || args.issueNumber) {
+    parts.push(`Issue #${args.issue_number || args.issueNumber}`);
+  }
+
+  if (args.message) {
+    const m = String(args.message).replace(/[\r\n\t]+/g, " ").trim();
+    parts.push(`说明: ${m.length > 40 ? `${m.slice(0, 40)}...` : m}`);
+  }
+
+  if (args.url) {
+    const u = String(args.url).trim();
+    parts.push(`地址: ${u.length > 60 ? `${u.slice(0, 60)}...` : u}`);
+  }
+
+  if (parts.length === 0) {
+    const keys = Object.keys(args).filter((k) => typeof args[k] === "string" || typeof args[k] === "number");
+    for (const k of keys.slice(0, 2)) {
+      const v = String(args[k]).replace(/[\r\n\t]+/g, " ").trim();
+      if (v) {
+        parts.push(`${k}: ${v.length > 40 ? `${v.slice(0, 40)}...` : v}`);
+      }
+    }
+  }
+
+  return parts.join(", ");
+}
+
 function sendSSEChunk(clientResponse, delta, model = "default") {
   const chunk = {
     id: `chatcmpl-${Date.now()}`,
@@ -1633,6 +1705,12 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       }
 
       let roundMessages = [...messages];
+      if (round === 0) {
+        roundMessages.push({
+          role: "system",
+          content: "【工具调用透明化指令】在调用任何工具前，思考过程中必须清晰指明目标仓库名称、文件路径、分支或具体检索内容，确保调用过程清晰可追踪。"
+        });
+      }
       if (hasWriteSuccess) {
         roundMessages.push({
           role: "system",
@@ -1972,11 +2050,13 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         const displayName = toolInfo?.serverName || "MCP";
         const rawAction = toolInfo?.rawName || tc.name;
         const args = toolArguments({ function: { arguments: tc.arguments } });
+        const actionDetails = formatToolCallDetails(args);
+        const detailSuffix = actionDetails ? ` | ${actionDetails}` : "";
 
         if (!abortSignal?.aborted && !clientResponse.destroyed) {
           sendReasoningChunk(
             clientResponse,
-            `\n> ⏳ 正在调用 [${displayName}] 执行操作: \`${rawAction}\`...\n`,
+            `\n> ⏳ 正在调用 [${displayName}] 执行操作: \`${rawAction}\`${detailSuffix}...\n`,
             requestBody.model
           );
         }
@@ -2028,13 +2108,13 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
             const failReason = errorMessage ? `: ${errorMessage}` : "";
             sendReasoningChunk(
               clientResponse,
-              `> ❌ [${displayName}] 执行失败${failReason}\n\n`,
+              `> ❌ [${displayName}] 执行失败${detailSuffix}${failReason}\n\n`,
               requestBody.model
             );
           } else {
             sendReasoningChunk(
               clientResponse,
-              `> ✅ [${displayName}] 执行完成\n\n`,
+              `> ✅ [${displayName}] 执行完成${detailSuffix}\n\n`,
               requestBody.model
             );
           }
