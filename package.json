@@ -10,6 +10,15 @@
   "engines": {
     "node": ">=18.0.0"
   },
-  "keywords": ["mcp", "agent", "proxy", "chatbox", "openai"],
+  "dependencies": {
+    "pg": "^8.13.1"
+  },
+  "keywords": [
+    "mcp",
+    "agent",
+    "proxy",
+    "chatbox",
+    "openai"
+  ],
   "license": "MIT"
 }
