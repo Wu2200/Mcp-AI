@@ -3,13 +3,16 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import pg from "pg";
 
+const { Pool } = pg;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT || 10000);
 const PROXY_API_KEY = (process.env.PROXY_API_KEY || "").trim();
 const PANEL_PASSWORD = (process.env.PANEL_PASSWORD || "").trim();
+const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
 
 const DATA_FILE = path.join(__dirname, "mcp-config.json");
 const SETTINGS_FILE = path.join(__dirname, "mcp-settings.json");
@@ -42,6 +45,62 @@ function addDebugLog(type, summary, detail = "") {
   debugLogs.push(entry);
   if (debugLogs.length > MAX_LOGS) {
     debugLogs.shift();
+  }
+}
+
+let dbPool = null;
+if (DATABASE_URL) {
+  const isSslDisabled = DATABASE_URL.includes("sslmode=disable");
+  dbPool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: isSslDisabled ? false : { rejectUnauthorized: false }
+  });
+  dbPool.on("error", (err) => {
+    addDebugLog("ERROR", `数据库连接异常: ${err.message}`, err);
+  });
+}
+
+async function initDatabase() {
+  if (!dbPool) return;
+  try {
+    await dbPool.query(`
+      CREATE TABLE IF NOT EXISTS mcp_storage (
+        key VARCHAR(255) PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+  } catch (err) {
+    addDebugLog("ERROR", `数据库初始化失败: ${err.message}`, err);
+  }
+}
+
+async function getStorageItem(key) {
+  if (!dbPool) return null;
+  try {
+    const res = await dbPool.query("SELECT value FROM mcp_storage WHERE key = $1", [key]);
+    if (res.rows.length > 0) {
+      return JSON.parse(res.rows[0].value);
+    }
+  } catch (err) {
+    addDebugLog("ERROR", `读取数据库项失败: ${err.message}`, err);
+  }
+  return null;
+}
+
+async function setStorageItem(key, val) {
+  if (!dbPool) return;
+  try {
+    const jsonStr = JSON.stringify(val);
+    await dbPool.query(
+      `INSERT INTO mcp_storage (key, value, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (key) DO UPDATE
+       SET value = EXCLUDED.value, updated_at = NOW()`,
+      [key, jsonStr]
+    );
+  } catch (err) {
+    addDebugLog("ERROR", `写入数据库项失败: ${err.message}`, err);
   }
 }
 
@@ -122,7 +181,8 @@ function loadUpstreamChannelsFromEnv() {
     "PROXY_API_KEY",
     "PANEL_PASSWORD",
     "PORT",
-    "NODE_ENV"
+    "NODE_ENV",
+    "DATABASE_URL"
   ]);
 
   const groupKeys = envKeys
@@ -257,39 +317,50 @@ function parseCookies(request) {
   return list;
 }
 
-function writeSettingsFile(patch) {
+async function saveSettingsToStorage() {
+  const data = {
+    loggingEnabled,
+    enabledModels: Array.from(enabledModels),
+    activeChannelId
+  };
   try {
-    let current = {};
-    if (fs.existsSync(SETTINGS_FILE)) {
-      try {
-        current = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf8"));
-      } catch {}
-    }
-    Object.assign(current, patch);
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(current, null, 2), "utf8");
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(data, null, 2), "utf8");
   } catch {}
+  if (dbPool) {
+    await setStorageItem("settings", data);
+  }
 }
 
 async function saveLoggingConfigToStorage(enabled) {
   loggingEnabled = enabled;
-  writeSettingsFile({ loggingEnabled: enabled });
+  await saveSettingsToStorage();
 }
 
 async function saveEnabledModelsToStorage(modelsArray) {
   enabledModels = new Set(modelsArray);
-  writeSettingsFile({ enabledModels: modelsArray });
+  await saveSettingsToStorage();
 }
 
 async function saveActiveChannelToStorage(channelId) {
   activeChannelId = channelId;
-  writeSettingsFile({ activeChannelId: channelId });
+  await saveSettingsToStorage();
 }
 
 async function loadSettingsFromStorage() {
-  if (!fs.existsSync(SETTINGS_FILE)) return;
-  try {
-    const raw = fs.readFileSync(SETTINGS_FILE, "utf8");
-    const data = JSON.parse(raw);
+  let data = null;
+  if (dbPool) {
+    data = await getStorageItem("settings");
+  }
+  if (!data && fs.existsSync(SETTINGS_FILE)) {
+    try {
+      const raw = fs.readFileSync(SETTINGS_FILE, "utf8");
+      data = JSON.parse(raw);
+      if (dbPool && data) {
+        await setStorageItem("settings", data);
+      }
+    } catch {}
+  }
+  if (data && typeof data === "object") {
     if (Array.isArray(data.enabledModels)) {
       enabledModels = new Set(data.enabledModels);
     }
@@ -301,50 +372,68 @@ async function loadSettingsFromStorage() {
         activeChannelId = data.activeChannelId;
       }
     }
-  } catch {}
+  }
 }
 
 async function saveServerToStorage() {
+  const data = Array.from(mcpServers.values());
   try {
-    const data = Array.from(mcpServers.values());
     fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf8");
   } catch {}
+  if (dbPool) {
+    await setStorageItem("servers", data);
+  }
 }
 
 async function deleteServerFromStorage() {
+  const data = Array.from(mcpServers.values());
   try {
-    const data = Array.from(mcpServers.values());
     fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf8");
   } catch {}
+  if (dbPool) {
+    await setStorageItem("servers", data);
+  }
 }
 
 async function loadConfigFromStorage() {
-  if (!fs.existsSync(DATA_FILE)) return;
-  try {
-    const raw = fs.readFileSync(DATA_FILE, "utf8");
-    const list = JSON.parse(raw);
+  let list = null;
+  if (dbPool) {
+    list = await getStorageItem("servers");
+  }
+  if (!list && fs.existsSync(DATA_FILE)) {
+    try {
+      const raw = fs.readFileSync(DATA_FILE, "utf8");
+      list = JSON.parse(raw);
+      if (dbPool && list) {
+        await setStorageItem("servers", list);
+      }
+    } catch {}
+  }
+  if (Array.isArray(list)) {
     for (const item of list) {
       const status = item.status || "active";
       item.status = status;
-      for (const t of item.tools) {
-        t.enabled = true;
-        t.status = "unchecked";
-        t.statusMessage = "";
+      for (const t of item.tools || []) {
+        t.enabled = typeof t.enabled === "boolean" ? t.enabled : true;
+        t.status = t.status || "unchecked";
+        t.statusMessage = t.statusMessage || "";
       }
       mcpServers.set(item.id, item);
       if (status === "active") {
-        for (const t of item.tools) {
-          mcpToolRegistry.set(t.key, {
-            serverId: item.id,
-            serverName: item.name,
-            rawName: t.rawName,
-            postEndpoint: item.postEndpoint,
-            headers: item.headers
-          });
+        for (const t of item.tools || []) {
+          if (t.enabled !== false) {
+            mcpToolRegistry.set(t.key, {
+              serverId: item.id,
+              serverName: item.name,
+              rawName: t.rawName,
+              postEndpoint: item.postEndpoint,
+              headers: item.headers
+            });
+          }
         }
       }
     }
-  } catch {}
+  }
 }
 
 function setCorsHeaders(response) {
@@ -548,7 +637,7 @@ async function connectToMcpServer({ name, url, token }) {
   };
 
   mcpServers.set(serverId, serverInfo);
-  await saveServerToStorage(serverInfo);
+  await saveServerToStorage();
   addDebugLog("TOOL", `成功挂载 MCP 服务: ${name}`, { serverId, url: cleanUrl, toolCount: registeredTools.length });
   return serverInfo;
 }
@@ -2260,7 +2349,7 @@ async function checkAllTools(modelName) {
       }
     }
 
-    await saveServerToStorage(s);
+    await saveServerToStorage();
   }
 
   addDebugLog("AGENT", `AI一键检测完成 - 渠道 [${channel.name}] - 测试模型 [${targetModel}] - 共 ${total} 个工具，支持 ${supported} 个，不支持已自动禁用 ${unsupported} 个`);
@@ -2358,6 +2447,9 @@ function getLoginHtml() {
 }
 
 loadUpstreamChannelsFromEnv();
+if (dbPool) {
+  await initDatabase();
+}
 await loadConfigFromStorage();
 await loadSettingsFromStorage();
 
@@ -2562,8 +2654,8 @@ const server = http.createServer(async (request, response) => {
               });
             }
           }
-          await saveServerToStorage(s);
         }
+        await saveServerToStorage();
         sendJson(response, 200, { success: true, count });
         return;
       }
@@ -2608,7 +2700,7 @@ const server = http.createServer(async (request, response) => {
         } else {
           mcpToolRegistry.delete(tool.key);
         }
-        await saveServerToStorage(s);
+        await saveServerToStorage();
         sendJson(response, 200, { success: true, enabled: tool.enabled });
         return;
       }
@@ -2633,7 +2725,7 @@ const server = http.createServer(async (request, response) => {
             });
           }
         }
-        await saveServerToStorage(s);
+        await saveServerToStorage();
         sendJson(response, 200, { success: true, status: "active" });
         return;
       }
@@ -2652,7 +2744,7 @@ const server = http.createServer(async (request, response) => {
             mcpToolRegistry.delete(key);
           }
         }
-        await saveServerToStorage(s);
+        await saveServerToStorage();
         sendJson(response, 200, { success: true, status: "disabled" });
         return;
       }
@@ -2666,7 +2758,7 @@ const server = http.createServer(async (request, response) => {
             mcpToolRegistry.delete(key);
           }
         }
-        await deleteServerFromStorage(id);
+        await deleteServerFromStorage();
         sendJson(response, 200, { success: true });
         return;
       }

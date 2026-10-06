@@ -15,3 +15,5 @@ services:
         sync: false
       - key: PANEL_PASSWORD
         sync: false
+      - key: DATABASE_URL
+        sync: false
