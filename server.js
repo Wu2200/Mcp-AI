@@ -2542,7 +2542,16 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
           } else {
             toolCallHistory.set(callKey, prevAttempts + 1);
             try {
-              const toolRes = await callMcpTool(tc.name, args);
+              const onWaitNotice = (waitSec) => {
+                if (!abortSignal?.aborted && !clientResponse.destroyed) {
+                  sendReasoningChunk(
+                    clientResponse,
+                    `> ⏳ 触发 GitHub 访问频控，正在等待 ${waitSec + 1} 秒后自动重试...\n`,
+                    requestBody.model
+                  );
+                }
+              };
+              const toolRes = await callMcpTool(tc.name, args, onWaitNotice);
               resultText = toolRes.content;
               isToolError = toolRes.isError;
               if (isToolError) {
