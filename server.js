@@ -1080,14 +1080,14 @@ function registerVirtualTools(serverInfo) {
       serverName: serverInfo.name,
       rawName: virtualRawName,
       isVirtual: true,
-      handler: async (args) => {
-        return await executeGithubEditFile(serverInfo, readTool.rawName, writeTool.rawName, args);
+      handler: async (args, onWaitNotice) => {
+        return await executeGithubEditFile(serverInfo, readTool.rawName, writeTool.rawName, args, onWaitNotice);
       }
     });
   }
 }
 
-async function callMcpTool(toolKey, args) {
+async function callMcpTool(toolKey, args, onWaitNotice = null) {
   let info = mcpToolRegistry.get(toolKey);
   if (!info) {
     for (const [k, v] of mcpToolRegistry.entries()) {
@@ -1099,10 +1099,10 @@ async function callMcpTool(toolKey, args) {
   }
   if (!info) throw new Error(`未找到工具：${toolKey}`);
 
+  const startTime = Date.now();
   if (typeof info.handler === "function") {
-    const startTime = Date.now();
     try {
-      const res = await info.handler(args);
+      const res = await info.handler(args, onWaitNotice);
       const duration = Date.now() - startTime;
       const isError = Boolean(res && res.isError);
       const content = typeof res?.content === "string" ? res.content : JSON.stringify(res || {});
@@ -1119,48 +1119,27 @@ async function callMcpTool(toolKey, args) {
     }
   }
 
-  const startTime = Date.now();
-  const res = await fetch(info.postEndpoint, {
-    method: "POST",
-    headers: info.headers,
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: Date.now(),
-      method: "tools/call",
-      params: { name: info.rawName, arguments: args }
-    })
-  });
-
-  const duration = Date.now() - startTime;
-  if (!res.ok) {
-    const txt = await res.text();
-    addDebugLog("ERROR", `MCP 工具 [${toolKey}] 执行失败 (${res.status}) - 耗时 ${duration}ms`, { error: txt });
-    throw new Error(`HTTP ${res.status}: ${txt.slice(0, 300)}`);
-  }
-
-  const data = await parseMcpResponse(res);
-  if (data.error) {
-    addDebugLog("ERROR", `MCP 工具 [${toolKey}] 报错 - 耗时 ${duration}ms`, data.error);
-    throw new Error(data.error.message || JSON.stringify(data.error));
-  }
-
-  const rawResult = data.result !== undefined ? data.result : data;
-  const isToolError = Boolean(rawResult && (rawResult.isError === true || rawResult.is_error === true));
-  const resultText = extractMcpResultContent(data);
-
-  if (isToolError) {
-    addDebugLog("ERROR", `MCP 工具 [${toolKey}] 返回错误 - 耗时 ${duration}ms`, {
+  try {
+    const { rawResult, isToolError, textContent } = await invokeMcpRawTool(info, info.rawName, args, onWaitNotice);
+    const duration = Date.now() - startTime;
+    if (isToolError) {
+      addDebugLog("ERROR", `MCP 工具 [${toolKey}] 返回错误 - 耗时 ${duration}ms`, {
+        arguments: args,
+        errorOutput: textContent.slice(0, 500)
+      });
+      return { isError: true, content: textContent };
+    }
+    addDebugLog("TOOL", `MCP 工具 [${toolKey}] 执行成功 - 耗时 ${duration}ms, 输出 ${textContent.length} 字符`, {
       arguments: args,
-      errorOutput: resultText.slice(0, 500)
+      outputPreview: textContent.slice(0, 500)
     });
-    return { isError: true, content: resultText };
+    return { isError: false, content: textContent };
+  } catch (err) {
+    const duration = Date.now() - startTime;
+    const msg = err instanceof Error ? err.message : String(err);
+    addDebugLog("ERROR", `MCP 工具 [${toolKey}] 异常 - 耗时 ${duration}ms`, msg);
+    throw err;
   }
-
-  addDebugLog("TOOL", `MCP 工具 [${toolKey}] 执行成功 - 耗时 ${duration}ms, 输出 ${resultText.length} 字符`, {
-    arguments: args,
-    outputPreview: resultText.slice(0, 500)
-  });
-  return { isError: false, content: resultText };
 }
 
 function getAllTools() {
