@@ -419,9 +419,10 @@ async function loadConfigFromStorage() {
         t.statusMessage = t.statusMessage || "";
       }
       mcpServers.set(item.id, item);
+      registerVirtualTools(item);
       if (status === "active") {
         for (const t of item.tools || []) {
-          if (t.enabled !== false) {
+          if (t.enabled !== false && !t.isVirtual) {
             mcpToolRegistry.set(t.key, {
               serverId: item.id,
               serverName: item.name,
@@ -636,9 +637,10 @@ async function connectToMcpServer({ name, url, token }) {
     tools: registeredTools
   };
 
+  registerVirtualTools(serverInfo);
   mcpServers.set(serverId, serverInfo);
   await saveServerToStorage();
-  addDebugLog("TOOL", `成功挂载 MCP 服务: ${name}`, { serverId, url: cleanUrl, toolCount: registeredTools.length });
+  addDebugLog("TOOL", `成功挂载 MCP 服务: ${name}`, { serverId, url: cleanUrl, toolCount: serverInfo.tools.length });
   return serverInfo;
 }
 
@@ -717,6 +719,315 @@ function extractErrorMessage(text) {
   return singleLine.length > 200 ? `${singleLine.slice(0, 200)}...` : singleLine;
 }
 
+async function invokeMcpRawTool(serverInfo, rawName, args) {
+  const res = await fetch(serverInfo.postEndpoint, {
+    method: "POST",
+    headers: serverInfo.headers,
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: Date.now(),
+      method: "tools/call",
+      params: { name: rawName, arguments: args }
+    }),
+    signal: AbortSignal.timeout(30000)
+  });
+
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`MCP HTTP ${res.status}: ${txt.slice(0, 300)}`);
+  }
+
+  const data = await parseMcpResponse(res);
+  if (data.error) {
+    throw new Error(data.error.message || JSON.stringify(data.error));
+  }
+
+  const rawResult = data.result !== undefined ? data.result : data;
+  const isToolError = Boolean(rawResult && (rawResult.isError === true || rawResult.is_error === true));
+  const textContent = extractMcpResultContent(data);
+  return { data, rawResult, isToolError, textContent };
+}
+
+function extractFileContentAndSha(mcpRes) {
+  const { rawResult, textContent } = mcpRes;
+  let fileContent = "";
+  let fileSha = "";
+
+  if (rawResult && Array.isArray(rawResult.content)) {
+    for (const item of rawResult.content) {
+      if (!item) continue;
+      if (item.type === "text" && item.text) {
+        const shaMatch = item.text.match(/SHA:\s*([0-9a-f]{40})/i);
+        if (shaMatch) {
+          fileSha = shaMatch[1];
+        }
+      }
+      if ((item.type === "resource" || item.type === "embedded_resource") && item.resource) {
+        if (typeof item.resource.text === "string") {
+          fileContent = item.resource.text;
+        } else if (item.resource.blob) {
+          try {
+            fileContent = Buffer.from(item.resource.blob, "base64").toString("utf8");
+          } catch {
+            fileContent = item.resource.blob;
+          }
+        }
+      }
+    }
+  }
+
+  if (!fileContent && textContent) {
+    const shaMatch = textContent.match(/SHA:\s*([0-9a-f]{40})/i);
+    if (shaMatch && !fileSha) {
+      fileSha = shaMatch[1];
+    }
+    fileContent = textContent.replace(/^successfully downloaded[^\n]*\r?\n+/, "");
+  }
+
+  if (!fileSha && textContent) {
+    const firstLine = textContent.split("\n")[0] || "";
+    const shaMatch = firstLine.match(/\b([0-9a-f]{40})\b/i);
+    if (shaMatch) {
+      fileSha = shaMatch[1];
+    }
+  }
+
+  return { fileContent, fileSha };
+}
+
+function applyStringReplacements(content, edits, filePath = "") {
+  let updated = content;
+  for (let i = 0; i < edits.length; i += 1) {
+    const { old_str, new_str } = edits[i];
+    if (typeof old_str !== "string" || typeof new_str !== "string") {
+      throw new Error(`第 ${i + 1} 处修改参数错误：old_str 与 new_str 必须为字符串`);
+    }
+    if (old_str === new_str) {
+      throw new Error(`第 ${i + 1} 处修改无效：old_str 与 new_str 完全相同`);
+    }
+
+    let targetStr = old_str;
+    let idx = updated.indexOf(targetStr);
+
+    if (idx === -1) {
+      if (updated.includes("\r\n") && !targetStr.includes("\r\n")) {
+        const crlfTarget = targetStr.replace(/\n/g, "\r\n");
+        if (updated.includes(crlfTarget)) {
+          targetStr = crlfTarget;
+          idx = updated.indexOf(targetStr);
+        }
+      } else if (!updated.includes("\r\n") && targetStr.includes("\r\n")) {
+        const lfTarget = targetStr.replace(/\r\n/g, "\n");
+        if (updated.includes(lfTarget)) {
+          targetStr = lfTarget;
+          idx = updated.indexOf(targetStr);
+        }
+      }
+    }
+
+    if (idx === -1) {
+      const trimmedOld = targetStr.trim();
+      if (trimmedOld && updated.includes(trimmedOld)) {
+        const occurrences = updated.split(trimmedOld).length - 1;
+        if (occurrences === 1) {
+          targetStr = trimmedOld;
+          idx = updated.indexOf(targetStr);
+        }
+      }
+    }
+
+    if (idx === -1) {
+      throw new Error(`在文件 ${filePath} 中未找到指定的待替换片段 (old_str)。请核对代码内容、空格缩进及换行是否准确。待查找片段预览:\n${old_str.slice(0, 200)}`);
+    }
+
+    const count = updated.split(targetStr).length - 1;
+    if (count > 1) {
+      throw new Error(`在文件 ${filePath} 中找到多处 (${count} 处) 完全相同的待替换片段。为防止误替换，请在 old_str 中包含更多上下文代码行以确保唯一性。`);
+    }
+
+    let replacement = new_str;
+    if (targetStr.includes("\r\n") && !replacement.includes("\r\n")) {
+      replacement = replacement.replace(/\n/g, "\r\n");
+    } else if (!targetStr.includes("\r\n") && replacement.includes("\r\n")) {
+      replacement = replacement.replace(/\r\n/g, "\n");
+    }
+
+    updated = updated.slice(0, idx) + replacement + updated.slice(idx + targetStr.length);
+  }
+  return updated;
+}
+
+async function executeGithubEditFile(serverInfo, readToolRawName, writeToolRawName, args) {
+  const { owner, repo, path: filePath, old_str, new_str, edits, message, branch } = args || {};
+
+  if (!owner || !repo || !filePath) {
+    throw new Error("缺少必需参数：owner, repo, path");
+  }
+
+  let editList = [];
+  if (Array.isArray(edits) && edits.length > 0) {
+    editList = edits;
+  } else if (typeof old_str === "string" && typeof new_str === "string") {
+    editList = [{ old_str, new_str }];
+  } else {
+    throw new Error("必须提供 old_str 与 new_str，或 edits 数组");
+  }
+
+  const getArgs = { owner, repo, path: filePath };
+  if (branch) {
+    getArgs.ref = branch;
+  }
+
+  addDebugLog("TOOL", `[局部编辑] 读取文件: ${owner}/${repo}/${filePath} (分支: ${branch || "默认"})`);
+  const getRes = await invokeMcpRawTool(serverInfo, readToolRawName, getArgs);
+  if (getRes.isToolError) {
+    throw new Error(`读取文件失败: ${getRes.textContent.slice(0, 300)}`);
+  }
+
+  const { fileContent, fileSha } = extractFileContentAndSha(getRes);
+  if (!fileSha) {
+    throw new Error(`未能获取到文件 SHA，请确认文件是否存在: ${filePath}`);
+  }
+
+  const updatedContent = applyStringReplacements(fileContent, editList, filePath);
+
+  if (updatedContent === fileContent) {
+    throw new Error("替换前后文件内容未发生任何改变");
+  }
+
+  const commitMsg = (message || "").trim() || `Update ${filePath}`;
+  const putArgs = {
+    owner,
+    repo,
+    path: filePath,
+    content: updatedContent,
+    message: commitMsg,
+    sha: fileSha
+  };
+  if (branch) {
+    putArgs.branch = branch;
+  }
+
+  addDebugLog("TOOL", `[局部编辑] 提交更新到 GitHub: ${owner}/${repo}/${filePath} (SHA: ${fileSha})`);
+  const putRes = await invokeMcpRawTool(serverInfo, writeToolRawName, putArgs);
+  if (putRes.isToolError) {
+    throw new Error(`提交更新失败: ${putRes.textContent.slice(0, 300)}`);
+  }
+
+  return {
+    isError: false,
+    content: `局部修改成功并已提交到 GitHub。仓库: ${owner}/${repo}，文件: ${filePath}，分支: ${branch || "默认分支"}，修改处数: ${editList.length}，原文件 SHA: ${fileSha}`
+  };
+}
+
+function findServerTool(serverInfo, targetNames) {
+  if (!Array.isArray(serverInfo.tools)) return null;
+  return serverInfo.tools.find((t) =>
+    targetNames.some((n) => t.rawName === n || t.rawName.endsWith(`_${n}`))
+  );
+}
+
+function registerVirtualTools(serverInfo) {
+  if (!serverInfo || !Array.isArray(serverInfo.tools)) return;
+  const readTool = findServerTool(serverInfo, ["get_file_contents"]);
+  const writeTool = findServerTool(serverInfo, ["create_or_update_file"]);
+  if (!readTool || !writeTool) return;
+
+  const serverNameLower = (serverInfo.name || "").toLowerCase();
+  const safePrefix = serverNameLower.replace(/[^a-z0-9_]/g, "_");
+  const virtualRawName = readTool.rawName.startsWith("github_") || serverNameLower.includes("github")
+    ? "github_edit_file"
+    : "edit_file";
+
+  const toolKey = virtualRawName.startsWith(`${safePrefix}_`)
+    ? virtualRawName
+    : `${safePrefix}_${virtualRawName}`;
+
+  let virtualTool = serverInfo.tools.find((t) => t.key === toolKey || t.rawName === virtualRawName);
+  if (!virtualTool) {
+    virtualTool = {
+      key: toolKey,
+      rawName: virtualRawName,
+      description: `[${serverInfo.name}] 局部编辑 GitHub 文件`,
+      enabled: true,
+      status: "supported",
+      statusMessage: "支持",
+      isVirtual: true,
+      openAiTool: {
+        type: "function",
+        function: {
+          name: toolKey,
+          description: `[${serverInfo.name}] 局部编辑 GitHub 仓库中的指定文件。通过比对替换指定的代码片段（old_str -> new_str），自动拉取最新文件、完成局部替换并提交更新，无需全量读取或全量重写。`,
+          parameters: {
+            type: "object",
+            properties: {
+              owner: {
+                type: "string",
+                description: "仓库所有者 (用户名或组织名)"
+              },
+              repo: {
+                type: "string",
+                description: "仓库名称"
+              },
+              path: {
+                type: "string",
+                description: "要修改的文件路径"
+              },
+              old_str: {
+                type: "string",
+                description: "待替换的原始代码片段。必须在文件中唯一存在，建议包含周围几行上下文以确保唯一性。"
+              },
+              new_str: {
+                type: "string",
+                description: "替换后的新代码片段。"
+              },
+              edits: {
+                type: "array",
+                description: "可选的多处同时替换列表。每项包含 old_str 与 new_str。若提供此项则按顺序批量替换。",
+                items: {
+                  type: "object",
+                  properties: {
+                    old_str: { type: "string", description: "待替换的代码片段" },
+                    new_str: { type: "string", description: "替换后的新代码片段" }
+                  },
+                  required: ["old_str", "new_str"]
+                }
+              },
+              message: {
+                type: "string",
+                description: "Git 提交说明"
+              },
+              branch: {
+                type: "string",
+                description: "目标分支名称 (可选，默认使用仓库默认分支)"
+              }
+            },
+            required: ["owner", "repo", "path", "message"]
+          }
+        }
+      }
+    };
+    serverInfo.tools.unshift(virtualTool);
+    serverInfo.toolCount = serverInfo.tools.length;
+  } else {
+    virtualTool.isVirtual = true;
+    virtualTool.status = "supported";
+    virtualTool.statusMessage = "支持";
+  }
+
+  if (serverInfo.status === "active" && virtualTool.enabled !== false) {
+    mcpToolRegistry.set(toolKey, {
+      serverId: serverInfo.id,
+      serverName: serverInfo.name,
+      rawName: virtualRawName,
+      isVirtual: true,
+      handler: async (args) => {
+        return await executeGithubEditFile(serverInfo, readTool.rawName, writeTool.rawName, args);
+      }
+    });
+  }
+}
+
 async function callMcpTool(toolKey, args) {
   let info = mcpToolRegistry.get(toolKey);
   if (!info) {
@@ -728,6 +1039,26 @@ async function callMcpTool(toolKey, args) {
     }
   }
   if (!info) throw new Error(`未找到工具：${toolKey}`);
+
+  if (typeof info.handler === "function") {
+    const startTime = Date.now();
+    try {
+      const res = await info.handler(args);
+      const duration = Date.now() - startTime;
+      const isError = Boolean(res && res.isError);
+      const content = typeof res?.content === "string" ? res.content : JSON.stringify(res || {});
+      addDebugLog(isError ? "ERROR" : "TOOL", `虚拟 MCP 工具 [${toolKey}] 执行${isError ? "失败" : "成功"} - 耗时 ${duration}ms`, {
+        arguments: args,
+        outputPreview: content.slice(0, 500)
+      });
+      return { isError, content };
+    } catch (err) {
+      const duration = Date.now() - startTime;
+      const msg = err instanceof Error ? err.message : String(err);
+      addDebugLog("ERROR", `虚拟 MCP 工具 [${toolKey}] 异常 - 耗时 ${duration}ms`, msg);
+      return { isError: true, content: JSON.stringify({ error: msg }) };
+    }
+  }
 
   const startTime = Date.now();
   const res = await fetch(info.postEndpoint, {
@@ -793,7 +1124,7 @@ function detectActionIntent(userText) {
   }
   const text = userText.trim();
 
-  const writeVerb = /(修改|修改下|改下|改一下|修一下|修复|更新|更新下|添加|增加|加一个|删除|删掉|重写|创建|新建|写入|覆盖|替换|调整|优化下|把.+改成|提交|推送|commit|push|write|update|create|delete)/i;
+  const writeVerb = /(修改|修改下|改下|改一下|修一下|修复|更新|更新下|添加|增加|加一个|删除|删掉|重写|创建|新建|写入|覆盖|替换|调整|优化下|把.+改成|提交|推送|commit|push|write|update|create|delete|edit)/i;
   const writeTarget = /(代码|文件|配置|仓库|bug|接口|函数|样式|组件|依赖|项目|分支|pr|github|readme|\.[a-z0-9]{1,5})/i;
   const isDirectWrite = writeVerb.test(text) && (writeTarget.test(text) || text.length <= 40);
 
@@ -833,7 +1164,7 @@ function selectRelevantTools(userText, allTools) {
       }
     }
 
-    if (text.includes("改") || text.includes("写") || text.includes("修") || text.includes("创建") || text.includes("更新")) {
+    if (text.includes("改") || text.includes("写") || text.includes("修") || text.includes("创建") || text.includes("更新") || text.includes("替换")) {
       if (name.includes("write") || name.includes("push") || name.includes("create") || name.includes("update") || name.includes("edit")) {
         score += 5;
       }
@@ -904,6 +1235,12 @@ function formatToolCallDetails(args) {
     parts.push(`路径: ${args.path}`);
   } else if (args.file || args.filePath || args.filename) {
     parts.push(`文件: ${args.file || args.filePath || args.filename}`);
+  }
+
+  if (args.old_str !== undefined && args.new_str !== undefined) {
+    parts.push(`局部替换 (${String(args.old_str).length} 字符 -> ${String(args.new_str).length} 字符)`);
+  } else if (Array.isArray(args.edits) && args.edits.length > 0) {
+    parts.push(`批量局部替换 (${args.edits.length} 处)`);
   }
 
   if (Array.isArray(args.files) && args.files.length > 0) {
@@ -1813,7 +2150,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       } else if (round === 0 && isWrite) {
         roundMessages.push({
           role: "system",
-          content: "【强制执行指令】检测到针对代码、配置或文件的修改/写入任务。严禁输出口头假提交或未执行的解释性答复，必须直接发起对应的工具调用完成实际写入与保存。"
+          content: "【强制执行与局部修改规范】检测到针对代码、配置或文件的修改任务。必须直接调用工具完成写入。如需修改已有文件，必须优先调用局部修改工具（如 github_edit_file），仅传入需替换的代码片段（old_str -> new_str），严禁将几百行大文件全量重写；仅在新建文件时使用全量写入工具。"
         });
       }
 
@@ -1959,7 +2296,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
                 if (!isToolError) {
                   executedToolCount += 1;
                   const fnLower = tc.function.name.toLowerCase();
-                  if (fnLower.includes("write") || fnLower.includes("create") || fnLower.includes("update") || fnLower.includes("push") || fnLower.includes("delete")) {
+                  if (fnLower.includes("write") || fnLower.includes("create") || fnLower.includes("update") || fnLower.includes("push") || fnLower.includes("delete") || fnLower.includes("edit")) {
                     hasWriteSuccess = true;
                   }
                 }
@@ -2175,7 +2512,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
               } else {
                 executedToolCount += 1;
                 const fnLower = tc.name.toLowerCase();
-                if (fnLower.includes("write") || fnLower.includes("create") || fnLower.includes("update") || fnLower.includes("push") || fnLower.includes("delete")) {
+                if (fnLower.includes("write") || fnLower.includes("create") || fnLower.includes("update") || fnLower.includes("push") || fnLower.includes("delete") || fnLower.includes("edit")) {
                   hasWriteSuccess = true;
                 }
               }
@@ -2287,6 +2624,18 @@ async function checkAllTools(modelName) {
 
     for (const t of s.tools) {
       total += 1;
+
+      if (t.isVirtual) {
+        supported += 1;
+        t.status = "supported";
+        t.statusMessage = "支持";
+        t.enabled = true;
+        if (s.status === "active") {
+          registerVirtualTools(s);
+        }
+        continue;
+      }
+
       let isSupported = true;
       let reason = "";
 
@@ -2644,7 +2993,7 @@ const server = http.createServer(async (request, response) => {
             t.status = "unchecked";
             t.statusMessage = "";
             count += 1;
-            if (s.status === "active") {
+            if (s.status === "active" && !t.isVirtual) {
               mcpToolRegistry.set(t.key, {
                 serverId: s.id,
                 serverName: s.name,
@@ -2653,6 +3002,9 @@ const server = http.createServer(async (request, response) => {
                 headers: s.headers
               });
             }
+          }
+          if (s.status === "active") {
+            registerVirtualTools(s);
           }
         }
         await saveServerToStorage();
@@ -2690,13 +3042,17 @@ const server = http.createServer(async (request, response) => {
         const nextEnabled = typeof body.enabled === "boolean" ? body.enabled : !tool.enabled;
         tool.enabled = nextEnabled;
         if (nextEnabled && s.status === "active") {
-          mcpToolRegistry.set(tool.key, {
-            serverId: s.id,
-            serverName: s.name,
-            rawName: tool.rawName,
-            postEndpoint: s.postEndpoint,
-            headers: s.headers
-          });
+          if (tool.isVirtual) {
+            registerVirtualTools(s);
+          } else {
+            mcpToolRegistry.set(tool.key, {
+              serverId: s.id,
+              serverName: s.name,
+              rawName: tool.rawName,
+              postEndpoint: s.postEndpoint,
+              headers: s.headers
+            });
+          }
         } else {
           mcpToolRegistry.delete(tool.key);
         }
@@ -2714,8 +3070,9 @@ const server = http.createServer(async (request, response) => {
           return;
         }
         s.status = "active";
+        registerVirtualTools(s);
         for (const t of s.tools) {
-          if (t.enabled !== false) {
+          if (t.enabled !== false && !t.isVirtual) {
             mcpToolRegistry.set(t.key, {
               serverId: s.id,
               serverName: s.name,
