@@ -719,33 +719,94 @@ function extractErrorMessage(text) {
   return singleLine.length > 200 ? `${singleLine.slice(0, 200)}...` : singleLine;
 }
 
-async function invokeMcpRawTool(serverInfo, rawName, args) {
-  const res = await fetch(serverInfo.postEndpoint, {
-    method: "POST",
-    headers: serverInfo.headers,
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: Date.now(),
-      method: "tools/call",
-      params: { name: rawName, arguments: args }
-    }),
-    signal: AbortSignal.timeout(30000)
-  });
-
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`MCP HTTP ${res.status}: ${txt.slice(0, 300)}`);
+function parseRateLimitWaitSeconds(errorText) {
+  if (!errorText || typeof errorText !== "string") return 0;
+  const match =
+    errorText.match(/retry after\s+(\d+)\s*s/i) ||
+    errorText.match(/retry after\s+(\d+)\s*seconds?/i) ||
+    errorText.match(/wait\s+(\d+)\s*s/i) ||
+    errorText.match(/wait\s+(\d+)\s*seconds?/i);
+  if (match) {
+    const sec = parseInt(match[1], 10);
+    if (!isNaN(sec) && sec > 0 && sec <= 120) {
+      return sec;
+    }
   }
-
-  const data = await parseMcpResponse(res);
-  if (data.error) {
-    throw new Error(data.error.message || JSON.stringify(data.error));
+  if (/rate limit exceeded|secondary rate limit|too many requests/i.test(errorText)) {
+    return 35;
   }
+  return 0;
+}
 
-  const rawResult = data.result !== undefined ? data.result : data;
-  const isToolError = Boolean(rawResult && (rawResult.isError === true || rawResult.is_error === true));
-  const textContent = extractMcpResultContent(data);
-  return { data, rawResult, isToolError, textContent };
+async function invokeMcpRawTool(serverInfo, rawName, args, onWaitNotice = null) {
+  const maxRetries = 2;
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    let res;
+    try {
+      res = await fetch(serverInfo.postEndpoint, {
+        method: "POST",
+        headers: serverInfo.headers,
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: Date.now(),
+          method: "tools/call",
+          params: { name: rawName, arguments: args }
+        }),
+        signal: AbortSignal.timeout(35000)
+      });
+    } catch (err) {
+      if (attempt === maxRetries) throw err;
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      continue;
+    }
+
+    if (!res.ok) {
+      const txt = await res.text();
+      const waitSec = parseRateLimitWaitSeconds(txt);
+      if (waitSec > 0 && attempt < maxRetries) {
+        if (typeof onWaitNotice === "function") {
+          onWaitNotice(waitSec);
+        }
+        addDebugLog("TOOL", `[频控保护] 接口调用触发限制，正在等待 ${waitSec + 1} 秒后自动重试...`);
+        await new Promise((resolve) => setTimeout(resolve, (waitSec + 1) * 1000));
+        continue;
+      }
+      throw new Error(`MCP HTTP ${res.status}: ${txt.slice(0, 300)}`);
+    }
+
+    const data = await parseMcpResponse(res);
+    if (data.error) {
+      const errMsg = data.error.message || JSON.stringify(data.error);
+      const waitSec = parseRateLimitWaitSeconds(errMsg);
+      if (waitSec > 0 && attempt < maxRetries) {
+        if (typeof onWaitNotice === "function") {
+          onWaitNotice(waitSec);
+        }
+        addDebugLog("TOOL", `[频控保护] 接口调用触发限制，正在等待 ${waitSec + 1} 秒后自动重试...`);
+        await new Promise((resolve) => setTimeout(resolve, (waitSec + 1) * 1000));
+        continue;
+      }
+      throw new Error(errMsg);
+    }
+
+    const rawResult = data.result !== undefined ? data.result : data;
+    const isToolError = Boolean(rawResult && (rawResult.isError === true || rawResult.is_error === true));
+    const textContent = extractMcpResultContent(data);
+
+    if (isToolError) {
+      const waitSec = parseRateLimitWaitSeconds(textContent);
+      if (waitSec > 0 && attempt < maxRetries) {
+        if (typeof onWaitNotice === "function") {
+          onWaitNotice(waitSec);
+        }
+        addDebugLog("TOOL", `[频控保护] 工具返回频率限制错误，正在等待 ${waitSec + 1} 秒后自动重试...`);
+        await new Promise((resolve) => setTimeout(resolve, (waitSec + 1) * 1000));
+        continue;
+      }
+    }
+
+    return { data, rawResult, isToolError, textContent };
+  }
 }
 
 function extractFileContentAndSha(mcpRes) {
