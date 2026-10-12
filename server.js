@@ -918,7 +918,7 @@ function applyStringReplacements(content, edits, filePath = "") {
   return updated;
 }
 
-async function executeGithubEditFile(serverInfo, readToolRawName, writeToolRawName, args) {
+async function executeGithubEditFile(serverInfo, readToolRawName, writeToolRawName, args, onWaitNotice = null) {
   const { owner, repo, path: filePath, old_str, new_str, edits, message, branch } = args || {};
 
   if (!owner || !repo || !filePath) {
@@ -940,7 +940,7 @@ async function executeGithubEditFile(serverInfo, readToolRawName, writeToolRawNa
   }
 
   addDebugLog("TOOL", `[局部编辑] 读取文件: ${owner}/${repo}/${filePath} (分支: ${branch || "默认"})`);
-  const getRes = await invokeMcpRawTool(serverInfo, readToolRawName, getArgs);
+  const getRes = await invokeMcpRawTool(serverInfo, readToolRawName, getArgs, onWaitNotice);
   if (getRes.isToolError) {
     throw new Error(`读取文件失败: ${getRes.textContent.slice(0, 300)}`);
   }
@@ -963,21 +963,19 @@ async function executeGithubEditFile(serverInfo, readToolRawName, writeToolRawNa
     path: filePath,
     content: updatedContent,
     message: commitMsg,
-    sha: fileSha
+    sha: fileSha,
+    branch: branch || "main"
   };
-  if (branch) {
-    putArgs.branch = branch;
-  }
 
   addDebugLog("TOOL", `[局部编辑] 提交更新到 GitHub: ${owner}/${repo}/${filePath} (SHA: ${fileSha})`);
-  const putRes = await invokeMcpRawTool(serverInfo, writeToolRawName, putArgs);
+  const putRes = await invokeMcpRawTool(serverInfo, writeToolRawName, putArgs, onWaitNotice);
   if (putRes.isToolError) {
     throw new Error(`提交更新失败: ${putRes.textContent.slice(0, 300)}`);
   }
 
   return {
     isError: false,
-    content: `局部修改成功并已提交到 GitHub。仓库: ${owner}/${repo}，文件: ${filePath}，分支: ${branch || "默认分支"}，修改处数: ${editList.length}，原文件 SHA: ${fileSha}`
+    content: `局部修改成功并已提交到 GitHub。仓库: ${owner}/${repo}，文件: ${filePath}，分支: ${branch || "main"}，修改处数: ${editList.length}，原文件 SHA: ${fileSha}`
   };
 }
 
