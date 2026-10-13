@@ -2159,7 +2159,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
 
   let finalFinishReason = null;
   let executedToolCount = 0;
-  const toolCallCache = new Map();
+  const toolCallHistory = new Map();
   let hasWriteSuccess = false;
   let consecutiveFailures = 0;
   const MAX_AGENT_ROUNDS = 60;
@@ -2328,28 +2328,19 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
             isToolError = true;
           } else {
             const callKey = `${tc.function.name}:${JSON.stringify(args)}`;
-            const cached = toolCallCache.get(callKey);
-            const fnLower = tc.function.name.toLowerCase();
-            const isReadOnly = fnLower.includes("get") || fnLower.includes("search") || fnLower.includes("read") || fnLower.includes("list");
-
-            if (cached && isReadOnly && !cached.isError) {
-              resultText = cached.content;
-              isToolError = false;
-            } else if (cached && !isReadOnly && cached.count >= 2) {
-              resultText = JSON.stringify({ error: "该写入工具已使用完全相同的参数执行，请勿重复提交。" });
+            const prevAttempts = toolCallHistory.get(callKey) || 0;
+            if (prevAttempts >= 2) {
+              resultText = JSON.stringify({ error: "该工具已使用完全相同的参数重复调用多次，系统已拦截重复执行。请勿继续重复调用，请根据当前信息直接回答用户。" });
               isToolError = true;
             } else {
+              toolCallHistory.set(callKey, prevAttempts + 1);
               try {
                 const toolRes = await callMcpTool(tc.function.name, args);
                 resultText = toolRes.content;
                 isToolError = toolRes.isError;
-                toolCallCache.set(callKey, {
-                  content: resultText,
-                  isError: isToolError,
-                  count: (cached?.count || 0) + 1
-                });
                 if (!isToolError) {
                   executedToolCount += 1;
+                  const fnLower = tc.function.name.toLowerCase();
                   if (fnLower.includes("write") || fnLower.includes("create") || fnLower.includes("update") || fnLower.includes("push") || fnLower.includes("delete") || fnLower.includes("edit")) {
                     hasWriteSuccess = true;
                   }
