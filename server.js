@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
@@ -19,6 +20,7 @@ const SETTINGS_FILE = path.join(__dirname, "mcp-settings.json");
 
 const mcpServers = new Map();
 const mcpToolRegistry = new Map();
+const agentLogContext = new AsyncLocalStorage();
 let enabledModels = new Set();
 
 const upstreamChannels = [];
@@ -37,6 +39,7 @@ function addDebugLog(type, summary, detail = "") {
     String(now.getMilliseconds()).padStart(3, "0");
   const entry = {
     id: `log_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    requestId: agentLogContext.getStore() || null,
     time,
     type,
     summary,
@@ -1269,6 +1272,54 @@ function toolArguments(toolCall) {
   }
 }
 
+function stableSerialize(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableSerialize).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableSerialize(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function getToolCallReplay(toolCallHistory, callKey) {
+  const previous = toolCallHistory.get(callKey);
+  if (!previous) {
+    toolCallHistory.set(callKey, { attempts: 1, successful: false, content: "" });
+    return null;
+  }
+  if (previous.successful) {
+    return {
+      isError: false,
+      content: `${previous.content}\n\n[重复调用提示：该工具和参数此前已成功执行，本次复用了已有结果，没有再次访问上游。请根据已有结果继续；如果仍需重复调用，请在最终答复说明可观察到的原因。]`,
+      attempts: previous.attempts,
+      replayed: true
+    };
+  }
+  if (previous.attempts < 3) {
+    previous.attempts += 1;
+    return null;
+  }
+  return {
+    isError: true,
+    content: JSON.stringify({
+      error: "相同工具参数连续失败，代理已停止重复请求以避免无效调用。",
+      repeatedCallDiagnostic: "代理只能确认工具名和参数相同以及此前调用失败，无法读取模型的内部原因。请根据已有结果或错误信息继续；最终答复中说明有证据支持的原因，证据不足时标明推测。",
+      attempts: previous.attempts,
+      previousResult: previous.content
+    }),
+    attempts: previous.attempts,
+    replayed: true
+  };
+}
+
+function recordToolCallOutcome(toolCallHistory, callKey, isError, content) {
+  const record = toolCallHistory.get(callKey) || { attempts: 1 };
+  record.successful = !isError;
+  record.content = content;
+  toolCallHistory.set(callKey, record);
+}
+
 function formatToolCallDetails(args) {
   if (!args || typeof args !== "object") return "";
   const parts = [];
@@ -2097,6 +2148,11 @@ async function passThroughAndTransformGemini(requestBody, clientResponse, isStre
 }
 
 async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
+  const requestId = crypto.randomUUID();
+  return agentLogContext.run(requestId, () => runAgentLoop(requestBody, clientResponse, reqMeta, abortSignal));
+}
+
+async function runAgentLoop(requestBody, clientResponse, reqMeta, abortSignal) {
   if (!Array.isArray(requestBody.messages) || requestBody.messages.length === 0) {
     throw new Error("messages 必须是非空数组");
   }
@@ -2160,6 +2216,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
   let finalFinishReason = null;
   let executedToolCount = 0;
   const toolCallHistory = new Map();
+  const duplicateCallDiagnostics = [];
   let hasWriteSuccess = false;
   let consecutiveFailures = 0;
   const MAX_AGENT_ROUNDS = 60;
@@ -2171,16 +2228,14 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         break;
       }
 
-      if (messages.length > 30) {
-        for (let i = 0; i < messages.length - 15; i += 1) {
-          const m = messages[i];
-          if (m && m.role === "tool" && typeof m.content === "string" && m.content.length > 2000) {
-            m.content = m.content.slice(0, 1000) + "\n\n[历史输出已精简]";
-          }
-        }
-      }
-
       let roundMessages = [...messages];
+      if (duplicateCallDiagnostics.length > 0) {
+        const diagnostics = duplicateCallDiagnostics.splice(0);
+        roundMessages.push({
+          role: "system",
+          content: `【重复调用诊断】代理观察到重复工具调用记录：${JSON.stringify(diagnostics)}。代理无法读取你的内部思考，不能断言主观原因。请先利用已经返回的工具结果，不要原样重复失败调用；若仍需继续，调整查询或参数。最终答复中简短说明可从调用记录确认的原因，无法确认时明确标为推测。`
+        });
+      }
       if (round === 0) {
         roundMessages.push({
           role: "system",
@@ -2327,17 +2382,19 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
             resultText = JSON.stringify({ error: "Invalid tool arguments" });
             isToolError = true;
           } else {
-            const callKey = `${tc.function.name}:${JSON.stringify(args)}`;
-            const prevAttempts = toolCallHistory.get(callKey) || 0;
-            if (prevAttempts >= 2) {
-              resultText = JSON.stringify({ error: "该工具已使用完全相同的参数重复调用多次，系统已拦截重复执行。请勿继续重复调用，请根据当前信息直接回答用户。" });
-              isToolError = true;
+            const callKey = `${tc.function.name}:${stableSerialize(args)}`;
+            const replay = getToolCallReplay(toolCallHistory, callKey);
+            if (replay) {
+              resultText = replay.content;
+              isToolError = replay.isError;
+              duplicateCallDiagnostics.push({ tool: tc.function.name, attempts: replay.attempts, result: replay.isError ? "stopped_after_failures" : "reused_success" });
+              addDebugLog("AGENT", `[重复调用保护] ${tc.function.name} ${replay.isError ? "连续失败后停止重试" : "复用此前成功结果"}`, { attempts: replay.attempts });
             } else {
-              toolCallHistory.set(callKey, prevAttempts + 1);
               try {
                 const toolRes = await callMcpTool(tc.function.name, args);
                 resultText = toolRes.content;
                 isToolError = toolRes.isError;
+                recordToolCallOutcome(toolCallHistory, callKey, isToolError, resultText);
                 if (!isToolError) {
                   executedToolCount += 1;
                   const fnLower = tc.function.name.toLowerCase();
@@ -2348,6 +2405,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
               } catch (err) {
                 resultText = JSON.stringify({ error: err instanceof Error ? err.message : "Tool execution failed" });
                 isToolError = true;
+                recordToolCallOutcome(toolCallHistory, callKey, isToolError, resultText);
               }
             }
           }
@@ -2540,14 +2598,15 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
           resultText = JSON.stringify({ error: errorMessage });
           isToolError = true;
         } else {
-          const callKey = `${tc.name}:${JSON.stringify(args)}`;
-          const prevAttempts = toolCallHistory.get(callKey) || 0;
-          if (prevAttempts >= 2) {
-            errorMessage = "重复调用已被系统拦截";
-            resultText = JSON.stringify({ error: "该工具已使用完全相同的参数重复调用多次，系统已拦截重复执行。请勿继续重复调用，请根据当前信息直接回答用户。" });
-            isToolError = true;
+          const callKey = `${tc.name}:${stableSerialize(args)}`;
+          const replay = getToolCallReplay(toolCallHistory, callKey);
+          if (replay) {
+            resultText = replay.content;
+            isToolError = replay.isError;
+            errorMessage = replay.isError ? extractErrorMessage(replay.content) : "";
+            duplicateCallDiagnostics.push({ tool: tc.name, attempts: replay.attempts, result: replay.isError ? "stopped_after_failures" : "reused_success" });
+            addDebugLog("AGENT", `[重复调用保护] ${tc.name} ${replay.isError ? "连续失败后停止重试" : "复用此前成功结果"}`, { attempts: replay.attempts });
           } else {
-            toolCallHistory.set(callKey, prevAttempts + 1);
             try {
               const onWaitNotice = (waitSec) => {
                 if (!abortSignal?.aborted && !clientResponse.destroyed) {
@@ -2561,6 +2620,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
               const toolRes = await callMcpTool(tc.name, args, onWaitNotice);
               resultText = toolRes.content;
               isToolError = toolRes.isError;
+              recordToolCallOutcome(toolCallHistory, callKey, isToolError, resultText);
               if (isToolError) {
                 errorMessage = extractErrorMessage(toolRes.content);
               } else {
@@ -2575,6 +2635,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
               errorMessage = extractErrorMessage(msg);
               resultText = JSON.stringify({ error: msg });
               isToolError = true;
+              recordToolCallOutcome(toolCallHistory, callKey, isToolError, resultText);
             }
           }
         }
