@@ -2591,6 +2591,8 @@ async function runAgentLoop(requestBody, clientResponse, reqMeta, abortSignal) {
       let assistantContent = "";
       let hasToolCalls = false;
       let roundFinishReason = null;
+      let roundContentBuffer = "";
+      let contentStreamedToClient = false;
 
       try {
         while (true) {
@@ -2622,7 +2624,13 @@ async function runAgentLoop(requestBody, clientResponse, reqMeta, abortSignal) {
               }
 
               if (delta?.tool_calls) {
-                hasToolCalls = true;
+                if (!hasToolCalls) {
+                  hasToolCalls = true;
+                  if (roundContentBuffer && !contentStreamedToClient && !clientResponse.destroyed && !abortSignal?.aborted) {
+                    sendReasoningChunk(clientResponse, `\n${roundContentBuffer}\n`, requestBody.model);
+                    roundContentBuffer = "";
+                  }
+                }
                 for (const tc of delta.tool_calls) {
                   const index = tc.index ?? 0;
                   if (!accumulatedToolCalls[index]) {
@@ -2638,22 +2646,36 @@ async function runAgentLoop(requestBody, clientResponse, reqMeta, abortSignal) {
                 }
               }
 
-              if (delta?.content) {
-                assistantContent += delta.content;
-                if (!hasToolCalls && !clientResponse.destroyed && !abortSignal?.aborted) {
-                  if (isTruncatedFinishReason(reason)) {
-                    const sanitized = {
-                      ...parsed,
-                      choices: choice ? [{ ...choice, finish_reason: null, finishReason: null }] : []
-                    };
-                    clientResponse.write(`data: ${JSON.stringify(sanitized)}\n\n`);
-                  } else {
-                    clientResponse.write(`${line}\n\n`);
-                  }
-                }
-              } else if (delta?.reasoning_content) {
+              if (delta?.reasoning_content) {
                 if (!clientResponse.destroyed && !abortSignal?.aborted) {
                   clientResponse.write(`${line}\n\n`);
+                }
+              } else if (delta?.content) {
+                assistantContent += delta.content;
+                if (hasToolCalls) {
+                  if (!clientResponse.destroyed && !abortSignal?.aborted) {
+                    sendReasoningChunk(clientResponse, delta.content, requestBody.model);
+                  }
+                } else if (contentStreamedToClient) {
+                  if (!clientResponse.destroyed && !abortSignal?.aborted) {
+                    if (isTruncatedFinishReason(reason)) {
+                      const sanitized = {
+                        ...parsed,
+                        choices: choice ? [{ ...choice, finish_reason: null, finishReason: null }] : []
+                      };
+                      clientResponse.write(`data: ${JSON.stringify(sanitized)}\n\n`);
+                    } else {
+                      clientResponse.write(`${line}\n\n`);
+                    }
+                  }
+                } else {
+                  roundContentBuffer += delta.content;
+                  if (roundContentBuffer.length >= 250) {
+                    contentStreamedToClient = true;
+                    if (!clientResponse.destroyed && !abortSignal?.aborted) {
+                      sendSSEChunk(clientResponse, { content: roundContentBuffer }, requestBody.model);
+                    }
+                  }
                 }
               }
             } catch {}
@@ -2682,6 +2704,11 @@ async function runAgentLoop(requestBody, clientResponse, reqMeta, abortSignal) {
       });
 
       if (mcpCalls.length === 0) {
+        if (!hasToolCalls && roundContentBuffer && !contentStreamedToClient && !clientResponse.destroyed && !abortSignal?.aborted) {
+          contentStreamedToClient = true;
+          sendSSEChunk(clientResponse, { content: roundContentBuffer }, requestBody.model);
+        }
+
         if (isTruncatedFinishReason(roundFinishReason) && assistantContent && !abortSignal?.aborted && !clientResponse.destroyed) {
           addDebugLog("AGENT", `⚠️ [抗截断触发] MCP 调度检测到截断 (${roundFinishReason})！正在自动进行无感断点续接...`, {
             round: round + 1,
@@ -2703,6 +2730,13 @@ async function runAgentLoop(requestBody, clientResponse, reqMeta, abortSignal) {
           totalRounds: round + 1
         });
         return;
+      }
+
+      if (mcpCalls.length > 0) {
+        if (roundContentBuffer && !contentStreamedToClient && !clientResponse.destroyed && !abortSignal?.aborted) {
+          sendReasoningChunk(clientResponse, `\n${roundContentBuffer}\n`, requestBody.model);
+          roundContentBuffer = "";
+        }
       }
 
       messages.push({
