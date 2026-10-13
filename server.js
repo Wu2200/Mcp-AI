@@ -1291,7 +1291,7 @@ function getToolCallReplay(toolCallHistory, callKey) {
   if (previous.successful) {
     return {
       isError: false,
-      content: `${previous.content}\n\n[重复调用提示：该工具和参数此前已成功执行，本次复用了已有结果，没有再次访问上游。请根据已有结果继续；如果仍需重复调用，请在最终答复说明可观察到的原因。]`,
+      content: `${previous.content}\n\n[重复调用诊断：代理记录到相同工具和参数此前已成功执行，因此本次复用了结果，没有再次访问上游。可确认的是发生了重复调用并复用了成功结果；代理无法确定重复调用的内部原因。请使用已有结果继续任务，不要再次原样调用。最终答复若需要说明，只陈述这些可观察事实，不要声称知道内部思考。]`,
       attempts: previous.attempts,
       replayed: true
     };
@@ -1304,7 +1304,7 @@ function getToolCallReplay(toolCallHistory, callKey) {
     isError: true,
     content: JSON.stringify({
       error: "相同工具参数连续失败，代理已停止重复请求以避免无效调用。",
-      repeatedCallDiagnostic: "代理只能确认工具名和参数相同以及此前调用失败，无法读取模型的内部原因。请根据已有结果或错误信息继续；最终答复中说明有证据支持的原因，证据不足时标明推测。",
+      repeatedCallDiagnostic: "代理观察到相同工具和相同参数此前连续失败，达到重试上限后停止继续请求。代理无法确定模型为何重复调用。请根据已有结果或错误继续处理其他未完成任务；最终答复中简短说明上述可观察事实，无法确认的动机应明确标为未知，不要输出内部思维过程。",},{
       attempts: previous.attempts,
       previousResult: previous.content
     }),
@@ -2230,10 +2230,10 @@ async function runAgentLoop(requestBody, clientResponse, reqMeta, abortSignal) {
 
       let roundMessages = [...messages];
       if (duplicateCallDiagnostics.length > 0) {
-        const diagnostics = duplicateCallDiagnostics.splice(0);
+        const diagnostics = duplicateCallDiagnostics.slice(-10);
         roundMessages.push({
           role: "system",
-          content: `【重复调用诊断】代理观察到重复工具调用记录：${JSON.stringify(diagnostics)}。代理无法读取你的内部思考，不能断言主观原因。请先利用已经返回的工具结果，不要原样重复失败调用；若仍需继续，调整查询或参数。最终答复中简短说明可从调用记录确认的原因，无法确认时明确标为推测。`
+          content: `【重复调用诊断】代理观察到以下重复工具调用：${JSON.stringify(diagnostics)}。请继续完成本轮任务，不要因重复调用而提前结束。最终答复必须用一句简短说明交代记录中可确认的重复调用状态及代理采取的处理；无法从记录确认的模型动机必须说明未知，不要声称知道内部思考，也不要输出思维链。`
         });
       }
       if (round === 0) {
@@ -2387,7 +2387,15 @@ async function runAgentLoop(requestBody, clientResponse, reqMeta, abortSignal) {
             if (replay) {
               resultText = replay.content;
               isToolError = replay.isError;
-              duplicateCallDiagnostics.push({ tool: tc.function.name, attempts: replay.attempts, result: replay.isError ? "stopped_after_failures" : "reused_success" });
+              duplicateCallDiagnostics.push({
+                tool: tc.function.name,
+                attempts: replay.attempts,
+                result: replay.isError ? "stopped_after_failures" : "reused_success",
+                observedReason: replay.isError
+                  ? "相同工具和参数此前连续失败，代理达到重试上限后停止请求"
+                  : "相同工具和参数此前成功，代理复用了已有结果"
+              });
+              if (duplicateCallDiagnostics.length > 20) duplicateCallDiagnostics.shift();
               addDebugLog("AGENT", `[重复调用保护] ${tc.function.name} ${replay.isError ? "连续失败后停止重试" : "复用此前成功结果"}`, { attempts: replay.attempts });
             } else {
               try {
@@ -2604,7 +2612,15 @@ async function runAgentLoop(requestBody, clientResponse, reqMeta, abortSignal) {
             resultText = replay.content;
             isToolError = replay.isError;
             errorMessage = replay.isError ? extractErrorMessage(replay.content) : "";
-            duplicateCallDiagnostics.push({ tool: tc.name, attempts: replay.attempts, result: replay.isError ? "stopped_after_failures" : "reused_success" });
+            duplicateCallDiagnostics.push({
+              tool: tc.name,
+              attempts: replay.attempts,
+              result: replay.isError ? "stopped_after_failures" : "reused_success",
+              observedReason: replay.isError
+                ? "相同工具和参数此前连续失败，代理达到重试上限后停止请求"
+                : "相同工具和参数此前成功，代理复用了已有结果"
+            });
+            if (duplicateCallDiagnostics.length > 20) duplicateCallDiagnostics.shift();
             addDebugLog("AGENT", `[重复调用保护] ${tc.name} ${replay.isError ? "连续失败后停止重试" : "复用此前成功结果"}`, { attempts: replay.attempts });
           } else {
             try {
