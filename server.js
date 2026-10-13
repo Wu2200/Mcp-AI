@@ -986,7 +986,7 @@ async function executeGithubEditFile(serverInfo, readToolRawName, writeToolRawNa
 
   let editList = [];
   if (Array.isArray(edits) && edits.length > 0) {
-    editList = editList;
+    editList = edits;
   } else if (typeof old_str === "string" && typeof new_str === "string") {
     editList = [{ old_str, new_str }];
   } else {
@@ -1012,7 +1012,10 @@ async function executeGithubEditFile(serverInfo, readToolRawName, writeToolRawNa
   const updatedContent = applyStringReplacements(fileContent, editList, filePath);
 
   if (updatedContent === fileContent) {
-    throw new Error("替换前后文件内容未发生任何改变");
+    return {
+      isError: false,
+      content: `文件 ${filePath} 内容未发生改变：目标修改内容此前已存在于文件中，当前已是最新目标状态，无需重复修改。`
+    };
   }
 
   const commitMsg = (message || "").trim() || `Update ${filePath}`;
@@ -2379,14 +2382,14 @@ async function runAgentLoop(requestBody, clientResponse, reqMeta, abortSignal) {
       } else if (round === 0 && isWrite) {
         roundMessages.push({
           role: "system",
-          content: "【代码修改推进准则】检测到针对代码、配置或文件的修改任务。你可以根据实际需要查阅关联合适文件，但你的核心目标是动手修改代码。修改已有文件时，必须优先调用局部修改工具（如 github_edit_file），仅传入需替换的代码片段（old_str -> new_str），严禁将大文件全量重写；仅在新建文件时使用全量写入工具。"
+          content: "【代码修改推进准则】检测到针对代码、配置或文件的修改任务。你可以根据实际需要查阅关联合适文件，但你的核心目标是动手修改代码。修改已有文件时，必须优先调用局部修改工具（如 github_edit_file），仅传入需替换的代码片段（old_str -> new_str），严禁将大文件全量重写；仅在新建文件时使用全量写入工具。严禁自行创建或触发 GitHub Actions 工作流进行远程构建和轮询等待；若需更新构建产物（如 dist 目录下的文件），请直接通过文件写入/修改工具同步更新对应的产物文件。代码搜索时必须限定当前仓库（例如 repo:owner/repo），严禁发起无仓库限定的全网搜索。"
         });
       }
 
       if (isWrite && round >= 4 && !hasWriteSuccess) {
         roundMessages.push({
           role: "system",
-          content: "【修改推进引导】你已经查阅了多个关联文件与参考代码。请结合目前已获得的代码上下文，重点开始对目标文件执行修改与写入。若缺少某个外网边角细节，优先参考现有项目已有模块的实现风格或进行精准编写，避免无休止地泛读其他无关文档。"
+          content: "【修改推进引导】你已经查阅了多个关联文件与参考代码。请结合目前已获得的代码上下文，重点开始对目标文件执行修改与写入。若缺少某个外网边角细节，优先参考现有项目已有模块的实现风格或进行精准编写，避免无休止地泛读其他无关文档。严禁创建/运行 GitHub Actions 工作流进行远程排队构建。"
         });
       }
 
