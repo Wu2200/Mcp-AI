@@ -30,6 +30,46 @@ let loggingEnabled = true;
 const MAX_LOGS = 1000;
 const debugLogs = [];
 
+function isConnectionAbortedError(err, signal) {
+  if (signal?.aborted) return true;
+  if (!err) return false;
+  if (err.name === "AbortError") return true;
+  const msg = String(err.message || "").toLowerCase();
+  if (
+    msg.includes("terminated") ||
+    msg.includes("aborted") ||
+    msg.includes("socket closed") ||
+    msg.includes("socket connection was closed") ||
+    msg.includes("connreset") ||
+    msg.includes("epipe")
+  ) {
+    return true;
+  }
+  const code = String(err.code || "").toUpperCase();
+  if (code === "ECONNRESET" || code === "UND_ERR_ABORTED" || code === "UND_ERR_SOCKET" || code === "EPIPE") {
+    return true;
+  }
+  return false;
+}
+
+function isWriteToolName(name) {
+  const n = String(name || "").toLowerCase();
+  return (
+    n.includes("write") ||
+    n.includes("create") ||
+    n.includes("update") ||
+    n.includes("push") ||
+    n.includes("delete") ||
+    n.includes("edit") ||
+    n.includes("patch") ||
+    n.includes("merge") ||
+    n.includes("upload") ||
+    n.includes("set") ||
+    n.includes("add") ||
+    n.includes("remove")
+  );
+}
+
 function addDebugLog(type, summary, detail = "") {
   if (!loggingEnabled) return;
   const now = new Date();
@@ -1282,29 +1322,36 @@ function stableSerialize(value) {
   return JSON.stringify(value);
 }
 
-function getToolCallReplay(toolCallHistory, callKey) {
+function getToolCallReplay(toolCallHistory, callKey, isWriteTool = false) {
   const previous = toolCallHistory.get(callKey);
   if (!previous) {
     toolCallHistory.set(callKey, { attempts: 1, successful: false, content: "" });
     return null;
   }
+
   if (previous.successful) {
+    if (isWriteTool) {
+      previous.attempts += 1;
+      return null;
+    }
+    previous.attempts += 1;
     return {
       isError: false,
-      content: `${previous.content}\n\n[重复调用诊断：代理记录到相同工具和参数此前已成功执行，因此本次复用了结果，没有再次访问上游。可确认的是发生了重复调用并复用了成功结果；代理无法确定重复调用的内部原因。请使用已有结果继续任务，不要再次原样调用。最终答复若需要说明，只陈述这些可观察事实，不要声称知道内部思考。]`,
+      content: `${previous.content}\n\n[系统提示：该只读工具此前已成功执行，代理已直接复用已有缓存结果，无需重复访问外部网络。请根据已有结果继续后续任务。]`,
       attempts: previous.attempts,
       replayed: true
     };
   }
+
   if (previous.attempts < 3) {
     previous.attempts += 1;
     return null;
   }
+
   return {
     isError: true,
     content: JSON.stringify({
-      error: "相同工具参数连续失败，代理已停止重复请求以避免无效调用。",
-      repeatedCallDiagnostic: "代理观察到相同工具和相同参数此前连续失败，达到重试上限后停止继续请求。代理无法确定模型为何重复调用。请根据已有结果或错误继续处理其他未完成任务；最终答复中简短说明上述可观察事实，无法确认的动机应明确标为未知，不要输出内部思维过程。",},{
+      error: "相同工具参数此前已连续执行失败多次，代理已停止重复请求以避免死循环。请根据已有的错误提示调整参数、换用其他工具，或直接回答用户。",
       attempts: previous.attempts,
       previousResult: previous.content
     }),
@@ -1318,6 +1365,49 @@ function recordToolCallOutcome(toolCallHistory, callKey, isError, content) {
   record.successful = !isError;
   record.content = content;
   toolCallHistory.set(callKey, record);
+}
+
+function optimizeMessagesForUpstream(messages) {
+  if (!Array.isArray(messages) || messages.length <= 12) {
+    return messages;
+  }
+
+  let totalChars = 0;
+  for (const m of messages) {
+    if (typeof m?.content === "string") totalChars += m.content.length;
+    else if (Array.isArray(m?.content)) {
+      for (const p of m.content) totalChars += (p.text || "").length;
+    }
+  }
+
+  if (totalChars < 35000) {
+    return messages;
+  }
+
+  const protectRecentCount = 10;
+  const cutoffIndex = Math.max(1, messages.length - protectRecentCount);
+
+  return messages.map((m, idx) => {
+    if (idx === 0 || idx >= cutoffIndex) {
+      return m;
+    }
+
+    if (m && m.role === "tool" && typeof m.content === "string" && m.content.length > 1500) {
+      return {
+        ...m,
+        content: m.content.slice(0, 800) + "\n\n[...该历史工具输出较早且过长，已自动精简。当前保留前800字符，如需完整内容可重新调用工具获取...]"
+      };
+    }
+
+    if (m && m.role === "assistant" && typeof m.content === "string" && m.content.length > 3000 && !m.tool_calls) {
+      return {
+        ...m,
+        content: m.content.slice(0, 1000) + "\n\n[...历史长回复已精简...]"
+      };
+    }
+
+    return m;
+  });
 }
 
 function formatToolCallDetails(args) {
@@ -1502,8 +1592,8 @@ async function passThrough(requestBody, clientResponse, reqMeta, abortSignal) {
         signal: abortSignal
       });
     } catch (err) {
-      if (abortSignal?.aborted || err.name === "AbortError") {
-        addDebugLog("DOWNSTREAM", `[直通模式] 客户端已断开，上游请求已中止`);
+      if (isConnectionAbortedError(err, abortSignal)) {
+        addDebugLog("DOWNSTREAM", `[直通模式] 客户端已断开或上游连接中止: ${err.message}`);
         return;
       }
       throw err;
@@ -1641,8 +1731,8 @@ async function passThrough(requestBody, clientResponse, reqMeta, abortSignal) {
         }
       }
     } catch (err) {
-      if (abortSignal?.aborted || err.name === "AbortError") {
-        addDebugLog("DOWNSTREAM", `[直通模式] 客户端中断传输`);
+      if (isConnectionAbortedError(err, abortSignal)) {
+        addDebugLog("DOWNSTREAM", `[直通模式] 客户端中断传输或连接关闭: ${err.message}`);
         return;
       }
       throw err;
@@ -2004,8 +2094,8 @@ async function passThroughAndTransformGemini(requestBody, clientResponse, isStre
         signal: abortSignal
       });
     } catch (err) {
-      if (abortSignal?.aborted || err.name === "AbortError") {
-        addDebugLog("DOWNSTREAM", `[Gemini 直通模式] 客户端已中止请求`);
+      if (isConnectionAbortedError(err, abortSignal)) {
+        addDebugLog("DOWNSTREAM", `[Gemini 直通模式] 客户端已中止请求或连接关闭: ${err.message}`);
         return;
       }
       throw err;
@@ -2111,8 +2201,8 @@ async function passThroughAndTransformGemini(requestBody, clientResponse, isStre
         }
       }
     } catch (err) {
-      if (abortSignal?.aborted || err.name === "AbortError") {
-        addDebugLog("DOWNSTREAM", `[Gemini 直通模式] 客户端中断传输`);
+      if (isConnectionAbortedError(err, abortSignal)) {
+        addDebugLog("DOWNSTREAM", `[Gemini 直通模式] 客户端中断传输或连接关闭: ${err.message}`);
         return;
       }
       throw err;
@@ -2216,7 +2306,6 @@ async function runAgentLoop(requestBody, clientResponse, reqMeta, abortSignal) {
   let finalFinishReason = null;
   let executedToolCount = 0;
   const toolCallHistory = new Map();
-  const duplicateCallDiagnostics = [];
   let hasWriteSuccess = false;
   let consecutiveFailures = 0;
   const MAX_AGENT_ROUNDS = 60;
@@ -2229,13 +2318,6 @@ async function runAgentLoop(requestBody, clientResponse, reqMeta, abortSignal) {
       }
 
       let roundMessages = [...messages];
-      if (duplicateCallDiagnostics.length > 0) {
-        const diagnostics = duplicateCallDiagnostics.slice(-10);
-        roundMessages.push({
-          role: "system",
-          content: `【重复调用诊断】代理观察到以下重复工具调用：${JSON.stringify(diagnostics)}。请继续完成本轮任务，不要因重复调用而提前结束。最终答复必须用一句简短说明交代记录中可确认的重复调用状态及代理采取的处理；无法从记录确认的模型动机必须说明未知，不要声称知道内部思考，也不要输出思维链。`
-        });
-      }
       if (round === 0) {
         roundMessages.push({
           role: "system",
@@ -2262,7 +2344,7 @@ async function runAgentLoop(requestBody, clientResponse, reqMeta, abortSignal) {
 
       const payload = {
         ...requestBody,
-        messages: roundMessages,
+        messages: optimizeMessagesForUpstream(roundMessages),
         stream: isStream
       };
 
@@ -2281,6 +2363,20 @@ async function runAgentLoop(requestBody, clientResponse, reqMeta, abortSignal) {
       });
 
       let upstreamResponse;
+      const roundAbortController = new AbortController();
+      let parentAbortListener = null;
+      if (abortSignal) {
+        if (abortSignal.aborted) {
+          roundAbortController.abort();
+        } else {
+          parentAbortListener = () => roundAbortController.abort();
+          abortSignal.addEventListener("abort", parentAbortListener, { once: true });
+        }
+      }
+      const roundTimeoutTimer = setTimeout(() => {
+        roundAbortController.abort(new Error("上游响应超时 (180秒)"));
+      }, 180000);
+
       try {
         upstreamResponse = await fetch(targetUrl, {
           method: "POST",
@@ -2289,14 +2385,19 @@ async function runAgentLoop(requestBody, clientResponse, reqMeta, abortSignal) {
             "Content-Type": "application/json"
           },
           body: JSON.stringify(payload),
-          signal: abortSignal
+          signal: roundAbortController.signal
         });
       } catch (err) {
-        if (abortSignal?.aborted || err.name === "AbortError") {
-          addDebugLog("DOWNSTREAM", `第 ${round + 1} 轮上游请求被客户端中止`);
+        if (isConnectionAbortedError(err, abortSignal)) {
+          addDebugLog("DOWNSTREAM", `第 ${round + 1} 轮上游请求被中止或连接关闭: ${err.message}`);
           return;
         }
         throw err;
+      } finally {
+        clearTimeout(roundTimeoutTimer);
+        if (abortSignal && parentAbortListener) {
+          abortSignal.removeEventListener("abort", parentAbortListener);
+        }
       }
 
       const roundDuration = Date.now() - roundStartTime;
@@ -2376,6 +2477,7 @@ async function runAgentLoop(requestBody, clientResponse, reqMeta, abortSignal) {
             }
           }
           const args = toolArguments(tc);
+          const isWriteTool = isWriteToolName(tc.function.name);
           let resultText = "";
           let isToolError = false;
           if (args === null) {
@@ -2383,19 +2485,10 @@ async function runAgentLoop(requestBody, clientResponse, reqMeta, abortSignal) {
             isToolError = true;
           } else {
             const callKey = `${tc.function.name}:${stableSerialize(args)}`;
-            const replay = getToolCallReplay(toolCallHistory, callKey);
+            const replay = getToolCallReplay(toolCallHistory, callKey, isWriteTool);
             if (replay) {
               resultText = replay.content;
               isToolError = replay.isError;
-              duplicateCallDiagnostics.push({
-                tool: tc.function.name,
-                attempts: replay.attempts,
-                result: replay.isError ? "stopped_after_failures" : "reused_success",
-                observedReason: replay.isError
-                  ? "相同工具和参数此前连续失败，代理达到重试上限后停止请求"
-                  : "相同工具和参数此前成功，代理复用了已有结果"
-              });
-              if (duplicateCallDiagnostics.length > 20) duplicateCallDiagnostics.shift();
               addDebugLog("AGENT", `[重复调用保护] ${tc.function.name} ${replay.isError ? "连续失败后停止重试" : "复用此前成功结果"}`, { attempts: replay.attempts });
             } else {
               try {
@@ -2405,8 +2498,7 @@ async function runAgentLoop(requestBody, clientResponse, reqMeta, abortSignal) {
                 recordToolCallOutcome(toolCallHistory, callKey, isToolError, resultText);
                 if (!isToolError) {
                   executedToolCount += 1;
-                  const fnLower = tc.function.name.toLowerCase();
-                  if (fnLower.includes("write") || fnLower.includes("create") || fnLower.includes("update") || fnLower.includes("push") || fnLower.includes("delete") || fnLower.includes("edit")) {
+                  if (isWriteTool) {
                     hasWriteSuccess = true;
                   }
                 }
@@ -2511,8 +2603,8 @@ async function runAgentLoop(requestBody, clientResponse, reqMeta, abortSignal) {
           }
         }
       } catch (err) {
-        if (abortSignal?.aborted || err.name === "AbortError") {
-          addDebugLog("DOWNSTREAM", `[AGENT] 客户端中断传输`);
+        if (isConnectionAbortedError(err, abortSignal)) {
+          addDebugLog("DOWNSTREAM", `[AGENT] 客户端中断传输或连接关闭: ${err.message}`);
           return;
         }
         throw err;
@@ -2589,40 +2681,61 @@ async function runAgentLoop(requestBody, clientResponse, reqMeta, abortSignal) {
         const args = toolArguments({ function: { arguments: tc.arguments } });
         const actionDetails = formatToolCallDetails(args);
         const detailSuffix = actionDetails ? ` | ${actionDetails}` : "";
-
-        if (!abortSignal?.aborted && !clientResponse.destroyed) {
-          sendReasoningChunk(
-            clientResponse,
-            `\n> ⏳ 正在调用 [${displayName}] 执行操作: \`${rawAction}\`${detailSuffix}...\n`,
-            requestBody.model
-          );
-        }
+        const isWriteTool = isWriteToolName(tc.name);
 
         let resultText = "";
         let isToolError = false;
         let errorMessage = "";
+
         if (args === null) {
           errorMessage = "无效参数";
           resultText = JSON.stringify({ error: errorMessage });
           isToolError = true;
+          if (!abortSignal?.aborted && !clientResponse.destroyed) {
+            sendReasoningChunk(
+              clientResponse,
+              `\n> ⏳ 正在调用 [${displayName}] 执行操作: \`${rawAction}\`${detailSuffix}...\n`,
+              requestBody.model
+            );
+            sendReasoningChunk(
+              clientResponse,
+              `> ❌ [${displayName}] 参数解析错误\n\n`,
+              requestBody.model
+            );
+          }
         } else {
           const callKey = `${tc.name}:${stableSerialize(args)}`;
-          const replay = getToolCallReplay(toolCallHistory, callKey);
+          const replay = getToolCallReplay(toolCallHistory, callKey, isWriteTool);
           if (replay) {
             resultText = replay.content;
             isToolError = replay.isError;
             errorMessage = replay.isError ? extractErrorMessage(replay.content) : "";
-            duplicateCallDiagnostics.push({
-              tool: tc.name,
-              attempts: replay.attempts,
-              result: replay.isError ? "stopped_after_failures" : "reused_success",
-              observedReason: replay.isError
-                ? "相同工具和参数此前连续失败，代理达到重试上限后停止请求"
-                : "相同工具和参数此前成功，代理复用了已有结果"
-            });
-            if (duplicateCallDiagnostics.length > 20) duplicateCallDiagnostics.shift();
             addDebugLog("AGENT", `[重复调用保护] ${tc.name} ${replay.isError ? "连续失败后停止重试" : "复用此前成功结果"}`, { attempts: replay.attempts });
+
+            if (!abortSignal?.aborted && !clientResponse.destroyed) {
+              if (replay.isError) {
+                sendReasoningChunk(
+                  clientResponse,
+                  `\n> ⚠️ [${displayName}] 相同操作连续失败已达上限，已停止重复调用${detailSuffix}\n\n`,
+                  requestBody.model
+                );
+              } else {
+                sendReasoningChunk(
+                  clientResponse,
+                  `\n> ⚡ [${displayName}] 已复用成功缓存: \`${rawAction}\`${detailSuffix}\n\n`,
+                  requestBody.model
+                );
+              }
+            }
           } else {
+            if (!abortSignal?.aborted && !clientResponse.destroyed) {
+              sendReasoningChunk(
+                clientResponse,
+                `\n> ⏳ 正在调用 [${displayName}] 执行操作: \`${rawAction}\`${detailSuffix}...\n`,
+                requestBody.model
+              );
+            }
+
             try {
               const onWaitNotice = (waitSec) => {
                 if (!abortSignal?.aborted && !clientResponse.destroyed) {
@@ -2641,8 +2754,7 @@ async function runAgentLoop(requestBody, clientResponse, reqMeta, abortSignal) {
                 errorMessage = extractErrorMessage(toolRes.content);
               } else {
                 executedToolCount += 1;
-                const fnLower = tc.name.toLowerCase();
-                if (fnLower.includes("write") || fnLower.includes("create") || fnLower.includes("update") || fnLower.includes("push") || fnLower.includes("delete") || fnLower.includes("edit")) {
+                if (isWriteTool) {
                   hasWriteSuccess = true;
                 }
               }
@@ -2653,28 +2765,28 @@ async function runAgentLoop(requestBody, clientResponse, reqMeta, abortSignal) {
               isToolError = true;
               recordToolCallOutcome(toolCallHistory, callKey, isToolError, resultText);
             }
+
+            if (!abortSignal?.aborted && !clientResponse.destroyed) {
+              if (isToolError) {
+                const failReason = errorMessage ? `: ${errorMessage}` : "";
+                sendReasoningChunk(
+                  clientResponse,
+                  `> ❌ [${displayName}] 执行失败${detailSuffix}${failReason}\n\n`,
+                  requestBody.model
+                );
+              } else {
+                sendReasoningChunk(
+                  clientResponse,
+                  `> ✅ [${displayName}] 执行完成${detailSuffix}\n\n`,
+                  requestBody.model
+                );
+              }
+            }
           }
         }
 
         if (isToolError) {
           roundHasFailure = true;
-        }
-
-        if (!abortSignal?.aborted && !clientResponse.destroyed) {
-          if (isToolError) {
-            const failReason = errorMessage ? `: ${errorMessage}` : "";
-            sendReasoningChunk(
-              clientResponse,
-              `> ❌ [${displayName}] 执行失败${detailSuffix}${failReason}\n\n`,
-              requestBody.model
-            );
-          } else {
-            sendReasoningChunk(
-              clientResponse,
-              `> ✅ [${displayName}] 执行完成${detailSuffix}\n\n`,
-              requestBody.model
-            );
-          }
         }
 
         messages.push({
@@ -3395,7 +3507,8 @@ const server = http.createServer(async (request, response) => {
 
     sendOpenAIError(response, 404, "接口不存在");
   } catch (err) {
-    if (err.name === "AbortError") {
+    if (isConnectionAbortedError(err) || response.destroyed || request.destroyed) {
+      addDebugLog("DOWNSTREAM", `[连接中断或取消]: ${err.message}`);
       return;
     }
     addDebugLog("ERROR", `全局服务未捕获异常: ${err.message}`, err.stack || err);
