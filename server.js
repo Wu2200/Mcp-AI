@@ -2159,7 +2159,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
 
   let finalFinishReason = null;
   let executedToolCount = 0;
-  const toolCallHistory = new Map();
+  const toolCallCache = new Map();
   let hasWriteSuccess = false;
   let consecutiveFailures = 0;
   const MAX_AGENT_ROUNDS = 60;
