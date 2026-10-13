@@ -2329,26 +2329,34 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
             isToolError = true;
           } else {
             const callKey = `${tc.function.name}:${JSON.stringify(args)}`;
-            const prevAttempts = toolCallHistory.get(callKey) || 0;
-            if (prevAttempts >= 2) {
-              resultText = JSON.stringify({ error: "该工具已使用完全相同的参数重复调用多次，系统已拦截重复执行。请勿继续重复调用，请根据当前信息直接回答用户。" });
-              isToolError = true;
+            const fnLower = tc.function.name.toLowerCase();
+            const isWriteTool = fnLower.includes("write") || fnLower.includes("create") || fnLower.includes("update") || fnLower.includes("push") || fnLower.includes("delete") || fnLower.includes("edit");
+            if (!isWriteTool && toolSuccessCache.has(callKey)) {
+              resultText = toolSuccessCache.get(callKey);
+              isToolError = false;
             } else {
-              toolCallHistory.set(callKey, prevAttempts + 1);
-              try {
-                const toolRes = await callMcpTool(tc.function.name, args);
-                resultText = toolRes.content;
-                isToolError = toolRes.isError;
-                if (!isToolError) {
-                  executedToolCount += 1;
-                  const fnLower = tc.function.name.toLowerCase();
-                  if (fnLower.includes("write") || fnLower.includes("create") || fnLower.includes("update") || fnLower.includes("push") || fnLower.includes("delete") || fnLower.includes("edit")) {
-                    hasWriteSuccess = true;
-                  }
-                }
-              } catch (err) {
-                resultText = JSON.stringify({ error: err instanceof Error ? err.message : "Tool execution failed" });
+              const prevAttempts = toolCallHistory.get(callKey) || 0;
+              if (prevAttempts >= 2) {
+                resultText = JSON.stringify({ error: "该工具已使用完全相同的参数重复调用多次，系统已拦截重复执行。请勿继续重复调用，请根据当前信息直接回答用户。" });
                 isToolError = true;
+              } else {
+                toolCallHistory.set(callKey, prevAttempts + 1);
+                try {
+                  const toolRes = await callMcpTool(tc.function.name, args);
+                  resultText = toolRes.content;
+                  isToolError = toolRes.isError;
+                  if (!isToolError) {
+                    executedToolCount += 1;
+                    if (isWriteTool) {
+                      hasWriteSuccess = true;
+                    } else {
+                      toolSuccessCache.set(callKey, resultText);
+                    }
+                  }
+                } catch (err) {
+                  resultText = JSON.stringify({ error: err instanceof Error ? err.message : "Tool execution failed" });
+                  isToolError = true;
+                }
               }
             }
           }
