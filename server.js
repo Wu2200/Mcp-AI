@@ -986,7 +986,7 @@ async function executeGithubEditFile(serverInfo, readToolRawName, writeToolRawNa
 
   let editList = [];
   if (Array.isArray(edits) && edits.length > 0) {
-    editList = edits;
+    editList = editList;
   } else if (typeof old_str === "string" && typeof new_str === "string") {
     editList = [{ old_str, new_str }];
   } else {
@@ -1184,7 +1184,7 @@ async function callMcpTool(toolKey, args, onWaitNotice = null) {
     const duration = Date.now() - startTime;
     let finalContent = textContent;
 
-    if (textContent.includes("429") || textContent.includes("blocked due to excessive requests") || textContent.includes("rate of requests")) {
+    if (isToolError && (textContent.includes("429") || textContent.includes("blocked due to excessive requests") || textContent.includes("rate of requests"))) {
       finalContent = JSON.stringify({
         note: "外部网络检索接口已触发短时频率限制 (429)。请基于当前已有的仓库源码及上下文继续修改和完善代码，避免高频外网搜索。"
       });
