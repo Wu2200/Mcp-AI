@@ -39,7 +39,7 @@ function addDebugLog(type, summary, detail = "") {
     String(now.getMilliseconds()).padStart(3, "0");
   const entry = {
     id: `log_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-    requestId: agentLogContext.getStore() || null,
+    requestId: agentLogContext.getStore() || (detail && typeof detail === "object" ? detail.requestId || null : null),
     time,
     type,
     summary,
@@ -2148,7 +2148,7 @@ async function passThroughAndTransformGemini(requestBody, clientResponse, isStre
 }
 
 async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
-  const requestId = crypto.randomUUID();
+  const requestId = reqMeta?.requestId || crypto.randomUUID();
   return agentLogContext.run(requestId, () => runAgentLoop(requestBody, clientResponse, reqMeta, abortSignal));
 }
 
@@ -3337,8 +3337,10 @@ const server = http.createServer(async (request, response) => {
           ? lastMsg.content
           : (Array.isArray(lastMsg?.content) ? lastMsg.content.map((c) => c.text || "").join(" ") : "");
         const mcpEnabled = isModelEnabledForMcp(body.model) && mcpToolRegistry.size > 0 && !isTitleGenerationRequest(lastMsgText);
+        const requestId = crypto.randomUUID();
 
         addDebugLog("DOWNSTREAM", `收到客户端请求 [${body.model || "default"}] -> 渠道 [${channel.name}] - stream=${body.stream === true}`, {
+          requestId,
           channel: channel.name,
           model: body.model,
           stream: body.stream,
@@ -3363,7 +3365,7 @@ const server = http.createServer(async (request, response) => {
 
         try {
           if (mcpEnabled) {
-            await runAgent(body, response, { ip: request.socket.remoteAddress }, abortController.signal);
+            await runAgent(body, response, { ip: request.socket.remoteAddress, requestId }, abortController.signal);
           } else {
             await passThrough(body, response, { ip: request.socket.remoteAddress }, abortController.signal);
           }
