@@ -1156,19 +1156,31 @@ function getAllTools() {
   return tools;
 }
 
+function isTitleGenerationRequest(userText) {
+  if (!userText || typeof userText !== "string") return false;
+  return (
+    /give this conversation a name/i.test(userText) ||
+    /based on the chat history,\s*give this conversation/i.test(userText) ||
+    /generate a (?:short )?title for this conversation/i.test(userText)
+  );
+}
+
 function detectActionIntent(userText) {
   if (!userText || typeof userText !== "string") {
     return { needsTool: false, isWrite: false };
   }
   const text = userText.trim();
+  if (isTitleGenerationRequest(text)) {
+    return { needsTool: false, isWrite: false };
+  }
 
-  const writeVerb = /(修改|修改下|改下|改一下|修一下|修复|更新|更新下|添加|增加|加一个|删除|删掉|重写|创建|新建|写入|覆盖|替换|调整|优化下|把.+改成|提交|推送|commit|push|write|update|create|delete|edit)/i;
-  const writeTarget = /(代码|文件|配置|仓库|bug|接口|函数|样式|组件|依赖|项目|分支|pr|github|readme|\.[a-z0-9]{1,5})/i;
-  const isDirectWrite = writeVerb.test(text) && (writeTarget.test(text) || text.length <= 40);
+  const writeVerb = /(修改|修改下|改下|改一下|修一下|修复|更新|更新下|添加|增加|加一个|删除|删掉|重写|创建|新建|写入|覆盖|替换|调整|优化|补齐|同步|把.+改成|提交|推送|commit|push|write|update|create|delete|edit)/i;
+  const writeTarget = /(代码|文件|配置|仓库|bug|接口|函数|样式|组件|依赖|项目|分支|插件|脚本|产物|测试|pr|github|readme|dist|\.[a-z0-9]{1,6})/i;
+  const isDirectWrite = writeVerb.test(text) && (writeTarget.test(text) || text.length <= 60);
 
-  const readVerb = /(查看|看一下|读取|获取|搜索|查一下|查找|找一下|列出|分析下|读一下|fetch|get|read|search|list)/i;
-  const readTarget = /(文件|代码|目录|仓库|分支|提交|commit|pr|issue|内容|日志|log|\.[a-z0-9]{1,5})/i;
-  const isDirectRead = readVerb.test(text) && readTarget.test(text);
+  const readVerb = /(查看|看一下|读取|获取|搜索|查一下|查找|找一下|列出|分析|检查|排查|看看|读一下|fetch|get|read|search|list)/i;
+  const readTarget = /(文件|代码|目录|仓库|分支|提交|日志|报错|错误|问题|原因|commit|pr|issue|内容|log|\.[a-z0-9]{1,6})/i;
+  const isDirectRead = readVerb.test(text) && (readTarget.test(text) || text.length <= 60);
 
   const isWrite = Boolean(isDirectWrite);
   const needsTool = Boolean(isDirectWrite || isDirectRead);
@@ -2175,24 +2187,19 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
           content: "【工具调用透明化指令】在调用任何工具前，思考过程中必须清晰指明目标仓库名称、文件路径、分支或具体检索内容，确保调用过程清晰可追踪。"
         });
       }
-      if (hasWriteSuccess) {
+      if (consecutiveFailures >= 2) {
         roundMessages.push({
           role: "system",
-          content: "【写入完成提示】相关修改与写入操作已确认成功。禁止再次进行多余的重复读取、校验或重复修改，请直接向用户完整输出最终的修改说明与交付结果。"
-        });
-      } else if (consecutiveFailures >= 2) {
-        roundMessages.push({
-          role: "system",
-          content: "【错误排查提示】上一轮工具调用存在失败。请仔细检查错误原因并调整策略；若无法解决或属于权限、冲突等外部限制，请停止重复盲目调用，直接向用户说明具体原因。"
+          content: "【错误自愈与切换提示】检测到前序工具调用返回错误（如 404 或匹配失败）。请更换查询方式或修正文件路径与参数继续完成全部任务；所有工具（含文件读取、局部编辑、全量写入等）均处于正常可用状态，严禁声称没有写入工具，所有待修改的文件与构建产物必须全部写入完成后才可结束。"
         });
       } else if (round === 0 && isWrite) {
         roundMessages.push({
           role: "system",
-          content: "【强制执行与局部修改规范】检测到针对代码、配置或文件的修改任务。必须直接调用工具完成写入。如需修改已有文件，必须优先调用局部修改工具（如 github_edit_file），仅传入需替换的代码片段（old_str -> new_str），严禁将几百行大文件全量重写；仅在新建文件时使用全量写入工具。"
+          content: "【强制执行与局部修改规范】检测到针对代码、配置或文件的修改任务。必须直接调用工具完成所有相关源码、构建产物与测试的完整写入。修改已有文件时，必须优先调用局部修改工具（如 github_edit_file），仅传入需替换的代码片段（old_str -> new_str），严禁将大文件全量重写；仅在新建文件时使用全量写入工具。"
         });
       }
 
-      const activeTools = consecutiveFailures >= 3 ? [] : tools;
+      const activeTools = tools;
       let activeToolChoice = "auto";
       if (tools.length > 0 && round === 0 && isWrite) {
         activeToolChoice = "required";
@@ -3264,8 +3271,11 @@ const server = http.createServer(async (request, response) => {
         }
 
         const body = await readRequestBody(request);
-        const mcpEnabled = isModelEnabledForMcp(body.model) && mcpToolRegistry.size > 0;
         const lastMsg = Array.isArray(body.messages) ? body.messages[body.messages.length - 1] : null;
+        const lastMsgText = typeof lastMsg?.content === "string"
+          ? lastMsg.content
+          : (Array.isArray(lastMsg?.content) ? lastMsg.content.map((c) => c.text || "").join(" ") : "");
+        const mcpEnabled = isModelEnabledForMcp(body.model) && mcpToolRegistry.size > 0 && !isTitleGenerationRequest(lastMsgText);
 
         addDebugLog("DOWNSTREAM", `收到客户端请求 [${body.model || "default"}] -> 渠道 [${channel.name}] - stream=${body.stream === true}`, {
           channel: channel.name,
@@ -3273,7 +3283,7 @@ const server = http.createServer(async (request, response) => {
           stream: body.stream,
           mcpEnabled,
           messagesCount: body.messages?.length || 0,
-          lastUserMessagePreview: typeof lastMsg?.content === "string" ? lastMsg.content.slice(0, 300) : "非文本内容"
+          lastUserMessagePreview: lastMsgText ? lastMsgText.slice(0, 300) : "非文本内容"
         });
 
         const abortController = new AbortController();
