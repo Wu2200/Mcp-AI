@@ -1347,6 +1347,31 @@ function formatToolCallDetails(args) {
   return parts.join(", ");
 }
 
+function isWriteTool(toolName) {
+  if (!toolName || typeof toolName !== "string") return false;
+  const lower = toolName.toLowerCase();
+  const writePatterns = [
+    "write", "create", "update", "delete", "edit", "patch",
+    "push", "modify", "merge", "fork", "cancel", "rerun",
+    "trigger", "comment", "star", "unstar", "manage"
+  ];
+  return writePatterns.some((pattern) => lower.includes(pattern));
+}
+
+function generateToolCallKey(toolName, args) {
+  if (!args || typeof args !== "object") return `${toolName}:{}`;
+  try {
+    const sortedKeys = Object.keys(args).sort();
+    const normalized = {};
+    for (const k of sortedKeys) {
+      normalized[k] = args[k];
+    }
+    return `${toolName}:${JSON.stringify(normalized)}`;
+  } catch {
+    return `${toolName}:${JSON.stringify(args)}`;
+  }
+}
+
 function sendSSEChunk(clientResponse, delta, model = "default") {
   const chunk = {
     id: `chatcmpl-${Date.now()}`,
@@ -2160,6 +2185,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
   let finalFinishReason = null;
   let executedToolCount = 0;
   const toolCallHistory = new Map();
+  const dialogReadCache = new Map();
   let hasWriteSuccess = false;
   let consecutiveFailures = 0;
   const MAX_AGENT_ROUNDS = 60;
@@ -2320,6 +2346,8 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
               }
             }
           }
+          const rawAction = toolInfo?.rawName || tc.function.name;
+          const isWrite = isWriteTool(rawAction);
           const args = toolArguments(tc);
           let resultText = "";
           let isToolError = false;
@@ -2327,9 +2355,20 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
             resultText = JSON.stringify({ error: "Invalid tool arguments" });
             isToolError = true;
           } else {
-            const callKey = `${tc.function.name}:${JSON.stringify(args)}`;
+            const callKey = generateToolCallKey(tc.function.name, args);
             const prevAttempts = toolCallHistory.get(callKey) || 0;
-            if (prevAttempts >= 2) {
+            const cachedContent = !isWrite ? dialogReadCache.get(callKey) : null;
+
+            if (cachedContent !== undefined && cachedContent !== null) {
+              toolCallHistory.set(callKey, prevAttempts + 1);
+              if (prevAttempts >= 5) {
+                resultText = JSON.stringify({ note: "已多次复用该工具的缓存结果，当前信息完整且最新。请直接根据已有信息继续执行或回答用户。" });
+              } else {
+                resultText = cachedContent;
+                addDebugLog("TOOL", `MCP 工具 [${tc.function.name}] 命中本次对话只读缓存，直接复用 (${cachedContent.length} 字符)`, { arguments: args });
+              }
+              isToolError = false;
+            } else if (prevAttempts >= 2) {
               resultText = JSON.stringify({ error: "该工具已使用完全相同的参数重复调用多次，系统已拦截重复执行。请勿继续重复调用，请根据当前信息直接回答用户。" });
               isToolError = true;
             } else {
@@ -2340,9 +2379,11 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
                 isToolError = toolRes.isError;
                 if (!isToolError) {
                   executedToolCount += 1;
-                  const fnLower = tc.function.name.toLowerCase();
-                  if (fnLower.includes("write") || fnLower.includes("create") || fnLower.includes("update") || fnLower.includes("push") || fnLower.includes("delete") || fnLower.includes("edit")) {
+                  if (isWrite) {
                     hasWriteSuccess = true;
+                    dialogReadCache.clear();
+                  } else {
+                    dialogReadCache.set(callKey, resultText);
                   }
                 }
               } catch (err) {
@@ -2520,34 +2561,50 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
 
         const displayName = toolInfo?.serverName || "MCP";
         const rawAction = toolInfo?.rawName || tc.name;
+        const isWrite = isWriteTool(rawAction);
         const args = toolArguments({ function: { arguments: tc.arguments } });
         const actionDetails = formatToolCallDetails(args);
         const detailSuffix = actionDetails ? ` | ${actionDetails}` : "";
 
-        if (!abortSignal?.aborted && !clientResponse.destroyed) {
-          sendReasoningChunk(
-            clientResponse,
-            `\n> ⏳ 正在调用 [${displayName}] 执行操作: \`${rawAction}\`${detailSuffix}...\n`,
-            requestBody.model
-          );
-        }
-
         let resultText = "";
         let isToolError = false;
         let errorMessage = "";
+        let isCacheHit = false;
+
         if (args === null) {
           errorMessage = "无效参数";
           resultText = JSON.stringify({ error: errorMessage });
           isToolError = true;
         } else {
-          const callKey = `${tc.name}:${JSON.stringify(args)}`;
+          const callKey = generateToolCallKey(tc.name, args);
           const prevAttempts = toolCallHistory.get(callKey) || 0;
-          if (prevAttempts >= 2) {
+          const cachedContent = !isWrite ? dialogReadCache.get(callKey) : null;
+
+          if (cachedContent !== undefined && cachedContent !== null) {
+            isCacheHit = true;
+            toolCallHistory.set(callKey, prevAttempts + 1);
+            if (prevAttempts >= 5) {
+              resultText = JSON.stringify({ note: "已多次复用该工具的缓存结果，当前信息完整且最新。请直接根据已有信息继续执行或回答用户。" });
+            } else {
+              resultText = cachedContent;
+              addDebugLog("TOOL", `MCP 工具 [${tc.name}] 命中本次对话只读缓存，直接复用 (${cachedContent.length} 字符)`, { arguments: args });
+            }
+            isToolError = false;
+          } else if (prevAttempts >= 2) {
             errorMessage = "重复调用已被系统拦截";
             resultText = JSON.stringify({ error: "该工具已使用完全相同的参数重复调用多次，系统已拦截重复执行。请勿继续重复调用，请根据当前信息直接回答用户。" });
             isToolError = true;
           } else {
             toolCallHistory.set(callKey, prevAttempts + 1);
+
+            if (!abortSignal?.aborted && !clientResponse.destroyed) {
+              sendReasoningChunk(
+                clientResponse,
+                `\n> ⏳ 正在调用 [${displayName}] 执行操作: \`${rawAction}\`${detailSuffix}...\n`,
+                requestBody.model
+              );
+            }
+
             try {
               const onWaitNotice = (waitSec) => {
                 if (!abortSignal?.aborted && !clientResponse.destroyed) {
@@ -2565,9 +2622,11 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
                 errorMessage = extractErrorMessage(toolRes.content);
               } else {
                 executedToolCount += 1;
-                const fnLower = tc.name.toLowerCase();
-                if (fnLower.includes("write") || fnLower.includes("create") || fnLower.includes("update") || fnLower.includes("push") || fnLower.includes("delete") || fnLower.includes("edit")) {
+                if (isWrite) {
                   hasWriteSuccess = true;
+                  dialogReadCache.clear();
+                } else {
+                  dialogReadCache.set(callKey, resultText);
                 }
               }
             } catch (err) {
@@ -2584,7 +2643,13 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         }
 
         if (!abortSignal?.aborted && !clientResponse.destroyed) {
-          if (isToolError) {
+          if (isCacheHit) {
+            sendReasoningChunk(
+              clientResponse,
+              `\n> ⚡ [${displayName}] \`${rawAction}\`${detailSuffix} (复用对话缓存，无需重复读取)\n\n`,
+              requestBody.model
+            );
+          } else if (isToolError) {
             const failReason = errorMessage ? `: ${errorMessage}` : "";
             sendReasoningChunk(
               clientResponse,
@@ -2615,6 +2680,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
     }
   } finally {
     if (keepAliveTimer) clearInterval(keepAliveTimer);
+    dialogReadCache.clear();
   }
 }
 
