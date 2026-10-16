@@ -1099,6 +1099,27 @@ async function callMcpTool(toolKey, args, onWaitNotice = null) {
   }
   if (!info) throw new Error(`未找到工具：${toolKey}`);
 
+  const isCfExecute =
+    (toolKey.toLowerCase().includes("cloudflare") || (info?.serverName || "").toLowerCase().includes("cloudflare")) &&
+    (toolKey.endsWith("execute") || info?.rawName === "execute");
+
+  if (isCfExecute && typeof args?.code === "string") {
+    const rawCode = args.code;
+    if (
+      rawCode.includes("DEFAULT_BASE_URL") ||
+      /fetch\s*\(\s*[`'"]https?:\/\/api\.cloudflare\.com/i.test(rawCode) ||
+      /fetch\s*\(\s*DEFAULT_BASE_URL/i.test(rawCode)
+    ) {
+      return {
+        isError: true,
+        content: JSON.stringify({
+          error:
+            "【Cloudflare execute 规范拦截】检测到代码中试图自行定义 DEFAULT_BASE_URL 或使用原生 fetch 请求 Cloudflare API。沙箱中已内置注入了带有鉴权的全局客户端 `cloudflare.request({ method, path, body })` 与全局变量 `accountId`。直接使用原生 fetch 会因缺少内置鉴权被 Cloudflare 拦截并返回 403 Forbidden（导致 Unexpected token 'F' 报错）。请改用 `return await cloudflare.request({ method: 'GET', path: `/accounts/${accountId}/...` })` 格式。"
+        })
+      };
+    }
+  }
+
   const startTime = Date.now();
   if (typeof info.handler === "function") {
     try {
@@ -1123,11 +1144,15 @@ async function callMcpTool(toolKey, args, onWaitNotice = null) {
     const { rawResult, isToolError, textContent } = await invokeMcpRawTool(info, info.rawName, args, onWaitNotice);
     const duration = Date.now() - startTime;
     if (isToolError) {
+      let refinedContent = textContent;
+      if (isCfExecute && (textContent.includes("Unexpected token 'F'") || textContent.includes("Forbidden"))) {
+        refinedContent = `${textContent}\n\n【诊断指引】此报错通常是因为在 execute 脚本中使用了原生 fetch 请求 Cloudflare 接口导致被 403 拦截并返回纯文本。请使用沙箱内置的 \`cloudflare.request({ method, path, body })\` 与全局变量 \`accountId\`，严禁在脚本中自拼 URL 或裸调 fetch。`;
+      }
       addDebugLog("ERROR", `MCP 工具 [${toolKey}] 返回错误 - 耗时 ${duration}ms`, {
         arguments: args,
-        errorOutput: textContent.slice(0, 500)
+        errorOutput: refinedContent.slice(0, 500)
       });
-      return { isError: true, content: textContent };
+      return { isError: true, content: refinedContent };
     }
     addDebugLog("TOOL", `MCP 工具 [${toolKey}] 执行成功 - 耗时 ${duration}ms, 输出 ${textContent.length} 字符`, {
       arguments: args,
@@ -1136,9 +1161,12 @@ async function callMcpTool(toolKey, args, onWaitNotice = null) {
     return { isError: false, content: textContent };
   } catch (err) {
     const duration = Date.now() - startTime;
-    const msg = err instanceof Error ? err.message : String(err);
+    let msg = err instanceof Error ? err.message : String(err);
+    if (isCfExecute && (msg.includes("Unexpected token 'F'") || msg.includes("Forbidden"))) {
+      msg = `${msg} (诊断指引: 请使用沙箱内置的 cloudflare.request 与 accountId，严禁使用原生 fetch 或自拼 DEFAULT_BASE_URL)`;
+    }
     addDebugLog("ERROR", `MCP 工具 [${toolKey}] 异常 - 耗时 ${duration}ms`, msg);
-    throw err;
+    throw (err instanceof Error ? new Error(msg) : new Error(String(msg)));
   }
 }
 
@@ -2211,6 +2239,16 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         roundMessages.push({
           role: "system",
           content: "【工具调用透明化指令】在调用任何工具前，思考过程中必须清晰指明目标仓库名称、文件路径、分支或具体检索内容，确保调用过程清晰可追踪。"
+        });
+      }
+      const hasCloudflare = tools.some((t) => {
+        const n = (t.function?.name || "").toLowerCase();
+        return n.includes("cloudflare");
+      });
+      if (round === 0 && hasCloudflare) {
+        roundMessages.push({
+          role: "system",
+          content: "【Cloudflare 工具执行规范】调用 Cloudflare 的 execute 工具时，沙箱内已预置并注入了鉴权客户端 `cloudflare.request({ method, path, body })` 与全局变量 `accountId`。严禁在代码中自行定义 DEFAULT_BASE_URL 或使用原生 fetch() 请求 Cloudflare API，必须直接调用 `return await cloudflare.request({ method: 'GET', path: `/accounts/${accountId}/...` })`。"
         });
       }
       if (consecutiveFailures >= 2) {
