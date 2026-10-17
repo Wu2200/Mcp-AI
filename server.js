@@ -864,6 +864,57 @@ function formatCardMarkdown(text) {
     .replace(/([^\n\r])\s*(检索内容[：:])/g, "$1\n$2");
 }
 
+function createStreamContentFilter(onEmit) {
+  let buffer = "";
+  const blockedPatterns = [
+    /<system-reminder>[\s\S]*?<\/system-reminder>/gi,
+    /<system-reminder>[\s\S]*/gi,
+    /【工具调用透明化与高效并行规范】[\s\S]*?(?:终局轮次严禁输出操作卡片。|严禁输出上述卡片。|$)/g,
+    /【Cloudflare 工具执行规范】[\s\S]*?(?:严禁跨平台跑到 GitHub 检索无关个人或仓库。|$)/g,
+    /【执行规范】[\s\S]*?(?:避免多轮无效探索。|$)/g
+  ];
+
+  return {
+    push(chunk) {
+      if (!chunk) return;
+      buffer += chunk;
+
+      const potentialPrefixes = ["<system-reminder", "</system-reminder", "<system", "<", "【工具", "【Cloudflare", "【执行"];
+      let holdbackLen = 0;
+      for (const prefix of potentialPrefixes) {
+        for (let i = 1; i <= prefix.length; i++) {
+          const sub = prefix.slice(0, i);
+          if (buffer.endsWith(sub)) {
+            holdbackLen = Math.max(holdbackLen, sub.length);
+          }
+        }
+      }
+
+      for (const pat of blockedPatterns) {
+        buffer = buffer.replace(pat, "");
+      }
+
+      const safeLen = buffer.length - holdbackLen;
+      if (safeLen > 0) {
+        const toEmit = buffer.slice(0, safeLen);
+        buffer = buffer.slice(safeLen);
+        if (toEmit) {
+          onEmit(formatCardMarkdown(toEmit));
+        }
+      }
+    },
+    flush() {
+      for (const pat of blockedPatterns) {
+        buffer = buffer.replace(pat, "");
+      }
+      if (buffer) {
+        onEmit(formatCardMarkdown(buffer));
+        buffer = "";
+      }
+    }
+  };
+}
+
 function parseTextToolCalls(text, activeTools) {
   if (!text || typeof text !== "string" || !Array.isArray(activeTools) || activeTools.length === 0) {
     return [];
@@ -2283,7 +2334,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
   });
 
   const systemRules = [
-    "【工具调用透明化与高效并行规范】\n1. 高效并行调用：当需要查阅多个文件、检索多个不同关键词或执行多个无相互依赖的操作时，必须在单轮响应中一次性发起所有工具调用进行并发执行，严禁拆分成多轮逐个调用。\n2. 在需要调用工具的轮次，正文必须且仅输出如下格式的操作卡片（不要输出多余的废话、解释或开场白）。若单轮并发调用多个工具，每个操作卡片之间必须使用双换行（\\n\\n）空行彻底分隔，严禁单行连续粘连：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n3. 核心执行约束：输出上述操作卡片的同时，必须同时发起真实的底层工具调用（Tool Calls），严禁仅在正文中打印卡片文本而不发起工具调用！\n4. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n5. 当所有工具调用完毕、输出最终答复的轮次，直接输出最终解答，严禁输出上述卡片。"
+    "【工具调用透明化与高效并行规范】\n1. 高效并行调用：当需要查阅多个文件、检索多个不同关键词或执行多个无相互依赖的操作时，必须在单轮响应中一次性发起所有工具调用进行并发执行，严禁拆分成多轮逐个调用。\n2. 严禁提前输出总结或方案草稿：在所有信息收集、代码排查或修改操作全部完成之前，严禁在中间轮次输出结论、答复文本、分析讲解或开场白！\n3. 在需要调用工具的轮次，正文必须且仅输出如下格式的操作卡片。若单轮并发调用多个工具，每个操作卡片之间必须使用双换行（\\n\\n）空行彻底分隔，严禁单行连续粘连：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n4. 核心执行约束：输出上述操作卡片的同时，必须同时发起真实的底层工具调用（Tool Calls），严禁仅在正文中打印卡片文本而不发起工具调用！\n5. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n6. 当所有工具调用完毕、进入最终答复轮次时，直接输出完整最终解答，终局轮次严禁输出操作卡片。"
   ];
   const hasCloudflare = tools.some((t) => {
     const n = (t.function?.name || "").toLowerCase();
@@ -2584,6 +2635,25 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       let hasToolCalls = false;
       let roundFinishReason = null;
 
+      const streamFilter = createStreamContentFilter((safeText) => {
+        if (!clientResponse.destroyed && !abortSignal?.aborted) {
+          const contentChunk = {
+            id: `chatcmpl-${Date.now()}`,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: requestBody.model || "default",
+            choices: [
+              {
+                index: 0,
+                delta: { content: safeText },
+                finish_reason: null
+              }
+            ]
+          };
+          clientResponse.write(`data: ${JSON.stringify(contentChunk)}\n\n`);
+        }
+      });
+
       try {
         while (true) {
           if (abortSignal?.aborted || clientResponse.destroyed) {
@@ -2631,31 +2701,8 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
               }
 
               if (delta?.content) {
-                if (
-                  delta.content.includes("【工具调用透明化与高效并行规范】") ||
-                  delta.content.includes("<system-reminder>") ||
-                  delta.content.includes("</system-reminder>")
-                ) {
-                  continue;
-                }
                 assistantContent += delta.content;
-                if (!clientResponse.destroyed && !abortSignal?.aborted) {
-                  const safeContent = formatCardMarkdown(delta.content);
-                  const contentChunk = {
-                    id: parsed.id || `chatcmpl-${Date.now()}`,
-                    object: "chat.completion.chunk",
-                    created: parsed.created || Math.floor(Date.now() / 1000),
-                    model: parsed.model || requestBody.model || "default",
-                    choices: [
-                      {
-                        index: 0,
-                        delta: { content: safeContent },
-                        finish_reason: null
-                      }
-                    ]
-                  };
-                  clientResponse.write(`data: ${JSON.stringify(contentChunk)}\n\n`);
-                }
+                streamFilter.push(delta.content);
               }
 
               if (delta?.reasoning_content) {
@@ -2686,6 +2733,8 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         }
         throw err;
       }
+
+      streamFilter.flush();
 
       if (abortSignal?.aborted || clientResponse.destroyed) {
         addDebugLog("DOWNSTREAM", `客户端已断开，终止后续 MCP 处理与续接`);
