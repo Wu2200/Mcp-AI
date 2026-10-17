@@ -2242,12 +2242,10 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       }
 
       let roundMessages = [...messages];
-      if (round === 0) {
-        roundMessages.push({
-          role: "system",
-          content: "【工具调用透明化指令】在调用任何工具前，思考过程中必须清晰指明目标仓库名称、文件路径、分支或具体检索内容，确保调用过程清晰可追踪。"
-        });
-      }
+      roundMessages.push({
+        role: "system",
+        content: "【工具调用透明化规范】\n在发起任何工具调用前，严禁将调用说明写入思考过程（thinking/reasoning_content）中！你必须在当前轮次的正文内容（content）中直接输出简短明确的说明，确保在界面正文气泡中直观展示：\n**目标说明**：[简要说明调用目标]\n**调用工具**：`[调用的工具名称]`\n**检索内容**：[目标仓库、文件路径、参数或检索摘要]\n\n输出完上述内容后再执行工具调用。"
+      });
       const hasCloudflare = tools.some((t) => {
         const n = (t.function?.name || "").toLowerCase();
         return n.includes("cloudflare");
