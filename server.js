@@ -1428,6 +1428,10 @@ function sendReasoningChunk(clientResponse, text, model = "default") {
   sendSSEChunk(clientResponse, { reasoning_content: text }, model);
 }
 
+function sendContentChunk(clientResponse, text, model = "default") {
+  sendSSEChunk(clientResponse, { content: text }, model);
+}
+
 function isTruncatedFinishReason(reason) {
   if (!reason || typeof reason !== "string") return false;
   const r = reason.toLowerCase().trim();
@@ -2506,7 +2510,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
 
               if (delta?.content) {
                 assistantContent += delta.content;
-                if (!hasToolCalls && !clientResponse.destroyed && !abortSignal?.aborted) {
+                if (!clientResponse.destroyed && !abortSignal?.aborted) {
                   if (isTruncatedFinishReason(reason)) {
                     const sanitized = {
                       ...parsed,
@@ -2638,7 +2642,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
             toolCallHistory.set(callKey, prevAttempts + 1);
 
             if (!abortSignal?.aborted && !clientResponse.destroyed) {
-              sendReasoningChunk(
+              sendContentChunk(
                 clientResponse,
                 `\n> ⏳ 正在调用 [${displayName}] 执行操作: \`${rawAction}\`${detailSuffix}...\n`,
                 requestBody.model
@@ -2648,7 +2652,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
             try {
               const onWaitNotice = (waitSec) => {
                 if (!abortSignal?.aborted && !clientResponse.destroyed) {
-                  sendReasoningChunk(
+                  sendContentChunk(
                     clientResponse,
                     `> ⏳ 触发 GitHub 访问频控，正在等待 ${waitSec + 1} 秒后自动重试...\n`,
                     requestBody.model
@@ -2684,20 +2688,20 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
 
         if (!abortSignal?.aborted && !clientResponse.destroyed) {
           if (isCacheHit) {
-            sendReasoningChunk(
+            sendContentChunk(
               clientResponse,
               `\n> ⚡ [${displayName}] \`${rawAction}\`${detailSuffix} (复用对话缓存，无需重复读取)\n\n`,
               requestBody.model
             );
           } else if (isToolError) {
             const failReason = errorMessage ? `: ${errorMessage}` : "";
-            sendReasoningChunk(
+            sendContentChunk(
               clientResponse,
               `> ❌ [${displayName}] 执行失败${detailSuffix}${failReason}\n\n`,
               requestBody.model
             );
           } else {
-            sendReasoningChunk(
+            sendContentChunk(
               clientResponse,
               `> ✅ [${displayName}] 执行完成${detailSuffix}\n\n`,
               requestBody.model
