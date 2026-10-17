@@ -2461,6 +2461,8 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       let assistantContent = "";
       let hasToolCalls = false;
       let roundFinishReason = null;
+      let pendingContentLines = [];
+      let isDirectStreamingContent = false;
 
       try {
         while (true) {
@@ -2508,22 +2510,41 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
                 }
               }
 
-              if (delta?.content) {
-                assistantContent += delta.content;
-                if (!clientResponse.destroyed && !abortSignal?.aborted) {
-                  if (isTruncatedFinishReason(reason)) {
-                    const sanitized = {
-                      ...parsed,
-                      choices: choice ? [{ ...choice, finish_reason: null, finishReason: null }] : []
-                    };
-                    clientResponse.write(`data: ${JSON.stringify(sanitized)}\n\n`);
-                  } else {
-                    clientResponse.write(`${line}\n\n`);
-                  }
-                }
-              } else if (delta?.reasoning_content) {
+              if (delta?.reasoning_content) {
                 if (!clientResponse.destroyed && !abortSignal?.aborted) {
                   clientResponse.write(`${line}\n\n`);
+                }
+              } else if (delta?.content) {
+                assistantContent += delta.content;
+                if (!clientResponse.destroyed && !abortSignal?.aborted) {
+                  if (isDirectStreamingContent) {
+                    if (isTruncatedFinishReason(reason)) {
+                      const sanitized = {
+                        ...parsed,
+                        choices: choice ? [{ ...choice, finish_reason: null, finishReason: null }] : []
+                      };
+                      clientResponse.write(`data: ${JSON.stringify(sanitized)}\n\n`);
+                    } else {
+                      clientResponse.write(`${line}\n\n`);
+                    }
+                  } else if (!hasToolCalls) {
+                    pendingContentLines.push({ line, reason, parsed, choice });
+                    if (assistantContent.length > 120) {
+                      isDirectStreamingContent = true;
+                      for (const p of pendingContentLines) {
+                        if (isTruncatedFinishReason(p.reason)) {
+                          const sanitized = {
+                            ...p.parsed,
+                            choices: p.choice ? [{ ...p.choice, finish_reason: null, finishReason: null }] : []
+                          };
+                          clientResponse.write(`data: ${JSON.stringify(sanitized)}\n\n`);
+                        } else {
+                          clientResponse.write(`${p.line}\n\n`);
+                        }
+                      }
+                      pendingContentLines = [];
+                    }
+                  }
                 }
               }
             } catch {}
@@ -2552,6 +2573,21 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       });
 
       if (mcpCalls.length === 0) {
+        if (!isDirectStreamingContent && pendingContentLines.length > 0 && !clientResponse.destroyed && !abortSignal?.aborted) {
+          for (const p of pendingContentLines) {
+            if (isTruncatedFinishReason(p.reason)) {
+              const sanitized = {
+                ...p.parsed,
+                choices: p.choice ? [{ ...p.choice, finish_reason: null, finishReason: null }] : []
+              };
+              clientResponse.write(`data: ${JSON.stringify(sanitized)}\n\n`);
+            } else {
+              clientResponse.write(`${p.line}\n\n`);
+            }
+          }
+          pendingContentLines = [];
+        }
+
         if (isTruncatedFinishReason(roundFinishReason) && assistantContent && !abortSignal?.aborted && !clientResponse.destroyed) {
           addDebugLog("AGENT", `⚠️ [抗截断触发] MCP 调度检测到截断 (${roundFinishReason})！正在自动进行无感断点续接...`, {
             round: round + 1,
