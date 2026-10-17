@@ -864,56 +864,7 @@ function formatCardMarkdown(text) {
     .replace(/([^\n\r])\s*(检索内容[：:])/g, "$1\n$2");
 }
 
-function createStreamContentFilter(onEmit) {
-  let buffer = "";
-  const blockedPatterns = [
-    /<system-reminder>[\s\S]*?<\/system-reminder>/gi,
-    /<system-reminder>[\s\S]*/gi,
-    /【工具调用透明化与高效并行规范】[\s\S]*?(?:终局轮次严禁输出操作卡片。|严禁输出上述卡片。|$)/g,
-    /【Cloudflare 工具执行规范】[\s\S]*?(?:严禁跨平台跑到 GitHub 检索无关个人或仓库。|$)/g,
-    /【执行规范】[\s\S]*?(?:避免多轮无效探索。|$)/g
-  ];
 
-  return {
-    push(chunk) {
-      if (!chunk) return;
-      buffer += chunk;
-
-      const potentialPrefixes = ["<system-reminder", "</system-reminder", "<system", "<", "【工具", "【Cloudflare", "【执行"];
-      let holdbackLen = 0;
-      for (const prefix of potentialPrefixes) {
-        for (let i = 1; i <= prefix.length; i++) {
-          const sub = prefix.slice(0, i);
-          if (buffer.endsWith(sub)) {
-            holdbackLen = Math.max(holdbackLen, sub.length);
-          }
-        }
-      }
-
-      for (const pat of blockedPatterns) {
-        buffer = buffer.replace(pat, "");
-      }
-
-      const safeLen = buffer.length - holdbackLen;
-      if (safeLen > 0) {
-        const toEmit = buffer.slice(0, safeLen);
-        buffer = buffer.slice(safeLen);
-        if (toEmit) {
-          onEmit(formatCardMarkdown(toEmit));
-        }
-      }
-    },
-    flush() {
-      for (const pat of blockedPatterns) {
-        buffer = buffer.replace(pat, "");
-      }
-      if (buffer) {
-        onEmit(formatCardMarkdown(buffer));
-        buffer = "";
-      }
-    }
-  };
-}
 
 function parseTextToolCalls(text, activeTools) {
   if (!text || typeof text !== "string" || !Array.isArray(activeTools) || activeTools.length === 0) {
@@ -1561,10 +1512,6 @@ function sendSSEChunk(clientResponse, delta, model = "default") {
 
 function sendReasoningChunk(clientResponse, text, model = "default") {
   sendSSEChunk(clientResponse, { reasoning_content: text }, model);
-}
-
-function sendProgressNotification(clientResponse, text, model = "default") {
-  sendSSEChunk(clientResponse, { content: text }, model);
 }
 
 function isTruncatedFinishReason(reason) {
@@ -2635,25 +2582,6 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       let hasToolCalls = false;
       let roundFinishReason = null;
 
-      const streamFilter = createStreamContentFilter((safeText) => {
-        if (!clientResponse.destroyed && !abortSignal?.aborted) {
-          const contentChunk = {
-            id: `chatcmpl-${Date.now()}`,
-            object: "chat.completion.chunk",
-            created: Math.floor(Date.now() / 1000),
-            model: requestBody.model || "default",
-            choices: [
-              {
-                index: 0,
-                delta: { content: safeText },
-                finish_reason: null
-              }
-            ]
-          };
-          clientResponse.write(`data: ${JSON.stringify(contentChunk)}\n\n`);
-        }
-      });
-
       try {
         while (true) {
           if (abortSignal?.aborted || clientResponse.destroyed) {
@@ -2702,7 +2630,22 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
 
               if (delta?.content) {
                 assistantContent += delta.content;
-                streamFilter.push(delta.content);
+                if (!clientResponse.destroyed && !abortSignal?.aborted) {
+                  const contentChunk = {
+                    id: parsed.id || `chatcmpl-${Date.now()}`,
+                    object: "chat.completion.chunk",
+                    created: parsed.created || Math.floor(Date.now() / 1000),
+                    model: parsed.model || requestBody.model || "default",
+                    choices: [
+                      {
+                        index: 0,
+                        delta: { content: delta.content },
+                        finish_reason: null
+                      }
+                    ]
+                  };
+                  clientResponse.write(`data: ${JSON.stringify(contentChunk)}\n\n`);
+                }
               }
 
               if (delta?.reasoning_content) {
@@ -2733,8 +2676,6 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         }
         throw err;
       }
-
-      streamFilter.flush();
 
       if (abortSignal?.aborted || clientResponse.destroyed) {
         addDebugLog("DOWNSTREAM", `客户端已断开，终止后续 MCP 处理与续接`);
@@ -2855,9 +2796,9 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
             toolCallHistory.set(callKey, prevAttempts + 1);
 
             if (!abortSignal?.aborted && !clientResponse.destroyed) {
-              sendProgressNotification(
+              sendReasoningChunk(
                 clientResponse,
-                `\n\n> ⏳ 正在调用 [${displayName}] 执行操作: \`${rawAction}\`${detailSuffix}...\n`,
+                `\n> ⏳ 正在调用 [${displayName}] 执行操作: \`${rawAction}\`${detailSuffix}...\n`,
                 requestBody.model
               );
             }
@@ -2865,9 +2806,9 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
             try {
               const onWaitNotice = (waitSec) => {
                 if (!abortSignal?.aborted && !clientResponse.destroyed) {
-                  sendProgressNotification(
+                  sendReasoningChunk(
                     clientResponse,
-                    `> ⏳ 触发访问频控，正在等待 ${waitSec + 1} 秒后自动重试...\n`,
+                    `\n> ⏳ 触发访问频控，正在等待 ${waitSec + 1} 秒后自动重试...\n`,
                     requestBody.model
                   );
                 }
@@ -2897,22 +2838,22 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
 
         if (!abortSignal?.aborted && !clientResponse.destroyed) {
           if (isCacheHit) {
-            sendProgressNotification(
+            sendReasoningChunk(
               clientResponse,
-              `> ⚡ [${displayName}] \`${rawAction}\`${detailSuffix} (复用对话缓存，无需重复读取)\n\n`,
+              `\n> ⚡ [${displayName}] \`${rawAction}\`${detailSuffix} (复用对话缓存)\n`,
               requestBody.model
             );
           } else if (isToolError) {
             const failReason = errorMessage ? `: ${errorMessage}` : "";
-            sendProgressNotification(
+            sendReasoningChunk(
               clientResponse,
-              `> ❌ [${displayName}] 执行失败${detailSuffix}${failReason}\n\n`,
+              `\n> ❌ [${displayName}] 执行失败${detailSuffix}${failReason}\n`,
               requestBody.model
             );
           } else {
-            sendProgressNotification(
+            sendReasoningChunk(
               clientResponse,
-              `> ✅ [${displayName}] 执行完成${detailSuffix}\n\n`,
+              `\n> ✅ [${displayName}] 执行完成${detailSuffix}\n`,
               requestBody.model
             );
           }
