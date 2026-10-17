@@ -1512,6 +1512,10 @@ function sendReasoningChunk(clientResponse, text, model = "default") {
   sendSSEChunk(clientResponse, { reasoning_content: text }, model);
 }
 
+function sendProgressNotification(clientResponse, text, model = "default") {
+  sendSSEChunk(clientResponse, { content: text }, model);
+}
+
 function isTruncatedFinishReason(reason) {
   if (!reason || typeof reason !== "string") return false;
   const r = reason.toLowerCase().trim();
