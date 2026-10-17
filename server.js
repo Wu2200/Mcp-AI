@@ -2242,12 +2242,10 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       }
 
       let roundMessages = [...messages];
-      if (round === 0) {
-        roundMessages.push({
-          role: "system",
-          content: "【工具调用透明化指令】在调用任何工具前，思考过程中必须清晰指明目标仓库名称、文件路径、分支或具体检索内容，确保调用过程清晰可追踪。"
-        });
-      }
+      roundMessages.push({
+        role: "system",
+        content: "【工具调用透明化规范】\n1. 在需要调用工具的轮次，正文必须且仅输出如下格式的三行操作卡片（不要输出多余的废话、解释或开场白）：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n2. 深入的代码分析、逻辑推演等复杂思维过程，在深度思考中进行。\n3. 当所有工具调用完毕、输出最终答复的轮次，直接输出最终解答，严禁输出上述卡片。"
+      });
       const hasCloudflare = tools.some((t) => {
         const n = (t.function?.name || "").toLowerCase();
         return n.includes("cloudflare");
@@ -2508,20 +2506,40 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
 
               if (delta?.content) {
                 assistantContent += delta.content;
-                if (!hasToolCalls && !clientResponse.destroyed && !abortSignal?.aborted) {
-                  if (isTruncatedFinishReason(reason)) {
-                    const sanitized = {
-                      ...parsed,
-                      choices: choice ? [{ ...choice, finish_reason: null, finishReason: null }] : []
-                    };
-                    clientResponse.write(`data: ${JSON.stringify(sanitized)}\n\n`);
-                  } else {
-                    clientResponse.write(`${line}\n\n`);
-                  }
-                }
-              } else if (delta?.reasoning_content) {
                 if (!clientResponse.destroyed && !abortSignal?.aborted) {
-                  clientResponse.write(`${line}\n\n`);
+                  const contentChunk = {
+                    id: parsed.id || `chatcmpl-${Date.now()}`,
+                    object: "chat.completion.chunk",
+                    created: parsed.created || Math.floor(Date.now() / 1000),
+                    model: parsed.model || requestBody.model || "default",
+                    choices: [
+                      {
+                        index: 0,
+                        delta: { content: delta.content },
+                        finish_reason: null
+                      }
+                    ]
+                  };
+                  clientResponse.write(`data: ${JSON.stringify(contentChunk)}\n\n`);
+                }
+              }
+
+              if (delta?.reasoning_content) {
+                if (!clientResponse.destroyed && !abortSignal?.aborted) {
+                  const reasoningChunk = {
+                    id: parsed.id || `chatcmpl-${Date.now()}`,
+                    object: "chat.completion.chunk",
+                    created: parsed.created || Math.floor(Date.now() / 1000),
+                    model: parsed.model || requestBody.model || "default",
+                    choices: [
+                      {
+                        index: 0,
+                        delta: { reasoning_content: delta.reasoning_content },
+                        finish_reason: null
+                      }
+                    ]
+                  };
+                  clientResponse.write(`data: ${JSON.stringify(reasoningChunk)}\n\n`);
                 }
               }
             } catch {}
