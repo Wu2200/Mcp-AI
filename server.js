@@ -2248,7 +2248,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       let roundMessages = [...messages];
       roundMessages.push({
         role: "system",
-        content: "【工具调用透明化规范】\n在发起任何工具调用前，严禁将调用说明写入思考过程（thinking/reasoning_content）中！你必须在当前轮次的正文内容（content）中直接输出简短明确的说明，确保在界面正文气泡中直观展示：\n**目标说明**：[简要说明调用目标]\n**调用工具**：`[调用的工具名称]`\n**检索内容**：[目标仓库、文件路径、参数或检索摘要]\n\n输出完上述内容后再执行工具调用。"
+        content: "【思考与进度展示分离规范】\n1. 保持深度思考：所有对代码的审查、排查推导、逻辑分析以及修改/查询规划，必须在深度思考（thinking/reasoning）过程中完整进行。\n2. 正文仅提炼三行进度卡片：在发起工具调用时，正文中不要输出大篇幅分析，仅且必须单独输出以下三行结构化卡片（输出后立即触发工具调用）：\n**目标说明**：[简明扼要说明本次操作目的]\n**调用工具**：`[调用的工具名称]`\n**检索内容**：[目标仓库、文件路径、关键参数或操作摘要]"
       });
       const hasCloudflare = tools.some((t) => {
         const n = (t.function?.name || "").toLowerCase();
