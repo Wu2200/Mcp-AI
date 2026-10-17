@@ -2248,7 +2248,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       let roundMessages = [...messages];
       roundMessages.push({
         role: "system",
-        content: "【工具调用与思考规范】\n1. 所有工具调用的规划、参数确认、排查分析及反思，全部在深度思考（thinking/reasoning）中进行。\n2. 在发起工具调用期间，严禁在正文（content）中输出任何目标说明、进度卡片或半成品标题，严禁在正文中提前打字导致前端界面卡顿等待。\n3. 当全部工具调用完成、拿到完整结果后，再在正文（content）中一次性、连贯地输出最终的完整答复。"
+        content: "【工具调用进度卡片规范】\n1. 代码分析、报错排查和参数推导等复杂思维过程，在深度思考中进行。\n2. 在发起工具调用的轮次，必须在正文中输出简明进度卡片（严格遵循以下格式，末尾带分割线，不输出多余废话）：\n**目标说明**：[简明扼要说明本次操作目的]\n**调用工具**：`[工具名称]`\n**检索内容**：[目标仓库、文件路径或关键参数]\n\n---\n\n3. 当所有工具调用完成、不再调用工具时，直接在正文中输出最终完整答复，不输出卡片。"
       });
       const hasCloudflare = tools.some((t) => {
         const n = (t.function?.name || "").toLowerCase();
