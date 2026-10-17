@@ -2248,7 +2248,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       let roundMessages = [...messages];
       roundMessages.push({
         role: "system",
-        content: "【思考与进度展示分离规范】\n1. 保持深度思考：代码审查、排查推导、逻辑分析以及修改/查询规划，必须在深度思考（thinking/reasoning）中完整进行。\n2. 正文仅提炼结构化进度卡片：在决定发起工具调用时，正文严禁输出大篇幅分析，只输出简明卡片。\n- 若单次调用多个工具，每个工具必须单独输出一张卡片；\n- 每张卡片末尾必须严格换行并附带分割线 `\\n\\n---\\n\\n`，严禁多张卡片紧贴粘连！\n卡片格式严格如下：\n**目标说明**：[简明扼要说明本次操作目的]\n**调用工具**：`[调用的工具名称]`\n**检索内容**：[目标仓库、文件路径、关键参数或操作摘要]\n\n---\n\n3. 最终交付：当所有工具调用完成、不需要再调工具时，正文直接输出最终完整的回答或分析报告。"
+        content: "【工具调用与思考规范】\n1. 所有工具调用的规划、参数确认、排查分析及反思，全部在深度思考（thinking/reasoning）中进行。\n2. 在发起工具调用期间，严禁在正文（content）中输出任何目标说明、进度卡片或半成品标题，严禁在正文中提前打字导致前端界面卡顿等待。\n3. 当全部工具调用完成、拿到完整结果后，再在正文（content）中一次性、连贯地输出最终的完整答复。"
       });
       const hasCloudflare = tools.some((t) => {
         const n = (t.function?.name || "").toLowerCase();
