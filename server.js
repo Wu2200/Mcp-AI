@@ -856,6 +856,75 @@ function extractFileContentAndSha(mcpRes) {
   return { fileContent, fileSha };
 }
 
+function formatCardMarkdown(text) {
+  if (!text || typeof text !== "string") return text;
+  return text
+    .replace(/([^\n\r])\s*(目标说明[：:])/g, "$1\n\n$2")
+    .replace(/([^\n\r])\s*(调用工具[：:])/g, "$1\n$2")
+    .replace(/([^\n\r])\s*(检索内容[：:])/g, "$1\n$2");
+}
+
+function parseTextToolCalls(text, activeTools) {
+  if (!text || typeof text !== "string" || !Array.isArray(activeTools) || activeTools.length === 0) {
+    return [];
+  }
+  const cleanText = formatCardMarkdown(text);
+  const regex = /目标说明[：:]\s*([^\n\r]*)\r?\n+调用工具[：:]\s*`?([a-zA-Z0-9_\-]+)`?\r?\n+检索内容[：:]\s*`?([\s\S]*?)`?(?=(?:\r?\n\s*目标说明[：:]|\r?\n\s*调用工具[：:]|$))/g;
+  const calls = [];
+  let match;
+
+  while ((match = regex.exec(cleanText)) !== null) {
+    const rawToolName = match[2].trim();
+    let contentArg = match[3].trim().replace(/^`+|`+$/g, "").trim();
+
+    const matchedTool = activeTools.find((t) => {
+      const name = t.function?.name || "";
+      return name === rawToolName || name.endsWith(`_${rawToolName}`) || rawToolName.endsWith(name);
+    });
+
+    if (!matchedTool) continue;
+    const finalToolName = matchedTool.function.name;
+    const paramsSchema = matchedTool.function.parameters?.properties || {};
+
+    let parsedArgs = {};
+    if (contentArg.startsWith("{") && contentArg.endsWith("}")) {
+      try {
+        parsedArgs = JSON.parse(contentArg);
+      } catch {}
+    }
+
+    if (Object.keys(parsedArgs).length === 0 && contentArg.includes(":")) {
+      const kvMatches = contentArg.matchAll(/([a-zA-Z0-9_]+)\s*[:：]\s*([^,\n]+)/g);
+      for (const m of kvMatches) {
+        const k = m[1].trim();
+        const v = m[2].trim();
+        if (paramsSchema[k]) {
+          parsedArgs[k] = v;
+        }
+      }
+    }
+
+    if (Object.keys(parsedArgs).length === 0) {
+      if (paramsSchema.query) parsedArgs.query = contentArg;
+      else if (paramsSchema.q) parsedArgs.q = contentArg;
+      else if (paramsSchema.path) parsedArgs.path = contentArg;
+      else if (paramsSchema.files) parsedArgs.files = [contentArg];
+      else {
+        const firstProp = Object.keys(paramsSchema)[0];
+        if (firstProp) parsedArgs[firstProp] = contentArg;
+      }
+    }
+
+    calls.push({
+      id: `call_text_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      name: finalToolName,
+      arguments: JSON.stringify(parsedArgs)
+    });
+  }
+
+  return calls;
+}
+
 function applyStringReplacements(content, edits, filePath = "") {
   let updated = content;
   for (let i = 0; i < edits.length; i += 1) {
@@ -1808,7 +1877,7 @@ function convertOpenAiChunkToGemini(parsedChunk) {
 
   if (delta?.content) {
     parts.push({
-      text: delta.content
+      text: formatCardMarkdown(delta.content)
     });
   }
 
@@ -2259,7 +2328,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       let roundMessages = [...messages];
       roundMessages.push({
         role: "system",
-        content: "【工具调用透明化与高效并行规范】\n1. 高效并行调用：当需要查阅多个文件、检索多个不同关键词或执行多个无相互依赖的操作时，必须在单轮响应中一次性发起所有工具调用进行并发执行，严禁拆分成多轮逐个调用。\n2. 在需要调用工具的轮次，正文必须且仅输出如下格式的操作卡片（不要输出多余的废话、解释或开场白，若单轮并发调用多个工具可连续输出）：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n3. 深入的代码分析、逻辑推演等复杂思维过程，在深度思考中进行。\n4. 当所有工具调用完毕、输出最终答复的轮次，直接输出最终解答，严禁输出上述卡片。"
+        content: "【工具调用透明化与高效并行规范】\n1. 高效并行调用：当需要查阅多个文件、检索多个不同关键词或执行多个无相互依赖的操作时，必须在单轮响应中一次性发起所有工具调用进行并发执行，严禁拆分成多轮逐个调用。\n2. 在需要调用工具的轮次，正文必须且仅输出如下格式的操作卡片（不要输出多余的废话、解释或开场白）。若单轮并发调用多个工具，每个操作卡片之间必须使用双换行（\\n\\n）空行彻底分隔，严禁单行连续粘连：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n3. 核心执行约束：输出上述操作卡片的同时，必须同时发起真实的底层工具调用（Tool Calls），严禁仅在正文中打印卡片文本而不发起工具调用！\n4. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n5. 当所有工具调用完毕、输出最终答复的轮次，直接输出最终解答，严禁输出上述卡片。"
       });
       const hasCloudflare = tools.some((t) => {
         const n = (t.function?.name || "").toLowerCase();
@@ -2364,7 +2433,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         const toolCalls = message?.tool_calls || [];
         finalFinishReason = extractFinishReason(json);
 
-        const mcpCalls = toolCalls.filter((tc) => {
+        let mcpCalls = toolCalls.filter((tc) => {
           if (!tc || !tc.function?.name) return false;
           const name = tc.function.name;
           if (mcpToolRegistry.has(name)) return true;
@@ -2373,6 +2442,18 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
           }
           return false;
         });
+
+        if (mcpCalls.length === 0 && activeTools.length > 0 && message?.content) {
+          const textCalls = parseTextToolCalls(message.content, activeTools);
+          if (textCalls.length > 0) {
+            addDebugLog("AGENT", `[自愈触发] 非流式检测到模型输出了 ${textCalls.length} 个操作卡片，自动转化为真实 MCP 调用`);
+            mcpCalls = textCalls.map((tc) => ({
+              id: tc.id,
+              type: "function",
+              function: { name: tc.name, arguments: tc.arguments }
+            }));
+          }
+        }
 
         if (mcpCalls.length === 0) {
           addDebugLog("AGENT", `第 ${round + 1} 轮完成 - 非流式响应返回客户端 (累计执行工具 ${executedToolCount} 次)`, {
@@ -2536,6 +2617,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
               if (delta?.content) {
                 assistantContent += delta.content;
                 if (!clientResponse.destroyed && !abortSignal?.aborted) {
+                  const safeContent = formatCardMarkdown(delta.content);
                   const contentChunk = {
                     id: parsed.id || `chatcmpl-${Date.now()}`,
                     object: "chat.completion.chunk",
@@ -2544,7 +2626,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
                     choices: [
                       {
                         index: 0,
-                        delta: { content: delta.content },
+                        delta: { content: safeContent },
                         finish_reason: null
                       }
                     ]
@@ -2587,7 +2669,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         break;
       }
 
-      const mcpCalls = accumulatedToolCalls.filter((tc) => {
+      let mcpCalls = accumulatedToolCalls.filter((tc) => {
         if (!tc || !tc.name) return false;
         if (mcpToolRegistry.has(tc.name)) return true;
         for (const [k, v] of mcpToolRegistry.entries()) {
@@ -2595,6 +2677,14 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         }
         return false;
       });
+
+      if (mcpCalls.length === 0 && activeTools.length > 0 && assistantContent) {
+        const textCalls = parseTextToolCalls(assistantContent, activeTools);
+        if (textCalls.length > 0) {
+          addDebugLog("AGENT", `[自愈触发] 流式检测到模型仅输出了 ${textCalls.length} 个操作卡片而未触发原生 tool_calls，自动转化为真实 MCP 调用`);
+          mcpCalls = textCalls;
+        }
+      }
 
       if (mcpCalls.length === 0) {
         if (isTruncatedFinishReason(roundFinishReason) && assistantContent && !abortSignal?.aborted && !clientResponse.destroyed) {
