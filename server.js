@@ -1304,6 +1304,21 @@ function toolArguments(toolCall) {
   }
 }
 
+async function executeConcurrentPool(items, concurrency, workerFn) {
+  if (!Array.isArray(items) || items.length === 0) return [];
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const poolSize = Math.min(concurrency, items.length);
+  const workers = Array.from({ length: poolSize }, async () => {
+    while (nextIndex < items.length) {
+      const idx = nextIndex++;
+      results[idx] = await workerFn(items[idx], idx);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 function formatToolCallDetails(args) {
   if (!args || typeof args !== "object") return "";
   const parts = [];
@@ -2244,7 +2259,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       let roundMessages = [...messages];
       roundMessages.push({
         role: "system",
-        content: "【工具调用透明化规范】\n1. 在需要调用工具的轮次，正文必须且仅输出如下格式的三行操作卡片（不要输出多余的废话、解释或开场白）：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n2. 深入的代码分析、逻辑推演等复杂思维过程，在深度思考中进行。\n3. 当所有工具调用完毕、输出最终答复的轮次，直接输出最终解答，严禁输出上述卡片。"
+        content: "【工具调用透明化与高效并行规范】\n1. 高效并行调用：当需要查阅多个文件、检索多个不同关键词或执行多个无相互依赖的操作时，必须在单轮响应中一次性发起所有工具调用进行并发执行，严禁拆分成多轮逐个调用。\n2. 在需要调用工具的轮次，正文必须且仅输出如下格式的操作卡片（不要输出多余的废话、解释或开场白，若单轮并发调用多个工具可连续输出）：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n3. 深入的代码分析、逻辑推演等复杂思维过程，在深度思考中进行。\n4. 当所有工具调用完毕、输出最终答复的轮次，直接输出最终解答，严禁输出上述卡片。"
       });
       const hasCloudflare = tools.some((t) => {
         const n = (t.function?.name || "").toLowerCase();
@@ -2371,11 +2386,17 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         messages.push(message);
 
         let roundHasFailure = false;
-        for (let i = 0; i < mcpCalls.length; i += 1) {
-          const tc = mcpCalls[i];
-          if (abortSignal?.aborted || clientResponse.destroyed) break;
-          if (i > 0) {
-            await new Promise((resolve) => setTimeout(resolve, 300));
+        const CONCURRENCY_LIMIT = 4;
+        const callResults = await executeConcurrentPool(mcpCalls, CONCURRENCY_LIMIT, async (tc, index) => {
+          if (abortSignal?.aborted || clientResponse.destroyed) {
+            return {
+              tool_call_id: tc.id,
+              content: JSON.stringify({ error: "Client aborted" }),
+              isToolError: true
+            };
+          }
+          if (index > 0 && mcpCalls.length > 1) {
+            await new Promise((resolve) => setTimeout(resolve, Math.min(index * 60, 300)));
           }
           let toolInfo = mcpToolRegistry.get(tc.function.name);
           if (!toolInfo) {
@@ -2432,13 +2453,21 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
               }
             }
           }
-          if (isToolError) {
+          return {
+            tool_call_id: tc.id,
+            content: resultText,
+            isToolError
+          };
+        });
+
+        for (const res of callResults) {
+          if (res.isToolError) {
             roundHasFailure = true;
           }
           messages.push({
             role: "tool",
-            tool_call_id: tc.id,
-            content: resultText
+            tool_call_id: res.tool_call_id,
+            content: res.content
           });
         }
 
@@ -2602,11 +2631,17 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       });
 
       let roundHasFailure = false;
-      for (let i = 0; i < mcpCalls.length; i += 1) {
-        const tc = mcpCalls[i];
-        if (abortSignal?.aborted || clientResponse.destroyed) break;
-        if (i > 0) {
-          await new Promise((resolve) => setTimeout(resolve, 300));
+      const CONCURRENCY_LIMIT = 4;
+      const callResults = await executeConcurrentPool(mcpCalls, CONCURRENCY_LIMIT, async (tc, index) => {
+        if (abortSignal?.aborted || clientResponse.destroyed) {
+          return {
+            tool_call_id: tc.id || `call_${crypto.randomUUID()}`,
+            content: JSON.stringify({ error: "Client aborted" }),
+            isToolError: true
+          };
+        }
+        if (index > 0 && mcpCalls.length > 1) {
+          await new Promise((resolve) => setTimeout(resolve, Math.min(index * 60, 300)));
         }
 
         let toolInfo = mcpToolRegistry.get(tc.name);
@@ -2670,7 +2705,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
                 if (!abortSignal?.aborted && !clientResponse.destroyed) {
                   sendReasoningChunk(
                     clientResponse,
-                    `> ⏳ 触发 GitHub 访问频控，正在等待 ${waitSec + 1} 秒后自动重试...\n`,
+                    `> ⏳ 触发访问频控，正在等待 ${waitSec + 1} 秒后自动重试...\n`,
                     requestBody.model
                   );
                 }
@@ -2698,10 +2733,6 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
           }
         }
 
-        if (isToolError) {
-          roundHasFailure = true;
-        }
-
         if (!abortSignal?.aborted && !clientResponse.destroyed) {
           if (isCacheHit) {
             sendReasoningChunk(
@@ -2725,10 +2756,21 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
           }
         }
 
+        return {
+          tool_call_id: tc.id || `call_${crypto.randomUUID()}`,
+          content: resultText,
+          isToolError
+        };
+      });
+
+      for (const res of callResults) {
+        if (res.isToolError) {
+          roundHasFailure = true;
+        }
         messages.push({
           role: "tool",
-          tool_call_id: tc.id || `call_${crypto.randomUUID()}`,
-          content: resultText
+          tool_call_id: res.tool_call_id,
+          content: res.content
         });
       }
 
