@@ -2641,20 +2641,12 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
           } else {
             toolCallHistory.set(callKey, prevAttempts + 1);
 
-            if (!abortSignal?.aborted && !clientResponse.destroyed) {
-              sendContentChunk(
-                clientResponse,
-                `\n> ⏳ 正在调用 [${displayName}] 执行操作: \`${rawAction}\`${detailSuffix}...\n`,
-                requestBody.model
-              );
-            }
-
             try {
               const onWaitNotice = (waitSec) => {
                 if (!abortSignal?.aborted && !clientResponse.destroyed) {
                   sendContentChunk(
                     clientResponse,
-                    `> ⏳ 触发 GitHub 访问频控，正在等待 ${waitSec + 1} 秒后自动重试...\n`,
+                    `\n> ⏳ 触发接口访问频控，正在等待 ${waitSec + 1} 秒后自动重试...\n`,
                     requestBody.model
                   );
                 }
@@ -2684,26 +2676,11 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
 
         if (isToolError) {
           roundHasFailure = true;
-        }
-
-        if (!abortSignal?.aborted && !clientResponse.destroyed) {
-          if (isCacheHit) {
-            sendContentChunk(
-              clientResponse,
-              `\n> ⚡ [${displayName}] \`${rawAction}\`${detailSuffix} (复用对话缓存，无需重复读取)\n\n`,
-              requestBody.model
-            );
-          } else if (isToolError) {
+          if (!abortSignal?.aborted && !clientResponse.destroyed) {
             const failReason = errorMessage ? `: ${errorMessage}` : "";
             sendContentChunk(
               clientResponse,
-              `> ❌ [${displayName}] 执行失败${detailSuffix}${failReason}\n\n`,
-              requestBody.model
-            );
-          } else {
-            sendContentChunk(
-              clientResponse,
-              `> ✅ [${displayName}] 执行完成${detailSuffix}\n\n`,
+              `\n> ❌ [${displayName}] 执行失败${detailSuffix}${failReason}\n\n`,
               requestBody.model
             );
           }
