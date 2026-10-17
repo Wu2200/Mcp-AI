@@ -1794,15 +1794,29 @@ function convertGeminiToOpenAIMessages(body) {
   return messages;
 }
 
+function isFakeToolCallContent(text) {
+  if (!text || typeof text !== "string") return false;
+  const hasCardPattern = /(?:目标说明|调用工具|检索内容)[:：]/i.test(text);
+  const hasToolName =
+    text.includes("github_") ||
+    text.includes("cloudflare_") ||
+    text.includes("contest7_") ||
+    text.includes("get_file_contents") ||
+    text.includes("search_code") ||
+    text.includes("edit_file");
+  return hasCardPattern && (hasToolName || text.length < 600);
+}
+
 function convertOpenAiChunkToGemini(parsedChunk) {
   const choice = parsedChunk.choices?.[0];
   const delta = choice?.delta;
   const parts = [];
 
-  if (delta?.reasoning_content) {
+  const reasoningText = delta?.reasoning_content || delta?.reasoning || delta?.thought;
+  if (reasoningText) {
     parts.push({
       thought: true,
-      text: delta.reasoning_content
+      text: reasoningText
     });
   }
 
@@ -2259,7 +2273,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       let roundMessages = [...messages];
       roundMessages.push({
         role: "system",
-        content: "【工具调用透明化与高效并行规范】\n1. 高效并行调用：当需要查阅多个文件、检索多个不同关键词或执行多个无相互依赖的操作时，必须在单轮响应中一次性发起所有工具调用进行并发执行，严禁拆分成多轮逐个调用。\n2. 在需要调用工具的轮次，正文必须且仅输出如下格式的操作卡片（不要输出多余的废话、解释或开场白，若单轮并发调用多个工具可连续输出）：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n3. 深入的代码分析、逻辑推演等复杂思维过程，在深度思考中进行。\n4. 当所有工具调用完毕、输出最终答复的轮次，直接输出最终解答，严禁输出上述卡片。"
+        content: "【工具调用执行规范】\n1. 真实工具调用：若需要查阅代码、读取文件、检索仓库或执行任何外部操作，必须直接通过标准的 function/tool calling 机制发起真正的工具调用，严禁在正文中使用纯文本手写卡片（如“目标说明/调用工具/检索内容”）伪装调用。\n2. 高效并发：若需查阅多个文件或检索多个关键词，必须在单轮响应中一次性发起所有工具调用并发执行，严禁拆分成多轮逐个调用。\n3. 正文交付：正文必须直接面向用户输出有价值的实质性分析、解答或完整代码。当工具调用完毕输出最终回答时，必须给出具体排查结论与解答，严禁仅输出卡片或空内容。\n4. 深入的代码分析、排查推演等复杂思维过程在深度思考中进行。"
       });
       const hasCloudflare = tools.some((t) => {
         const n = (t.function?.name || "").toLowerCase();
@@ -2375,9 +2389,23 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         });
 
         if (mcpCalls.length === 0) {
-          addDebugLog("AGENT", `第 ${round + 1} 轮完成 - 非流式响应返回客户端 (累计执行工具 ${executedToolCount} 次)`, {
+          const content = message?.content || "";
+          if (isFakeToolCallContent(content) && round < 3) {
+            addDebugLog("AGENT", `⚠️ [非流式伪调用拦截自愈] 检测到模型在正文输出了工具卡片但未发起 tool_calls，正在自动纠偏重试...`, {
+              round: round + 1,
+              preview: content.slice(0, 300)
+            });
+            messages.push(message);
+            messages.push({
+              role: "system",
+              content: "【系统严重警告与纠偏】检测到你刚才仅在正文中输出了卡片文本，但并未实际通过工具调用接口（function calling）发起真实调用！你当前的回答是不完整的。如果你需要查阅代码或文件，必须立即通过 tool_calls 发起真实调用；如果你无需调用工具，请立即在正文中给出详细的实质性分析和完整解答，严禁仅输出卡片！"
+            });
+            continue;
+          }
+
+          addDebugLog("AGENT", `第 ${round + 1} 轮完成 - 非流式响应返回客户端 (累计执行工具 ${executedToolCount} 次, 正文字数: ${content.length})`, {
             finishReason: finalFinishReason,
-            contentLength: message?.content?.length || 0
+            contentLength: content.length
           });
           sendJson(clientResponse, 200, json);
           return;
@@ -2484,6 +2512,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       let buffer = "";
       let accumulatedToolCalls = [];
       let assistantContent = "";
+      let accumulatedReasoning = "";
       let hasToolCalls = false;
       let roundFinishReason = null;
 
@@ -2553,7 +2582,9 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
                 }
               }
 
-              if (delta?.reasoning_content) {
+              const deltaReasoning = delta?.reasoning_content || delta?.reasoning || delta?.thought;
+              if (deltaReasoning) {
+                accumulatedReasoning += deltaReasoning;
                 if (!clientResponse.destroyed && !abortSignal?.aborted) {
                   const reasoningChunk = {
                     id: parsed.id || `chatcmpl-${Date.now()}`,
@@ -2563,7 +2594,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
                     choices: [
                       {
                         index: 0,
-                        delta: { reasoning_content: delta.reasoning_content },
+                        delta: { reasoning_content: deltaReasoning },
                         finish_reason: null
                       }
                     ]
@@ -2608,14 +2639,36 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
           continue;
         }
 
+        if (isFakeToolCallContent(assistantContent) && round < 3 && !abortSignal?.aborted && !clientResponse.destroyed) {
+          addDebugLog("AGENT", `⚠️ [流式伪调用拦截自愈] 检测到模型在正文输出了工具卡片但未发起 tool_calls，正在自动纠偏重试...`, {
+            round: round + 1,
+            preview: assistantContent.slice(0, 300)
+          });
+          messages.push({ role: "assistant", content: assistantContent });
+          messages.push({
+            role: "system",
+            content: "【系统严重警告与纠偏】检测到你刚才仅在正文中输出了卡片文本，但并未实际通过工具调用接口（function calling）发起真实调用！你当前的回答是不完整的。如果你需要查阅代码或文件，必须立即通过 tool_calls 发起真实调用；如果你无需调用工具，请立即在正文中给出详细的实质性分析和完整解答，严禁仅输出卡片！"
+          });
+          continue;
+        }
+
+        if (!assistantContent.trim() && !abortSignal?.aborted && !clientResponse.destroyed) {
+          const fallbackText = accumulatedReasoning.trim()
+            ? "\n\n*(提示：模型本轮未输出独立正文，推演与排查细节已包含在上方深度思考中)*"
+            : "\n\n⚠️ 模型未返回有效解答（可能因提问包含敏感词触发了上游安全审查过滤或输入截断），请调整提问后重试。";
+          sendSSEChunk(clientResponse, { content: fallbackText }, requestBody.model);
+        }
+
         if (!abortSignal?.aborted && !clientResponse.destroyed) {
           clientResponse.write("data: [DONE]\n\n");
           clientResponse.end();
         }
-        addDebugLog("AGENT", `第 ${round + 1} 轮流式完成输出 - 结束原因: ${roundFinishReason || "stop"} (累计执行工具 ${executedToolCount} 次)`, {
+        addDebugLog("AGENT", `第 ${round + 1} 轮流式完成输出 - 结束原因: ${roundFinishReason || "stop"} (累计执行工具 ${executedToolCount} 次, 正文字数: ${assistantContent.length}, 思考字数: ${accumulatedReasoning.length})`, {
           round: round + 1,
           finishReason: roundFinishReason,
-          totalRounds: round + 1
+          totalRounds: round + 1,
+          contentLength: assistantContent.length,
+          reasoningLength: accumulatedReasoning.length
         });
         return;
       }
