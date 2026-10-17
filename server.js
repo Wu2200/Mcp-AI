@@ -1428,10 +1428,6 @@ function sendReasoningChunk(clientResponse, text, model = "default") {
   sendSSEChunk(clientResponse, { reasoning_content: text }, model);
 }
 
-function sendContentChunk(clientResponse, text, model = "default") {
-  sendSSEChunk(clientResponse, { content: text }, model);
-}
-
 function isTruncatedFinishReason(reason) {
   if (!reason || typeof reason !== "string") return false;
   const r = reason.toLowerCase().trim();
@@ -2246,10 +2242,12 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       }
 
       let roundMessages = [...messages];
-      roundMessages.push({
-        role: "system",
-        content: "【工具调用进度卡片规范】\n1. 代码分析、报错排查和参数推导等复杂思维过程，在深度思考中进行。\n2. 在发起工具调用的轮次，必须在正文中输出简明进度卡片（严格遵循以下格式，末尾带分割线，不输出多余废话）：\n**目标说明**：[简明扼要说明本次操作目的]\n**调用工具**：`[工具名称]`\n**检索内容**：[目标仓库、文件路径或关键参数]\n\n---\n\n3. 当所有工具调用完成、不再调用工具时，直接在正文中输出最终完整答复，不输出卡片。"
-      });
+      if (round === 0) {
+        roundMessages.push({
+          role: "system",
+          content: "【工具调用透明化指令】在调用任何工具前，思考过程中必须清晰指明目标仓库名称、文件路径、分支或具体检索内容，确保调用过程清晰可追踪。"
+        });
+      }
       const hasCloudflare = tools.some((t) => {
         const n = (t.function?.name || "").toLowerCase();
         return n.includes("cloudflare");
@@ -2461,8 +2459,6 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       let assistantContent = "";
       let hasToolCalls = false;
       let roundFinishReason = null;
-      let pendingContentLines = [];
-      let isDirectStreamingContent = false;
 
       try {
         while (true) {
@@ -2510,41 +2506,22 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
                 }
               }
 
-              if (delta?.reasoning_content) {
+              if (delta?.content) {
+                assistantContent += delta.content;
+                if (!hasToolCalls && !clientResponse.destroyed && !abortSignal?.aborted) {
+                  if (isTruncatedFinishReason(reason)) {
+                    const sanitized = {
+                      ...parsed,
+                      choices: choice ? [{ ...choice, finish_reason: null, finishReason: null }] : []
+                    };
+                    clientResponse.write(`data: ${JSON.stringify(sanitized)}\n\n`);
+                  } else {
+                    clientResponse.write(`${line}\n\n`);
+                  }
+                }
+              } else if (delta?.reasoning_content) {
                 if (!clientResponse.destroyed && !abortSignal?.aborted) {
                   clientResponse.write(`${line}\n\n`);
-                }
-              } else if (delta?.content) {
-                assistantContent += delta.content;
-                if (!clientResponse.destroyed && !abortSignal?.aborted) {
-                  if (isDirectStreamingContent) {
-                    if (isTruncatedFinishReason(reason)) {
-                      const sanitized = {
-                        ...parsed,
-                        choices: choice ? [{ ...choice, finish_reason: null, finishReason: null }] : []
-                      };
-                      clientResponse.write(`data: ${JSON.stringify(sanitized)}\n\n`);
-                    } else {
-                      clientResponse.write(`${line}\n\n`);
-                    }
-                  } else if (!hasToolCalls) {
-                    pendingContentLines.push({ line, reason, parsed, choice });
-                    if (assistantContent.length > 120) {
-                      isDirectStreamingContent = true;
-                      for (const p of pendingContentLines) {
-                        if (isTruncatedFinishReason(p.reason)) {
-                          const sanitized = {
-                            ...p.parsed,
-                            choices: p.choice ? [{ ...p.choice, finish_reason: null, finishReason: null }] : []
-                          };
-                          clientResponse.write(`data: ${JSON.stringify(sanitized)}\n\n`);
-                        } else {
-                          clientResponse.write(`${p.line}\n\n`);
-                        }
-                      }
-                      pendingContentLines = [];
-                    }
-                  }
                 }
               }
             } catch {}
@@ -2573,21 +2550,6 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       });
 
       if (mcpCalls.length === 0) {
-        if (!isDirectStreamingContent && pendingContentLines.length > 0 && !clientResponse.destroyed && !abortSignal?.aborted) {
-          for (const p of pendingContentLines) {
-            if (isTruncatedFinishReason(p.reason)) {
-              const sanitized = {
-                ...p.parsed,
-                choices: p.choice ? [{ ...p.choice, finish_reason: null, finishReason: null }] : []
-              };
-              clientResponse.write(`data: ${JSON.stringify(sanitized)}\n\n`);
-            } else {
-              clientResponse.write(`${p.line}\n\n`);
-            }
-          }
-          pendingContentLines = [];
-        }
-
         if (isTruncatedFinishReason(roundFinishReason) && assistantContent && !abortSignal?.aborted && !clientResponse.destroyed) {
           addDebugLog("AGENT", `⚠️ [抗截断触发] MCP 调度检测到截断 (${roundFinishReason})！正在自动进行无感断点续接...`, {
             round: round + 1,
@@ -2677,12 +2639,20 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
           } else {
             toolCallHistory.set(callKey, prevAttempts + 1);
 
+            if (!abortSignal?.aborted && !clientResponse.destroyed) {
+              sendReasoningChunk(
+                clientResponse,
+                `\n> ⏳ 正在调用 [${displayName}] 执行操作: \`${rawAction}\`${detailSuffix}...\n`,
+                requestBody.model
+              );
+            }
+
             try {
               const onWaitNotice = (waitSec) => {
                 if (!abortSignal?.aborted && !clientResponse.destroyed) {
-                  sendContentChunk(
+                  sendReasoningChunk(
                     clientResponse,
-                    `\n> ⏳ 触发接口访问频控，正在等待 ${waitSec + 1} 秒后自动重试...\n`,
+                    `> ⏳ 触发 GitHub 访问频控，正在等待 ${waitSec + 1} 秒后自动重试...\n`,
                     requestBody.model
                   );
                 }
@@ -2712,11 +2682,26 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
 
         if (isToolError) {
           roundHasFailure = true;
-          if (!abortSignal?.aborted && !clientResponse.destroyed) {
-            const failReason = errorMessage ? `: ${errorMessage}` : "";
-            sendContentChunk(
+        }
+
+        if (!abortSignal?.aborted && !clientResponse.destroyed) {
+          if (isCacheHit) {
+            sendReasoningChunk(
               clientResponse,
-              `\n> ❌ [${displayName}] 执行失败${detailSuffix}${failReason}\n\n`,
+              `\n> ⚡ [${displayName}] \`${rawAction}\`${detailSuffix} (复用对话缓存，无需重复读取)\n\n`,
+              requestBody.model
+            );
+          } else if (isToolError) {
+            const failReason = errorMessage ? `: ${errorMessage}` : "";
+            sendReasoningChunk(
+              clientResponse,
+              `> ❌ [${displayName}] 执行失败${detailSuffix}${failReason}\n\n`,
+              requestBody.model
+            );
+          } else {
+            sendReasoningChunk(
+              clientResponse,
+              `> ✅ [${displayName}] 执行完成${detailSuffix}\n\n`,
               requestBody.model
             );
           }
