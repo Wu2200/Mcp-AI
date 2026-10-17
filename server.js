@@ -1202,6 +1202,13 @@ function detectActionIntent(userText) {
     return { needsTool: false, isWrite: false };
   }
 
+  const isConsultation =
+    /^(?:为什么|为啥|为何|请问|帮我看下为什么|分析|排查原因|查下原因|怎么回事|怎么会|why|how|what)/i.test(text) ||
+    /(?:为什么|为啥|为何|怎么回事|正常吗)[？?\s]*$/i.test(text);
+  if (isConsultation && !/(?:帮我|直接|请|现在).*(?:修改|改一下|修复|更新|写入|提交|替换)/i.test(text)) {
+    return { needsTool: false, isWrite: false };
+  }
+
   const writeVerb = /(修改|修改下|改下|改一下|修一下|修复|更新|更新下|添加|增加|加一个|删除|删掉|重写|创建|新建|写入|覆盖|替换|调整|优化|补齐|同步|把.+改成|提交|推送|commit|push|write|update|create|delete|edit)/i;
   const writeTarget = /(代码|文件|配置|仓库|bug|接口|函数|样式|组件|依赖|项目|分支|插件|脚本|产物|测试|pr|github|readme|dist|\.[a-z0-9]{1,6})/i;
   const isDirectWrite = writeVerb.test(text) && (writeTarget.test(text) || text.length <= 60);
@@ -2216,7 +2223,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
   const dialogReadCache = new Map();
   let hasWriteSuccess = false;
   let consecutiveFailures = 0;
-  const MAX_AGENT_ROUNDS = 60;
+  const MAX_AGENT_ROUNDS = 35;
 
   try {
     for (let round = 0; round < MAX_AGENT_ROUNDS; round += 1) {
@@ -2248,26 +2255,23 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       if (round === 0 && hasCloudflare) {
         roundMessages.push({
           role: "system",
-          content: "【Cloudflare 工具执行规范】调用 Cloudflare 的 execute 工具时，沙箱内已预置并注入了鉴权客户端 `cloudflare.request({ method, path, body })` 与全局变量 `accountId`。严禁在代码中自行定义 DEFAULT_BASE_URL 或使用原生 fetch() 请求 Cloudflare API，必须直接调用 `return await cloudflare.request({ method: 'GET', path: `/accounts/${accountId}/...` })`。"
+          content: "【Cloudflare 工具执行规范】\n1. 沙箱内已预置带有鉴权的全局客户端 `cloudflare.request({ method, path, body, contentType, rawBody })` 与全局变量 `accountId`。严禁自行拼接 BaseURL 或使用原生 fetch()，必须直接使用 `cloudflare.request`。\n2. 读取 Worker 脚本: `cloudflare.request({ method: 'GET', path: `/accounts/${accountId}/workers/scripts/${name}` })`。\n3. 更新单文件 Worker 脚本: `cloudflare.request({ method: 'PUT', path: `/accounts/${accountId}/workers/scripts/${name}`, body: codeString, contentType: 'application/javascript', rawBody: true })`（若为模块 Worker 则按 multipart/form-data 格式）。切勿盲目遍历搜索庞大的 OpenAPI 规范。\n4. 若操作对象是 Cloudflare 资源，切勿跨平台在 GitHub 相关工具上搜索无关个人或仓库。"
         });
       }
       if (consecutiveFailures >= 2) {
         roundMessages.push({
           role: "system",
-          content: "【错误自愈与切换提示】检测到前序工具调用返回错误（如 404 或匹配失败）。请更换查询方式或修正文件路径与参数继续完成全部任务；所有工具（含文件读取、局部编辑、全量写入等）均处于正常可用状态，严禁声称没有写入工具，所有待修改的文件与构建产物必须全部写入完成后才可结束。"
+          content: "【错误自愈与收敛提示】检测到前序工具调用返回错误。请先检查参数与目标环境是否正确，切勿在未知或不存在的端点上机械试错；若核心逻辑已通过排查查明，请直接聚焦于问题修复与交付，避免过度扩散探索。"
         });
       } else if (round === 0 && isWrite) {
         roundMessages.push({
           role: "system",
-          content: "【强制执行与局部修改规范】检测到针对代码、配置或文件的修改任务。必须直接调用工具完成所有相关源码、构建产物与测试的完整写入。修改已有文件时，必须优先调用局部修改工具（如 github_edit_file），仅传入需替换的代码片段（old_str -> new_str），严禁将大文件全量重写；仅在新建文件时使用全量写入工具。"
+          content: "【执行规范】检测到代码或配置修改任务。请根据目标资源类型选择匹配的工具：\n- 若修改 GitHub 仓库文件，优先调用局部修改工具（如 github_edit_file）替换代码片段；\n- 若修改 Cloudflare Worker/KV 等远程云资源，直接使用 Cloudflare 工具处理，严禁跨平台跑到 GitHub 检索无关个人或仓库；\n- 修改已有代码前先快速获取关键逻辑上下文，一旦定位根因立即收敛修改，避免多轮无效探索。"
         });
       }
 
       const activeTools = tools;
       let activeToolChoice = "auto";
-      if (tools.length > 0 && round === 0 && isWrite) {
-        activeToolChoice = "required";
-      }
 
       const payload = {
         ...requestBody,
