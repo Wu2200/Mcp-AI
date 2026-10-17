@@ -2745,20 +2745,12 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
           } else {
             toolCallHistory.set(callKey, prevAttempts + 1);
 
-            if (!abortSignal?.aborted && !clientResponse.destroyed) {
-              sendReasoningChunk(
-                clientResponse,
-                `\n> ⏳ 正在调用 [${displayName}] 执行操作: \`${rawAction}\`${detailSuffix}...\n`,
-                requestBody.model
-              );
-            }
-
             try {
               const onWaitNotice = (waitSec) => {
                 if (!abortSignal?.aborted && !clientResponse.destroyed) {
-                  sendReasoningChunk(
+                  sendSSEChunk(
                     clientResponse,
-                    `> ⏳ 触发访问频控，正在等待 ${waitSec + 1} 秒后自动重试...\n`,
+                    { content: `> ⏳ 访问频控保护中，正在等待 ${waitSec + 1} 秒后自动重试...\n\n` },
                     requestBody.model
                   );
                 }
@@ -2788,22 +2780,22 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
 
         if (!abortSignal?.aborted && !clientResponse.destroyed) {
           if (isCacheHit) {
-            sendReasoningChunk(
+            sendSSEChunk(
               clientResponse,
-              `\n> ⚡ [${displayName}] \`${rawAction}\`${detailSuffix} (复用对话缓存，无需重复读取)\n\n`,
+              { content: `> ⚡ **复用缓存**：\`${rawAction}\`${detailSuffix}\n\n` },
               requestBody.model
             );
           } else if (isToolError) {
             const failReason = errorMessage ? `: ${errorMessage}` : "";
-            sendReasoningChunk(
+            sendSSEChunk(
               clientResponse,
-              `> ❌ [${displayName}] 执行失败${detailSuffix}${failReason}\n\n`,
+              { content: `> ❌ **工具执行失败**：\`${rawAction}\`${detailSuffix}${failReason}\n\n` },
               requestBody.model
             );
           } else {
-            sendReasoningChunk(
+            sendSSEChunk(
               clientResponse,
-              `> ✅ [${displayName}] 执行完成${detailSuffix}\n\n`,
+              { content: `> 🛠️ **调用工具**：\`${rawAction}\`\n> 📋 **检索内容**：${actionDetails || "已确认参数"}\n> ✅ **状态**：执行完成\n\n` },
               requestBody.model
             );
           }
