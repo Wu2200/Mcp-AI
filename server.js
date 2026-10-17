@@ -2282,6 +2282,37 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
     initialMessages: messages.length
   });
 
+  const systemRules = [
+    "【工具调用透明化与高效并行规范】\n1. 高效并行调用：当需要查阅多个文件、检索多个不同关键词或执行多个无相互依赖的操作时，必须在单轮响应中一次性发起所有工具调用进行并发执行，严禁拆分成多轮逐个调用。\n2. 在需要调用工具的轮次，正文必须且仅输出如下格式的操作卡片（不要输出多余的废话、解释或开场白）。若单轮并发调用多个工具，每个操作卡片之间必须使用双换行（\\n\\n）空行彻底分隔，严禁单行连续粘连：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n3. 核心执行约束：输出上述操作卡片的同时，必须同时发起真实的底层工具调用（Tool Calls），严禁仅在正文中打印卡片文本而不发起工具调用！\n4. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n5. 当所有工具调用完毕、输出最终答复的轮次，直接输出最终解答，严禁输出上述卡片。"
+  ];
+  const hasCloudflare = tools.some((t) => {
+    const n = (t.function?.name || "").toLowerCase();
+    return n.includes("cloudflare");
+  });
+  if (hasCloudflare) {
+    systemRules.push(
+      "【Cloudflare 工具执行规范】\n1. 沙箱内已预置带有鉴权的全局客户端 `cloudflare.request({ method, path, body, contentType, rawBody })` 与全局变量 `accountId`。严禁自行拼接 BaseURL 或使用原生 fetch()，必须直接使用 `cloudflare.request`。\n2. 读取 Worker 脚本: `cloudflare.request({ method: 'GET', path: `/accounts/${accountId}/workers/scripts/${name}` })`。\n3. 更新单文件 Worker 脚本: `cloudflare.request({ method: 'PUT', path: `/accounts/${accountId}/workers/scripts/${name}`, body: codeString, contentType: 'application/javascript', rawBody: true })`（若为模块 Worker 则按 multipart/form-data 格式）。切勿盲目遍历搜索庞大的 OpenAPI 规范。\n4. 若操作对象是 Cloudflare 资源，切勿跨平台在 GitHub 相关工具上搜索无关个人或仓库。"
+    );
+  }
+  if (isWrite) {
+    systemRules.push(
+      "【执行规范】检测到代码或配置修改任务。请根据目标资源类型选择匹配的工具：\n- 若修改 GitHub 仓库文件，优先调用局部修改工具（如 github_edit_file）替换代码片段；\n- 若修改 Cloudflare Worker/KV 等远程云资源，直接使用 Cloudflare 工具处理，严禁跨平台跑到 GitHub 检索无关个人或仓库；\n- 修改已有代码前先快速获取关键逻辑上下文，一旦定位根因立即收敛修改，避免多轮无效探索。"
+    );
+  }
+
+  const combinedSystemPrompt = systemRules.join("\n\n");
+  if (messages.length > 0 && messages[0].role === "system") {
+    messages[0] = {
+      ...messages[0],
+      content: `${messages[0].content}\n\n${combinedSystemPrompt}`
+    };
+  } else {
+    messages.unshift({
+      role: "system",
+      content: combinedSystemPrompt
+    });
+  }
+
   if (isStream) {
     setCorsHeaders(clientResponse);
     clientResponse.writeHead(200, {
@@ -2330,30 +2361,11 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       }
 
       let roundMessages = [...messages];
-      roundMessages.push({
-        role: "system",
-        content: "【工具调用透明化与高效并行规范】\n1. 高效并行调用：当需要查阅多个文件、检索多个不同关键词或执行多个无相互依赖的操作时，必须在单轮响应中一次性发起所有工具调用进行并发执行，严禁拆分成多轮逐个调用。\n2. 在需要调用工具的轮次，正文必须且仅输出如下格式的操作卡片（不要输出多余的废话、解释或开场白）。若单轮并发调用多个工具，每个操作卡片之间必须使用双换行（\\n\\n）空行彻底分隔，严禁单行连续粘连：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n3. 核心执行约束：输出上述操作卡片的同时，必须同时发起真实的底层工具调用（Tool Calls），严禁仅在正文中打印卡片文本而不发起工具调用！\n4. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n5. 当所有工具调用完毕、输出最终答复的轮次，直接输出最终解答，严禁输出上述卡片。"
-      });
-      const hasCloudflare = tools.some((t) => {
-        const n = (t.function?.name || "").toLowerCase();
-        return n.includes("cloudflare");
-      });
-      if (round === 0 && hasCloudflare) {
-        roundMessages.push({
-          role: "system",
-          content: "【Cloudflare 工具执行规范】\n1. 沙箱内已预置带有鉴权的全局客户端 `cloudflare.request({ method, path, body, contentType, rawBody })` 与全局变量 `accountId`。严禁自行拼接 BaseURL 或使用原生 fetch()，必须直接使用 `cloudflare.request`。\n2. 读取 Worker 脚本: `cloudflare.request({ method: 'GET', path: `/accounts/${accountId}/workers/scripts/${name}` })`。\n3. 更新单文件 Worker 脚本: `cloudflare.request({ method: 'PUT', path: `/accounts/${accountId}/workers/scripts/${name}`, body: codeString, contentType: 'application/javascript', rawBody: true })`（若为模块 Worker 则按 multipart/form-data 格式）。切勿盲目遍历搜索庞大的 OpenAPI 规范。\n4. 若操作对象是 Cloudflare 资源，切勿跨平台在 GitHub 相关工具上搜索无关个人或仓库。"
-        });
-      }
-      if (consecutiveFailures >= 2) {
-        roundMessages.push({
-          role: "system",
-          content: "【错误自愈与收敛提示】检测到前序工具调用返回错误。请先检查参数与目标环境是否正确，切勿在未知或不存在的端点上机械试错；若核心逻辑已通过排查查明，请直接聚焦于问题修复与交付，避免过度扩散探索。"
-        });
-      } else if (round === 0 && isWrite) {
-        roundMessages.push({
-          role: "system",
-          content: "【执行规范】检测到代码或配置修改任务。请根据目标资源类型选择匹配的工具：\n- 若修改 GitHub 仓库文件，优先调用局部修改工具（如 github_edit_file）替换代码片段；\n- 若修改 Cloudflare Worker/KV 等远程云资源，直接使用 Cloudflare 工具处理，严禁跨平台跑到 GitHub 检索无关个人或仓库；\n- 修改已有代码前先快速获取关键逻辑上下文，一旦定位根因立即收敛修改，避免多轮无效探索。"
-        });
+      if (consecutiveFailures >= 2 && roundMessages.length > 0 && roundMessages[0].role === "system") {
+        roundMessages[0] = {
+          ...roundMessages[0],
+          content: `${roundMessages[0].content}\n\n【错误自愈与收敛提示】检测到前序工具调用返回错误。请先检查参数与目标环境是否正确，切勿在未知或不存在的端点上机械试错；若核心逻辑已通过排查查明，请直接聚焦于问题修复与交付，避免过度扩散探索。`
+        };
       }
 
       const activeTools = tools;
@@ -2619,6 +2631,13 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
               }
 
               if (delta?.content) {
+                if (
+                  delta.content.includes("【工具调用透明化与高效并行规范】") ||
+                  delta.content.includes("<system-reminder>") ||
+                  delta.content.includes("</system-reminder>")
+                ) {
+                  continue;
+                }
                 assistantContent += delta.content;
                 if (!clientResponse.destroyed && !abortSignal?.aborted) {
                   const safeContent = formatCardMarkdown(delta.content);
@@ -2787,9 +2806,9 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
             toolCallHistory.set(callKey, prevAttempts + 1);
 
             if (!abortSignal?.aborted && !clientResponse.destroyed) {
-              sendReasoningChunk(
+              sendProgressNotification(
                 clientResponse,
-                `\n> ⏳ 正在调用 [${displayName}] 执行操作: \`${rawAction}\`${detailSuffix}...\n`,
+                `\n\n> ⏳ 正在调用 [${displayName}] 执行操作: \`${rawAction}\`${detailSuffix}...\n`,
                 requestBody.model
               );
             }
@@ -2797,7 +2816,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
             try {
               const onWaitNotice = (waitSec) => {
                 if (!abortSignal?.aborted && !clientResponse.destroyed) {
-                  sendReasoningChunk(
+                  sendProgressNotification(
                     clientResponse,
                     `> ⏳ 触发访问频控，正在等待 ${waitSec + 1} 秒后自动重试...\n`,
                     requestBody.model
@@ -2829,20 +2848,20 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
 
         if (!abortSignal?.aborted && !clientResponse.destroyed) {
           if (isCacheHit) {
-            sendReasoningChunk(
+            sendProgressNotification(
               clientResponse,
-              `\n> ⚡ [${displayName}] \`${rawAction}\`${detailSuffix} (复用对话缓存，无需重复读取)\n\n`,
+              `> ⚡ [${displayName}] \`${rawAction}\`${detailSuffix} (复用对话缓存，无需重复读取)\n\n`,
               requestBody.model
             );
           } else if (isToolError) {
             const failReason = errorMessage ? `: ${errorMessage}` : "";
-            sendReasoningChunk(
+            sendProgressNotification(
               clientResponse,
               `> ❌ [${displayName}] 执行失败${detailSuffix}${failReason}\n\n`,
               requestBody.model
             );
           } else {
-            sendReasoningChunk(
+            sendProgressNotification(
               clientResponse,
               `> ✅ [${displayName}] 执行完成${detailSuffix}\n\n`,
               requestBody.model
