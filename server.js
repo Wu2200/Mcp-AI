@@ -1500,7 +1500,36 @@ function redactToolArguments(value, key = "") {
   return value;
 }
 
-function formatToolActionCard(toolCall, activeTools) {
+function buildChineseToolGoal(rawAction, userText) {
+  const action = String(rawAction || "").toLowerCase();
+  const knownGoals = [
+    [/get_me$/, "获取当前 GitHub 用户的基本信息"],
+    [/get_file_contents$/, "读取指定文件或目录内容"],
+    [/get_repository_tree$/, "查看仓库目录结构"],
+    [/list_commits$/, "查看仓库提交记录"],
+    [/get_commit$/, "查看提交详情"],
+    [/search_code$/, "搜索仓库代码"],
+    [/search_repositories$/, "搜索 GitHub 仓库"],
+    [/list_pull_requests$/, "查看拉取请求列表"],
+    [/get_pull_request$/, "查看拉取请求详情"],
+    [/list_issues$/, "查看仓库问题列表"],
+    [/search_issues$/, "搜索相关问题"],
+    [/create_or_update_file$/, "创建或更新仓库文件"],
+    [/github_edit_file$/, "修改 GitHub 仓库文件"]
+  ];
+  const knownGoal = knownGoals.find(([pattern]) => pattern.test(action));
+  if (knownGoal) return knownGoal[1];
+
+  const request = typeof userText === "string"
+    ? userText.replace(/[\r\n\t]+/g, " ").trim()
+    : "";
+  if (/[\u3400-\u9fff]/.test(request)) {
+    return `根据用户请求执行：${request.slice(0, 120)}`;
+  }
+  return "根据用户请求执行相关工具操作";
+}
+
+function formatToolActionCard(toolCall, activeTools, userText = "") {
   const toolName = toolCall.function?.name || toolCall.name || "unknown_tool";
   const toolInfo = mcpToolRegistry.get(toolName) || Array.from(mcpToolRegistry.entries())
     .find(([key, info]) => key.endsWith(toolName) || toolName.endsWith(info.rawName))?.[1];
@@ -1512,12 +1541,8 @@ function formatToolActionCard(toolCall, activeTools) {
     const name = tool.function?.name || "";
     return name === toolName || name.endsWith(`_${toolName}`) || toolName.endsWith(`_${name}`);
   });
-  const description = String(toolDefinition?.function?.description || "")
-    .replace(/^\[[^\]]+\]\s*/, "")
-    .split(/[\r\n]/, 1)[0]
-    .trim();
-  const goal = String(toolCall.goal || description || `执行工具 ${rawAction}`)
-    .replace(/[\r\n]+/g, " ")
+  const explicitGoal = String(toolCall.goal || "").replace(/[\r\n]+/g, " ").trim();
+  const goal = (/[\u3400-\u9fff]/.test(explicitGoal) ? explicitGoal : buildChineseToolGoal(rawAction, userText))
     .slice(0, 180);
   let details = formatToolCallDetails(safeArguments);
   if (!details) {
@@ -2557,7 +2582,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
           return;
         }
 
-        displayedActionCards.push(...mcpCalls.map((tc) => formatToolActionCard(tc, activeTools)));
+        displayedActionCards.push(...mcpCalls.map((tc) => formatToolActionCard(tc, activeTools, userText)));
 
         if (usedTextToolCallFallback) {
           messages.push({
@@ -2827,7 +2852,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         return;
       }
 
-      const visibleActionCards = mcpCalls.map((tc) => formatToolActionCard(tc, activeTools));
+      const visibleActionCards = mcpCalls.map((tc) => formatToolActionCard(tc, activeTools, userText));
       if (visibleActionCards.length > 0 && !abortSignal?.aborted && !clientResponse.destroyed) {
         sendSSEChunk(clientResponse, { content: `${visibleActionCards.join("\n\n")}\n\n` }, requestBody.model);
       }
