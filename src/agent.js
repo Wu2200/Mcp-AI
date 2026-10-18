@@ -5,10 +5,10 @@ import {
   addDebugLog,
   sendJson,
   setCorsHeaders,
-  enabledModels
+  enabledModels,
+  mcpToolRegistry
 } from "./store.js";
 import {
-  mcpToolRegistry,
   callMcpTool,
   getAllTools,
   selectRelevantTools,
@@ -423,7 +423,7 @@ export async function passThrough(requestBody, clientResponse, reqMeta, abortSig
     }
 
     let upstreamResponse;
-    const roundStartTime = Date.now();
+    const roundStartTime = Date.now() - 0;
     if (continueRound > 0) {
       addDebugLog("UPSTREAM", `[直通模式] [${channel.name}] 第 ${continueRound + 1} 轮断点续接上游请求 - 消息量: ${currentMessages.length}`);
     }
