@@ -1325,13 +1325,14 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
           const args = toolArguments(tc);
           let resultText = "";
           let isToolError = false;
+          let isCommitBuildPoll = false;
           if (args === null) {
             resultText = JSON.stringify({ error: "Invalid tool arguments" });
             isToolError = true;
           } else {
             const callKey = generateToolCallKey(tc.function.name, args);
             const prevAttempts = toolCallHistory.get(callKey) || 0;
-            const isCommitBuildPoll = hasWriteSuccess && isActions && (args.method === "list_workflow_runs" || !args.method);
+            isCommitBuildPoll = hasWriteSuccess && isActions && (args.method === "list_workflow_runs" || !args.method);
 
             if (isCommitBuildPoll) {
               if (actionsWaitChecked) {
@@ -1666,6 +1667,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
         let isToolError = false;
         let errorMessage = "";
         let isCacheHit = false;
+        let isCommitBuildPoll = false;
 
         if (args === null) {
           errorMessage = "无效参数";
@@ -1674,7 +1676,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
         } else {
           const callKey = generateToolCallKey(tc.name, args);
           const prevAttempts = toolCallHistory.get(callKey) || 0;
-          const isCommitBuildPoll = hasWriteSuccess && isActions && (args.method === "list_workflow_runs" || !args.method);
+          isCommitBuildPoll = hasWriteSuccess && isActions && (args.method === "list_workflow_runs" || !args.method);
 
           if (isCommitBuildPoll) {
             if (actionsWaitChecked) {
@@ -1689,26 +1691,10 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
               const { waitSec, primaryWorkflowName, lastDuration } = await estimatePrimaryBuildWaitSeconds(args.owner, args.repo);
               addDebugLog("TOOL", `[Actions 动态等待] 提交后确认构建，主要工作流 [${primaryWorkflowName}] 上次耗时 ${lastDuration}s，初始等待 ${waitSec}s`);
 
-              if (!abortSignal?.aborted && !clientResponse.destroyed) {
-                sendReasoningChunk(
-                  clientResponse,
-                  `\n> ⏳ 正在等待 GitHub Actions [${primaryWorkflowName}] 构建（预计等待 ${waitSec} 秒后拉取结果）...\n`,
-                  requestBody.model
-                );
-              }
-
-              // 1. 初始等待 (上次耗时 + 10s，每 30 秒简明同步一次)
-              const TOTAL_WAIT_SEC = waitSec;
-              for (let sec = 1; sec <= TOTAL_WAIT_SEC; sec += 1) {
+              // 1. 初始静默等待 (上次耗时 + 10s，静默无刷屏)
+              for (let sec = 1; sec <= waitSec; sec += 1) {
                 if (abortSignal?.aborted || clientResponse.destroyed) break;
                 await new Promise((r) => setTimeout(r, 1000));
-                if (sec % 30 === 0 && sec < TOTAL_WAIT_SEC && !abortSignal?.aborted && !clientResponse.destroyed) {
-                  sendReasoningChunk(
-                    clientResponse,
-                    `\n> ⏳ 云端构建进行中（已等待 ${sec}s / ${TOTAL_WAIT_SEC}s）...\n`,
-                    requestBody.model
-                  );
-                }
               }
 
               // 2. 首次查询构建状态
@@ -1722,7 +1708,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                 isToolError = true;
               }
 
-              // 3. 若未完成，加等 15 秒，最多 3 次
+              // 3. 若未完成，静默加等 15 秒，最多 3 次，中途不输出多余思考日志
               if (toolRes && !toolRes.isError) {
                 let buildStatus = checkPrimaryBuildStatus(toolRes.content, primaryWorkflowName);
                 const MAX_EXTENSIONS = 3;
@@ -1732,14 +1718,6 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                   if (abortSignal?.aborted || clientResponse.destroyed) break;
                   extensionCount += 1;
                   addDebugLog("TOOL", `[Actions 加等] 主要构建 [${primaryWorkflowName}] 未完成 (${buildStatus.status})，加等 15 秒 (第 ${extensionCount}/${MAX_EXTENSIONS} 次)...`);
-
-                  if (!abortSignal?.aborted && !clientResponse.destroyed) {
-                    sendReasoningChunk(
-                      clientResponse,
-                      `\n> ⏳ 构建仍在打包中，自动延长等待 15 秒（第 ${extensionCount}/${MAX_EXTENSIONS} 次）...\n`,
-                      requestBody.model
-                    );
-                  }
 
                   for (let s = 0; s < 15; s += 1) {
                     if (abortSignal?.aborted || clientResponse.destroyed) break;
@@ -1760,31 +1738,10 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                   // 构建失败：解锁并引导模型调 get_job_logs 自动修复
                   actionsWaitChecked = false;
                   resultText = `${toolRes.content}\n\n【构建失败自愈提示】检测到主要构建 [${primaryWorkflowName}] 失败 (${buildStatus.conclusion || "failure"})。请立即调用 get_job_logs 获取编译错误日志，分析报错原因并使用 github_edit_file 修复代码！`;
-                  if (!abortSignal?.aborted && !clientResponse.destroyed) {
-                    sendReasoningChunk(
-                      clientResponse,
-                      `\n> ❌ 主要构建 [${primaryWorkflowName}] 失败，正在调取日志排查修复...\n`,
-                      requestBody.model
-                    );
-                  }
                 } else if (buildStatus.completed) {
                   resultText = `${toolRes.content}\n\n【构建成功提示】主要工作流 [${primaryWorkflowName}] 构建成功！耗时约 ${totalWaited} 秒。请立即向用户交付最终汇报。`;
-                  if (!abortSignal?.aborted && !clientResponse.destroyed) {
-                    sendReasoningChunk(
-                      clientResponse,
-                      `\n> ✅ 主要构建 [${primaryWorkflowName}] 构建成功！正在生成最终汇报...\n`,
-                      requestBody.model
-                    );
-                  }
                 } else {
                   resultText = `${toolRes.content}\n\n【构建进行中提示】主要工作流 [${primaryWorkflowName}] 已在后台正常编译中（已等待 ${totalWaited} 秒）。无需继续原地空转死等，请立即向用户汇报修改详情并告知构建已在后台触发。`;
-                  if (!abortSignal?.aborted && !clientResponse.destroyed) {
-                    sendReasoningChunk(
-                      clientResponse,
-                      `\n> ⏱️ 主要构建 [${primaryWorkflowName}] 仍在后台编译打包中，准备交付答复...\n`,
-                      requestBody.model
-                    );
-                  }
                 }
                 isToolError = toolRes.isError;
                 if (!isToolError) executedToolCount += 1;
