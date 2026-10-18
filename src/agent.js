@@ -916,7 +916,7 @@ export async function passThroughAndTransformGemini(requestBody, clientResponse,
       addDebugLog("AGENT", `⚠️ [抗截断触发] 检测到上游返回截断 (${lastFinishReason})！正在自动进行第 ${continueRound} 次无感断点续接...`, {
         round: continueRound,
         finishReason: lastFinishReason,
-        accumulatedLength: accumulatedContent.length
+        accumulatedLength: fullAccumulatedContent.length
       });
       currentMessages = [
         ...currentMessages,
@@ -984,6 +984,33 @@ export async function estimatePrimaryBuildWaitSeconds(owner, repo) {
     };
   } catch {
     return { waitSec: 70, primaryWorkflowName: "主构建", lastDuration: 60 };
+  }
+}
+
+export function checkPrimaryBuildStatus(contentStr, primaryWorkflowName = "") {
+  try {
+    const data = typeof contentStr === "object" ? contentStr : JSON.parse(contentStr);
+    const runs = Array.isArray(data.workflow_runs)
+      ? data.workflow_runs
+      : (Array.isArray(data.jobs) ? data.jobs : (data.status ? [data] : []));
+    if (runs.length === 0) return { completed: true, status: "completed" };
+
+    const isAux = (name = "") => /cleanup|lint|format|stale|dependabot|pages|greeting|notify|label/i.test(name);
+    let targetRun = runs.find((r) => primaryWorkflowName && r.name && r.name.toLowerCase() === primaryWorkflowName.toLowerCase());
+    if (!targetRun) {
+      targetRun = runs.find((r) => !isAux(r.name)) || runs[0];
+    }
+
+    const status = (targetRun.status || "").toLowerCase();
+    const isCompleted = status === "completed" || Boolean(targetRun.conclusion);
+    return {
+      completed: isCompleted,
+      status: targetRun.status || "unknown",
+      conclusion: targetRun.conclusion || null,
+      runName: targetRun.name || "主要构建"
+    };
+  } catch {
+    return { completed: true, status: "unknown" };
   }
 }
 
@@ -1300,25 +1327,51 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
               if (actionsWaitChecked) {
                 resultText = JSON.stringify({
                   status: "already_checked",
-                  note: "已完成本次提交的构建状态检查。规则限制只查看一次构建状态，严禁重复查询！请立即向用户交付最终汇报与代码说明。"
+                  note: "已完成本次提交的构建状态检查。规则限制只查看一次构建状态，严禁重复查询！请立即向用户交付最终汇报与修改详情。"
                 });
                 isToolError = false;
               } else {
                 actionsWaitChecked = true;
                 const { waitSec, primaryWorkflowName, lastDuration } = await estimatePrimaryBuildWaitSeconds(args.owner, args.repo);
-                addDebugLog("TOOL", `[Actions 动态等待] 提交后确认构建，主要工作流 [${primaryWorkflowName}] 上次耗时 ${lastDuration}s，等待 ${waitSec}s`);
+                addDebugLog("TOOL", `[Actions 动态等待] 提交后确认构建，主要工作流 [${primaryWorkflowName}] 上次耗时 ${lastDuration}s，初始等待 ${waitSec}s`);
                 for (let s = 0; s < waitSec; s += 1) {
                   if (abortSignal?.aborted || clientResponse.destroyed) break;
                   await new Promise((r) => setTimeout(r, 1000));
                 }
+                let toolRes = null;
                 try {
-                  const toolRes = await callMcpTool(tc.function.name, args);
-                  resultText = `${toolRes.content}\n\n【系统提示】已根据该仓库上次主要构建 [${primaryWorkflowName}] 成功耗时 (${lastDuration}s) 动态等待了 ${waitSec} 秒 (${lastDuration}s + 10s)，并拉取到构建最新状态（全过程仅检查此一次）。请不要继续轮询，请立即向用户交付完整的最终答复。`;
-                  isToolError = toolRes.isError;
-                  if (!isToolError) executedToolCount += 1;
+                  toolRes = await callMcpTool(tc.function.name, args);
                 } catch (err) {
                   resultText = JSON.stringify({ error: err instanceof Error ? err.message : "获取构建状态失败" });
                   isToolError = true;
+                }
+
+                if (toolRes && !toolRes.isError) {
+                  let buildStatus = checkPrimaryBuildStatus(toolRes.content, primaryWorkflowName);
+                  const MAX_EXTENSIONS = 3;
+                  let extensionCount = 0;
+
+                  while (!buildStatus.completed && extensionCount < MAX_EXTENSIONS) {
+                    if (abortSignal?.aborted || clientResponse.destroyed) break;
+                    extensionCount += 1;
+                    addDebugLog("TOOL", `[Actions 加等] 主要构建 [${primaryWorkflowName}] 未完成 (${buildStatus.status})，加等 15 秒 (第 ${extensionCount}/${MAX_EXTENSIONS} 次)...`);
+                    for (let s = 0; s < 15; s += 1) {
+                      if (abortSignal?.aborted || clientResponse.destroyed) break;
+                      await new Promise((r) => setTimeout(r, 1000));
+                    }
+                    if (abortSignal?.aborted || clientResponse.destroyed) break;
+                    try {
+                      toolRes = await callMcpTool(tc.function.name, args);
+                      buildStatus = checkPrimaryBuildStatus(toolRes.content, primaryWorkflowName);
+                    } catch {
+                      break;
+                    }
+                  }
+
+                  const totalWaited = waitSec + (extensionCount * 15);
+                  resultText = `${toolRes.content}\n\n【系统提示】已完成构建检查（主要工作流：${primaryWorkflowName}，共等待 ${totalWaited} 秒，当前状态：${buildStatus.status || "完成"}）。请立即向用户交付最终答复，说明代码改动及构建结果。`;
+                  isToolError = toolRes.isError;
+                  if (!isToolError) executedToolCount += 1;
                 }
               }
             } else {
@@ -1591,21 +1644,10 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
         const actionDetails = formatToolCallDetails(args);
         const detailSuffix = actionDetails ? ` | ${actionDetails}` : "";
 
-        const onWaitNotice = (waitSec) => {
-          if (!abortSignal?.aborted && !clientResponse.destroyed) {
-            sendReasoningChunk(
-              clientResponse,
-              `\n> ⏳ 触发访问频控，正在等待 ${waitSec + 1} 秒后自动重试...\n`,
-              requestBody.model
-            );
-          }
-        };
-
         let resultText = "";
         let isToolError = false;
         let errorMessage = "";
         let isCacheHit = false;
-        let didWait = false;
 
         if (args === null) {
           errorMessage = "无效参数";
@@ -1626,53 +1668,55 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
               isToolError = false;
             } else {
               actionsWaitChecked = true;
-              didWait = true;
               const { waitSec, primaryWorkflowName, lastDuration } = await estimatePrimaryBuildWaitSeconds(args.owner, args.repo);
-              addDebugLog("TOOL", `[Actions 动态预估] 提交后确认构建，主要构建 [${primaryWorkflowName}] 上次成功耗时 ${lastDuration}s，本次动态设定等待 ${waitSec}s`);
+              addDebugLog("TOOL", `[Actions 动态等待] 提交后确认构建，主要工作流 [${primaryWorkflowName}] 上次耗时 ${lastDuration}s，初始等待 ${waitSec}s`);
 
-              if (!abortSignal?.aborted && !clientResponse.destroyed) {
-                sendReasoningChunk(
-                  clientResponse,
-                  `\n> 📊 [智能预估] 检测到刚刚提交了代码，主要构建 [${primaryWorkflowName}] 上次耗时 ${lastDuration}s，正在等待云端构建 ${waitSec}s (${lastDuration}s + 10s)...\n`,
-                  requestBody.model
-                );
-              }
-
-              const TOTAL_WAIT_SEC = waitSec;
-              for (let sec = 1; sec <= TOTAL_WAIT_SEC; sec += 1) {
+              // 1. 初始静默等待 (上次耗时 + 10s，静默无刷屏)
+              for (let sec = 1; sec <= waitSec; sec += 1) {
                 if (abortSignal?.aborted || clientResponse.destroyed) break;
                 await new Promise((r) => setTimeout(r, 1000));
-                if (sec % 30 === 0 && sec < TOTAL_WAIT_SEC && !abortSignal?.aborted && !clientResponse.destroyed) {
-                  sendReasoningChunk(
-                    clientResponse,
-                    `\n> ⏳ 正在等待 GitHub Actions 云端构建运行（已等待 ${sec}s / ${TOTAL_WAIT_SEC}s）...\n`,
-                    requestBody.model
-                  );
-                }
               }
 
-              if (!abortSignal?.aborted && !clientResponse.destroyed) {
-                sendReasoningChunk(
-                  clientResponse,
-                  `\n> 🔍 ${TOTAL_WAIT_SEC} 秒等待结束，正在拉取 GitHub Actions 最新状态...\n`,
-                  requestBody.model
-                );
-              }
-
+              // 2. 首次查询构建状态
+              let toolRes = null;
               try {
-                const toolRes = await callMcpTool(tc.name, args, onWaitNotice);
-                resultText = `${toolRes.content}\n\n【系统特别提示】已根据该仓库上次主要构建 [${primaryWorkflowName}] 的成功耗时 (${lastDuration}s) 动态等待了 ${TOTAL_WAIT_SEC} 秒 (${lastDuration}s + 10s)，并拉取到了最新构建结果（全过程仅检查此一次）。请不要继续轮询，请立即向用户交付完整的最终答复（包括代码修改详情与当前构建状态）。`;
-                isToolError = toolRes.isError;
-                if (isToolError) {
-                  errorMessage = extractErrorMessage(toolRes.content);
-                } else {
-                  executedToolCount += 1;
-                }
+                toolRes = await callMcpTool(tc.name, args, null);
               } catch (err) {
                 const msg = err instanceof Error ? err.message : "获取构建状态失败";
                 errorMessage = extractErrorMessage(msg);
                 resultText = JSON.stringify({ error: msg });
                 isToolError = true;
+              }
+
+              // 3. 若未完成，静默加等 15 秒，最多 3 次，中途不输出多余思考日志
+              if (toolRes && !toolRes.isError) {
+                let buildStatus = checkPrimaryBuildStatus(toolRes.content, primaryWorkflowName);
+                const MAX_EXTENSIONS = 3;
+                let extensionCount = 0;
+
+                while (!buildStatus.completed && extensionCount < MAX_EXTENSIONS) {
+                  if (abortSignal?.aborted || clientResponse.destroyed) break;
+                  extensionCount += 1;
+                  addDebugLog("TOOL", `[Actions 加等] 主要构建 [${primaryWorkflowName}] 未完成 (${buildStatus.status})，加等 15 秒 (第 ${extensionCount}/${MAX_EXTENSIONS} 次)...`);
+
+                  for (let s = 0; s < 15; s += 1) {
+                    if (abortSignal?.aborted || clientResponse.destroyed) break;
+                    await new Promise((r) => setTimeout(r, 1000));
+                  }
+                  if (abortSignal?.aborted || clientResponse.destroyed) break;
+
+                  try {
+                    toolRes = await callMcpTool(tc.name, args, null);
+                    buildStatus = checkPrimaryBuildStatus(toolRes.content, primaryWorkflowName);
+                  } catch {
+                    break;
+                  }
+                }
+
+                const totalWaited = waitSec + (extensionCount * 15);
+                resultText = `${toolRes.content}\n\n【系统提示】已完成构建检查（主要工作流：${primaryWorkflowName}，共等待 ${totalWaited} 秒，当前状态：${buildStatus.status || "完成"}）。请立即向用户交付最终汇报，说明代码改动及构建结果。`;
+                isToolError = toolRes.isError;
+                if (!isToolError) executedToolCount += 1;
               }
             }
           } else {
@@ -1704,6 +1748,15 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
               }
 
               try {
+                const onWaitNotice = (waitSec) => {
+                  if (!abortSignal?.aborted && !clientResponse.destroyed) {
+                    sendReasoningChunk(
+                      clientResponse,
+                      `\n> ⏳ 触发访问频控，正在等待 ${waitSec + 1} 秒后自动重试...\n`,
+                      requestBody.model
+                    );
+                  }
+                };
                 const toolRes = await callMcpTool(tc.name, args, onWaitNotice);
                 resultText = toolRes.content;
                 isToolError = toolRes.isError;
@@ -1735,20 +1788,6 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
               `\n> ⚡ [${displayName}] \`${rawAction}\`${detailSuffix} (复用对话缓存)\n`,
               requestBody.model
             );
-          } else if (didWait) {
-            if (isToolError) {
-              sendReasoningChunk(
-                clientResponse,
-                `\n> ❌ [${displayName}] 构建状态获取失败${errorMessage ? `: ${errorMessage}` : ""}\n`,
-                requestBody.model
-              );
-            } else {
-              sendReasoningChunk(
-                clientResponse,
-                `\n> ✅ [${displayName}] 构建等待结束，已成功获取最新构建状态\n`,
-                requestBody.model
-              );
-            }
           } else if (isToolError) {
             const failReason = errorMessage ? `: ${errorMessage}` : "";
             sendReasoningChunk(
