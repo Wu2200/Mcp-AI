@@ -127,6 +127,10 @@ export function formatToolCallDetails(args) {
   if (!args || typeof args !== "object") return "";
   const parts = [];
 
+  if (args.method) {
+    parts.push(`操作: ${args.method}`);
+  }
+
   if (args.owner && args.repo) {
     parts.push(`仓库: ${args.owner}/${args.repo}`);
   } else if (args.repo) {
@@ -139,6 +143,14 @@ export function formatToolCallDetails(args) {
     parts.push(`路径: ${args.path}`);
   } else if (args.file || args.filePath || args.filename) {
     parts.push(`文件: ${args.file || args.filePath || args.filename}`);
+  }
+
+  if (args.resource_id) {
+    parts.push(`资源ID: ${args.resource_id}`);
+  } else if (args.run_id) {
+    parts.push(`运行ID: ${args.run_id}`);
+  } else if (args.job_id) {
+    parts.push(`任务ID: ${args.job_id}`);
   }
 
   if (args.old_str !== undefined && args.new_str !== undefined) {
@@ -237,7 +249,11 @@ export function buildChineseToolGoal(rawAction, userText) {
     [/list_issues$/, "查看仓库问题列表"],
     [/search_issues$/, "搜索相关问题"],
     [/create_or_update_file$/, "创建或更新仓库文件"],
-    [/github_edit_file$/, "修改 GitHub 仓库文件"]
+    [/github_edit_file$/, "修改 GitHub 仓库文件"],
+    [/actions_list$/, "查看 GitHub Actions 运行记录"],
+    [/actions_get$/, "查看 GitHub Actions 任务详情"],
+    [/actions_run_trigger$/, "触发 GitHub Actions 构建"],
+    [/get_job_logs$/, "获取 Actions 构建日志"]
   ];
   const knownGoal = knownGoals.find(([pattern]) => pattern.test(action));
   if (knownGoal) return knownGoal[1];
@@ -246,7 +262,7 @@ export function buildChineseToolGoal(rawAction, userText) {
     ? userText.replace(/[\r\n\t]+/g, " ").trim()
     : "";
   if (/[\u3400-\u9fff]/.test(request)) {
-    return `根据用户请求执行：${request.slice(0, 120)}`;
+    return `根据需求执行工具操作：${request.slice(0, 30)}...`;
   }
   return "根据用户请求执行相关工具操作";
 }
@@ -423,7 +439,7 @@ export async function passThrough(requestBody, clientResponse, reqMeta, abortSig
     }
 
     let upstreamResponse;
-    const roundStartTime = Date.now() - 0;
+    const roundStartTime = Date.now();
     if (continueRound > 0) {
       addDebugLog("UPSTREAM", `[直通模式] [${channel.name}] 第 ${continueRound + 1} 轮断点续接上游请求 - 消息量: ${currentMessages.length}`);
     }
@@ -958,7 +974,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
   });
 
   const systemRules = [
-    "【工具调用透明化与高效并行规范】\n1. 单轮最多规划并发调用 3 个最相关的真实工具；若目标较多，先执行优先级最高的 1~3 项，取得结果后再决定下一步，禁止一次性铺开大量调用。\n2. 严禁提前输出总结或方案草稿：在所有信息收集、代码排查或修改操作全部完成之前，严禁在中间轮次输出结论、答复文本、分析讲解或开场白！\n3. 优先使用原生 Tool Calls。仅当上游未发出原生调用时，才允许使用操作卡片作为兼容兜底；每轮最多 3 张，且必须对应真实工具调用。多个卡片之间必须使用双换行（\\n\\n）空行彻底分隔，严禁单行连续粘连：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n4. 核心执行约束：输出上述操作卡片的同时，必须同时发起真实的底层工具调用（Tool Calls），严禁仅在正文中打印卡片文本而不发起工具调用！\n5. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n6. 当所有工具调用完毕、进入最终答复轮次时，直接输出完整最终解答，终局轮次严禁输出操作卡片。"
+    "【工具调用透明化与高效并行规范】\n1. 单轮最多规划并发调用 3 个最相关的真实工具；若目标较多，先执行优先级最高的 1~3 项，取得结果后再决定下一步，禁止一次性铺开大量调用。\n2. 严禁提前输出总结或方案草稿：在所有信息收集、代码排查或修改操作全部完成之前，严禁在中间轮次输出结论、答复文本、分析讲解或开场白！\n3. 严禁死等或轮询构建状态：当代码已提交成功，若 GitHub Actions 已触发并在运行中（in_progress/queued），严禁连续轮询等待其完成！应直接结束工具调用并向用户交付结果，告知构建已在后台触发即可。\n4. 优先使用原生 Tool Calls。仅当上游未发出原生调用时，才允许使用操作卡片作为兼容兜底；每轮最多 3 张，且必须对应真实工具调用。多个卡片之间必须使用双换行（\\n\\n）空行彻底分隔，严禁单行连续粘连：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n5. 核心执行约束：输出上述操作卡片的同时，必须同时发起真实的底层工具调用（Tool Calls），严禁仅在正文中打印卡片文本而不发起工具调用！\n6. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n7. 当所有工具调用完毕、进入最终答复轮次时，直接输出完整最终解答，终局轮次严禁输出操作卡片。"
   ];
   const hasCloudflare = tools.some((t) => {
     const n = (t.function?.name || "").toLowerCase();
@@ -1224,38 +1240,48 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
           } else {
             const callKey = generateToolCallKey(tc.function.name, args);
             const prevAttempts = toolCallHistory.get(callKey) || 0;
-            const cachedContent = !isWrite ? dialogReadCache.get(callKey) : null;
+            const isActionsPoll = /actions_(list|get)/i.test(rawAction);
 
-            if (cachedContent !== undefined && cachedContent !== null) {
-              toolCallHistory.set(callKey, prevAttempts + 1);
-              if (prevAttempts >= 5) {
-                resultText = JSON.stringify({ note: "已多次复用该工具的缓存结果，当前信息完整且最新。请直接根据已有信息继续执行或回答用户。" });
-              } else {
-                resultText = cachedContent;
-                addDebugLog("TOOL", `MCP 工具 [${tc.function.name}] 命中本次对话只读缓存，直接复用 (${cachedContent.length} 字符)`, { arguments: args });
-              }
+            if (isActionsPoll && prevAttempts >= 2) {
+              resultText = JSON.stringify({
+                status: "in_progress",
+                note: "构建已触发并在后台正常排队或运行中。切勿继续机械轮询，请立即根据已有修改向用户进行最终回答与交付汇报！"
+              });
               isToolError = false;
-            } else if (prevAttempts >= 2) {
-              resultText = JSON.stringify({ error: "该工具已使用完全相同的参数重复调用多次，系统已拦截重复执行。请勿继续重复调用，请根据当前信息直接回答用户。" });
-              isToolError = true;
             } else {
-              toolCallHistory.set(callKey, prevAttempts + 1);
-              try {
-                const toolRes = await callMcpTool(tc.function.name, args);
-                resultText = toolRes.content;
-                isToolError = toolRes.isError;
-                if (!isToolError) {
-                  executedToolCount += 1;
-                  if (isWrite) {
-                    hasWriteSuccess = true;
-                    dialogReadCache.clear();
-                  } else {
-                    dialogReadCache.set(callKey, resultText);
-                  }
+              const cachedContent = !isWrite && !isActionsPoll ? dialogReadCache.get(callKey) : null;
+
+              if (cachedContent !== undefined && cachedContent !== null) {
+                toolCallHistory.set(callKey, prevAttempts + 1);
+                if (prevAttempts >= 3) {
+                  resultText = JSON.stringify({ note: "已多次复用该工具的缓存结果，当前信息完整且最新。请直接根据已有信息继续执行或回答用户。" });
+                } else {
+                  resultText = cachedContent;
+                  addDebugLog("TOOL", `MCP 工具 [${tc.function.name}] 命中本次对话只读缓存，直接复用 (${cachedContent.length} 字符)`, { arguments: args });
                 }
-              } catch (err) {
-                resultText = JSON.stringify({ error: err instanceof Error ? err.message : "Tool execution failed" });
+                isToolError = false;
+              } else if (prevAttempts >= 2 && !isActionsPoll) {
+                resultText = JSON.stringify({ error: "该工具已使用完全相同的参数重复调用多次，系统已拦截重复执行。请勿继续重复调用，请根据当前信息直接回答用户。" });
                 isToolError = true;
+              } else {
+                toolCallHistory.set(callKey, prevAttempts + 1);
+                try {
+                  const toolRes = await callMcpTool(tc.function.name, args);
+                  resultText = toolRes.content;
+                  isToolError = toolRes.isError;
+                  if (!isToolError) {
+                    executedToolCount += 1;
+                    if (isWrite) {
+                      hasWriteSuccess = true;
+                      dialogReadCache.clear();
+                    } else if (!isActionsPoll) {
+                      dialogReadCache.set(callKey, resultText);
+                    }
+                  }
+                } catch (err) {
+                  resultText = JSON.stringify({ error: err instanceof Error ? err.message : "Tool execution failed" });
+                  isToolError = true;
+                }
               }
             }
           }
@@ -1503,62 +1529,72 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
         } else {
           const callKey = generateToolCallKey(tc.name, args);
           const prevAttempts = toolCallHistory.get(callKey) || 0;
-          const cachedContent = !isWrite ? dialogReadCache.get(callKey) : null;
+          const isActionsPoll = /actions_(list|get)/i.test(rawAction);
 
-          if (cachedContent !== undefined && cachedContent !== null) {
-            isCacheHit = true;
-            toolCallHistory.set(callKey, prevAttempts + 1);
-            if (prevAttempts >= 5) {
-              resultText = JSON.stringify({ note: "已多次复用该工具的缓存结果，当前信息完整且最新。请直接根据已有信息继续执行或回答用户。" });
-            } else {
-              resultText = cachedContent;
-              addDebugLog("TOOL", `MCP 工具 [${tc.name}] 命中本次对话只读缓存，直接复用 (${cachedContent.length} 字符)`, { arguments: args });
-            }
+          if (isActionsPoll && prevAttempts >= 2) {
+            resultText = JSON.stringify({
+              status: "in_progress",
+              note: "构建已触发并在后台正常排队或运行中。切勿继续机械轮询，请立即根据已有修改向用户进行最终回答与交付汇报！"
+            });
             isToolError = false;
-          } else if (prevAttempts >= 2) {
-            errorMessage = "重复调用已被系统拦截";
-            resultText = JSON.stringify({ error: "该工具已使用完全相同的参数重复调用多次，系统已拦截重复执行。请勿继续重复调用，请根据当前信息直接回答用户。" });
-            isToolError = true;
           } else {
-            toolCallHistory.set(callKey, prevAttempts + 1);
+            const cachedContent = !isWrite && !isActionsPoll ? dialogReadCache.get(callKey) : null;
 
-            if (!abortSignal?.aborted && !clientResponse.destroyed) {
-              sendReasoningChunk(
-                clientResponse,
-                `\n> ⏳ 正在调用 [${displayName}] 执行操作: \`${rawAction}\`${detailSuffix}...\n`,
-                requestBody.model
-              );
-            }
-
-            try {
-              const onWaitNotice = (waitSec) => {
-                if (!abortSignal?.aborted && !clientResponse.destroyed) {
-                  sendReasoningChunk(
-                    clientResponse,
-                    `\n> ⏳ 触发访问频控，正在等待 ${waitSec + 1} 秒后自动重试...\n`,
-                    requestBody.model
-                  );
-                }
-              };
-              const toolRes = await callMcpTool(tc.name, args, onWaitNotice);
-              resultText = toolRes.content;
-              isToolError = toolRes.isError;
-              if (isToolError) {
-                errorMessage = extractErrorMessage(toolRes.content);
+            if (cachedContent !== undefined && cachedContent !== null) {
+              isCacheHit = true;
+              toolCallHistory.set(callKey, prevAttempts + 1);
+              if (prevAttempts >= 3) {
+                resultText = JSON.stringify({ note: "已多次复用该工具的缓存结果，当前信息完整且最新。请直接根据已有信息继续执行或回答用户。" });
               } else {
-                executedToolCount += 1;
-                if (isWrite) {
-                  hasWriteSuccess = true;
-                  dialogReadCache.clear();
-                } else {
-                  dialogReadCache.set(callKey, resultText);
-                }
+                resultText = cachedContent;
+                addDebugLog("TOOL", `MCP 工具 [${tc.name}] 命中本次对话只读缓存，直接复用 (${cachedContent.length} 字符)`, { arguments: args });
               }
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : "Tool execution failed";
-              errorMessage = extractErrorMessage(msg);
-              resultText = JSON.stringify({ error: msg });
+              isToolError = false;
+            } else if (prevAttempts >= 2 && !isActionsPoll) {
+              errorMessage = "重复调用已被系统拦截";
+              resultText = JSON.stringify({ error: "该工具已使用完全相同的参数重复调用多次，系统已拦截重复执行。请勿继续重复调用，请根据当前信息直接回答用户。" });
               isToolError = true;
+            } else {
+              toolCallHistory.set(callKey, prevAttempts + 1);
+
+              if (!abortSignal?.aborted && !clientResponse.destroyed) {
+                sendReasoningChunk(
+                  clientResponse,
+                  `\n> ⏳ 正在调用 [${displayName}] 执行操作: \`${rawAction}\`${detailSuffix}...\n`,
+                  requestBody.model
+                );
+              }
+
+              try {
+                const onWaitNotice = (waitSec) => {
+                  if (!abortSignal?.aborted && !clientResponse.destroyed) {
+                    sendReasoningChunk(
+                      clientResponse,
+                      `\n> ⏳ 触发访问频控，正在等待 ${waitSec + 1} 秒后自动重试...\n`,
+                      requestBody.model
+                    );
+                  }
+                };
+                const toolRes = await callMcpTool(tc.name, args, onWaitNotice);
+                resultText = toolRes.content;
+                isToolError = toolRes.isError;
+                if (isToolError) {
+                  errorMessage = extractErrorMessage(toolRes.content);
+                } else {
+                  executedToolCount += 1;
+                  if (isWrite) {
+                    hasWriteSuccess = true;
+                    dialogReadCache.clear();
+                  } else if (!isActionsPoll) {
+                    dialogReadCache.set(callKey, resultText);
+                  }
+                }
+              } catch (err) {
+                const msg = err instanceof Error ? err.message : "Tool execution failed";
+                errorMessage = extractErrorMessage(msg);
+                resultText = JSON.stringify({ error: msg });
+                isToolError = true;
+              }
             }
           }
         }
