@@ -1347,8 +1347,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
               } else {
                 actionsWaitChecked = true;
                 const { waitSec, primaryWorkflowName, lastDuration } = await estimatePrimaryBuildWaitSeconds(args.owner, args.repo);
-                addDebugLog("TOOL", `[Actions 动态等待] 提交后确认构建，主要工作流 [${primaryWorkflowName}] 上次耗时 ${lastDuration}s，初始等待 ${waitSec}s`);
-
+                addDebugLog("TOOL", `[Actions 动态等待] 提交后确认构建，主要工作流 [${primaryWorkflowName}] 上次耗时 ${lastDuration}s，等待 ${waitSec}s`);
                 for (let s = 0; s < waitSec; s += 1) {
                   if (abortSignal?.aborted || clientResponse.destroyed) break;
                   await new Promise((r) => setTimeout(r, 1000));
@@ -1472,6 +1471,8 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
       let hasToolCalls = false;
       let roundFinishReason = null;
       let stoppedForTextToolCalls = false;
+      let streamContentSent = false;
+      let contentBuffer = "";
 
       try {
         while (true) {
@@ -1521,12 +1522,35 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
 
               if (delta?.content) {
                 assistantContent += delta.content;
+
                 if (!hasToolCalls && activeTools.length > 0) {
                   const textCalls = parseTextToolCalls(assistantContent, activeTools);
                   if (textCalls.length >= MAX_TOOL_CALLS_PER_ROUND) {
                     stoppedForTextToolCalls = true;
                     await reader.cancel().catch(() => {});
                     break;
+                  }
+                }
+
+                // 实时流式输出正文：如果本轮未检测到工具调用，逐字打字机推送
+                if (!hasToolCalls) {
+                  if (streamContentSent) {
+                    if (!clientResponse.destroyed && !abortSignal?.aborted) {
+                      sendSSEChunk(clientResponse, { content: delta.content }, requestBody.model);
+                    }
+                  } else {
+                    contentBuffer += delta.content;
+                    const trimmedBuf = contentBuffer.trimStart();
+                    const couldBeCard = "目标说明".startsWith(trimmedBuf) || trimmedBuf.startsWith("目标说明");
+                    if (!couldBeCard || trimmedBuf.length > 25) {
+                      if (!/(?:目标说明|调用工具)\s*[：:]/.test(trimmedBuf)) {
+                        if (!clientResponse.destroyed && !abortSignal?.aborted) {
+                          sendSSEChunk(clientResponse, { content: contentBuffer }, requestBody.model);
+                        }
+                        streamContentSent = true;
+                        contentBuffer = "";
+                      }
+                    }
                   }
                 }
               }
@@ -1594,13 +1618,17 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
       }
 
       if (mcpCalls.length === 0) {
-        if (!/(?:目标说明|调用工具|检索内容)\s*[：:]/.test(assistantContent)) {
-          if (assistantContent && !abortSignal?.aborted && !clientResponse.destroyed) {
-            sendSSEChunk(clientResponse, { content: assistantContent }, requestBody.model);
+        // 未使用流式实时推出去的短文本（如小于25字符），在此补发
+        if (!streamContentSent && contentBuffer) {
+          if (!/(?:目标说明|调用工具|检索内容)\s*[：:]/.test(contentBuffer)) {
+            if (!clientResponse.destroyed && !abortSignal?.aborted) {
+              sendSSEChunk(clientResponse, { content: contentBuffer }, requestBody.model);
+            }
+          } else if (!abortSignal?.aborted && !clientResponse.destroyed) {
+            sendSSEChunk(clientResponse, { content: "输出了无法匹配到已启用工具的操作卡片，未执行任何工具。请根据当前可用工具直接回答。" }, requestBody.model);
           }
-        } else if (!abortSignal?.aborted && !clientResponse.destroyed) {
-          sendSSEChunk(clientResponse, { content: "输出了无法匹配到已启用工具的操作卡片，未执行任何工具。请根据当前可用工具直接回答。" }, requestBody.model);
         }
+
         if (isTruncatedFinishReason(roundFinishReason) && assistantContent && !/(?:目标说明|调用工具|检索内容)\s*[：:]/.test(assistantContent) && !abortSignal?.aborted && !clientResponse.destroyed) {
           addDebugLog("AGENT", `⚠️ [抗截断触发] MCP 调度检测到截断 (${roundFinishReason})！正在自动进行无感断点续接...`, {
             round: round + 1,
@@ -1703,7 +1731,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
               if (!abortSignal?.aborted && !clientResponse.destroyed) {
                 sendReasoningChunk(
                   clientResponse,
-                  `\n> ⏳ 正在等待 GitHub Actions [${primaryWorkflowName}] 构建（预计等待 ${waitSec} 秒后拉取结果）...\n`,
+                  `\n> ⏳ 正在等待 GitHub Actions [${primaryWorkflowName}] 云端构建运行（预计等待 ${waitSec} 秒后拉取结果）...\n`,
                   requestBody.model
                 );
               }
