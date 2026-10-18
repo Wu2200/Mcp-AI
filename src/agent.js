@@ -1124,7 +1124,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
             choices: [
               {
                 index: 0,
-                delta: { content: `\n\n⚠️ [上游接口返回错误 ${upstreamResponse.status}]: ${errText.slice(0, 500)}` },
+                delta: { content: `\n\n⚠️ [上游接口返回错误 ${upstreamResponse.status}]: ${errTxt.slice(0, 500)}` },
                 finish_reason: "stop"
               }
             ]
@@ -1579,7 +1579,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
               for (let sec = 1; sec <= TOTAL_WAIT_SEC; sec += 1) {
                 if (abortSignal?.aborted || clientResponse.destroyed) break;
                 await new Promise((r) => setTimeout(r, 1000));
-                if (sec % 15 === 0 && sec < TOTAL_WAIT_SEC && !abortSignal?.aborted && !clientResponse.destroyed) {
+                if (sec % 30 === 0 && sec < TOTAL_WAIT_SEC && !abortSignal?.aborted && !clientResponse.destroyed) {
                   sendReasoningChunk(
                     clientResponse,
                     `\n> ⏳ 正在等待 GitHub Actions 云端构建运行（已等待 ${sec}s / ${TOTAL_WAIT_SEC}s）...\n`,
@@ -1622,7 +1622,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                 resultText = JSON.stringify({ note: "已多次复用该工具的缓存结果，当前信息完整且最新。请直接根据已有信息继续执行或回答用户。" });
               } else {
                 resultText = cachedContent;
-                addDebugLog("TOOL", `MCP 工具 [${tc.name}] 命中本次对话只读缓存，直接复用 (${cachedContent.length} 字符)`, { arguments: args });
+                addDebugLog("TOOL", `MCP 工具 [${tc.function.name}] 命中本次对话只读缓存，直接复用 (${cachedContent.length} 字符)`, { arguments: args });
               }
               isToolError = false;
             } else if (prevAttempts >= 2) {
