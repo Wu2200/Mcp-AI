@@ -866,41 +866,12 @@ function formatCardMarkdown(text) {
 
 
 
-function extractContextRepo(messages) {
-  let owner = "";
-  let repo = "";
-  if (!Array.isArray(messages)) return { owner, repo };
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i];
-    if (m?.tool_calls) {
-      for (const tc of m.tool_calls) {
-        const args = toolArguments(tc);
-        if (args?.owner && args?.repo) {
-          return { owner: String(args.owner).trim(), repo: String(args.repo).trim() };
-        }
-      }
-    }
-    const content = typeof m?.content === "string" ? m.content : "";
-    const repoMatches = content.matchAll(/\b([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+)\b/g);
-    for (const rm of repoMatches) {
-      const p1 = rm[1].toLowerCase();
-      if (!["application", "text", "image", "audio", "video", "multipart"].includes(p1)) {
-        if (!owner && !repo) {
-          owner = rm[1];
-          repo = rm[2];
-        }
-      }
-    }
-  }
-  return { owner, repo };
-}
-
-function parseTextToolCalls(text, activeTools, defaultOwner = "", defaultRepo = "") {
+function parseTextToolCalls(text, activeTools) {
   if (!text || typeof text !== "string" || !Array.isArray(activeTools) || activeTools.length === 0) {
     return [];
   }
   const cleanText = formatCardMarkdown(text);
-  const regex = /(?:目标说明[：:]\s*([^\n\r]*)\r?\n+)?调用工具[：:]\s*`?([a-zA-Z0-9_\-]+)`?\r?\n+检索内容[：:]\s*`?([\s\S]*?)`?(?=(?:\r?\n\s*目标说明[：:]|\r?\n\s*调用工具[：:]|$))/g;
+  const regex = /目标说明[：:]\s*([^\n\r]*)\r?\n+调用工具[：:]\s*`?([a-zA-Z0-9_\-]+)`?\r?\n+检索内容[：:]\s*`?([\s\S]*?)`?(?=(?:\r?\n\s*目标说明[：:]|\r?\n\s*调用工具[：:]|$))/g;
   const calls = [];
   let match;
 
@@ -918,19 +889,14 @@ function parseTextToolCalls(text, activeTools, defaultOwner = "", defaultRepo = 
     const paramsSchema = matchedTool.function.parameters?.properties || {};
 
     let parsedArgs = {};
-
-    let jsonCandidate = contentArg;
-    if (jsonCandidate.includes("```")) {
-      jsonCandidate = jsonCandidate.replace(/```(?:json)?\s*([\s\S]*?)```/i, "$1").trim();
-    }
-    if (jsonCandidate.startsWith("{") && jsonCandidate.endsWith("}")) {
+    if (contentArg.startsWith("{") && contentArg.endsWith("}")) {
       try {
-        parsedArgs = JSON.parse(jsonCandidate);
+        parsedArgs = JSON.parse(contentArg);
       } catch {}
     }
 
-    if (Object.keys(parsedArgs).length === 0 && (contentArg.includes(":") || contentArg.includes("="))) {
-      const kvMatches = contentArg.matchAll(/([a-zA-Z0-9_]+)\s*[:=：]\s*["']?([^,\n"'\s]+)["']?/g);
+    if (Object.keys(parsedArgs).length === 0 && contentArg.includes(":")) {
+      const kvMatches = contentArg.matchAll(/([a-zA-Z0-9_]+)\s*[:：]\s*([^,\n]+)/g);
       for (const m of kvMatches) {
         const k = m[1].trim();
         const v = m[2].trim();
@@ -940,47 +906,12 @@ function parseTextToolCalls(text, activeTools, defaultOwner = "", defaultRepo = 
       }
     }
 
-    if (paramsSchema.owner && paramsSchema.repo) {
-      if (!parsedArgs.owner || !parsedArgs.repo) {
-        const repoPathMatch = contentArg.match(/^([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+)(?::|\s+path:|\s+file:|\/)(.+)$/i);
-        if (repoPathMatch) {
-          parsedArgs.owner = repoPathMatch[1].trim();
-          parsedArgs.repo = repoPathMatch[2].trim();
-          if (paramsSchema.path && !parsedArgs.path) {
-            parsedArgs.path = repoPathMatch[3].trim().replace(/^[:/\s]+/, "");
-          }
-        } else {
-          const repoOnlyMatch = contentArg.match(/^([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+)(?:\s*\((.*)\))?$/);
-          if (repoOnlyMatch) {
-            parsedArgs.owner = repoOnlyMatch[1].trim();
-            parsedArgs.repo = repoOnlyMatch[2].trim();
-            if (repoOnlyMatch[3]) {
-              const innerKv = repoOnlyMatch[3].matchAll(/([a-zA-Z0-9_]+)\s*[:=：]\s*([^,\n]+)/g);
-              for (const ik of innerKv) {
-                const k = ik[1].trim();
-                let v = ik[2].trim();
-                if (paramsSchema[k]) {
-                  if (v === "true") v = true;
-                  else if (v === "false") v = false;
-                  else if (/^\d+$/.test(v)) v = parseInt(v, 10);
-                  parsedArgs[k] = v;
-                }
-              }
-            }
-          }
-        }
-      }
-
-      if (!parsedArgs.owner && defaultOwner) parsedArgs.owner = defaultOwner;
-      if (!parsedArgs.repo && defaultRepo) parsedArgs.repo = defaultRepo;
-    }
-
-    if (Object.keys(parsedArgs).length === 0 || (paramsSchema.query && !parsedArgs.query)) {
+    if (Object.keys(parsedArgs).length === 0) {
       if (paramsSchema.query) parsedArgs.query = contentArg;
       else if (paramsSchema.q) parsedArgs.q = contentArg;
-      else if (paramsSchema.path && !parsedArgs.path) parsedArgs.path = contentArg;
-      else if (paramsSchema.files && !parsedArgs.files) parsedArgs.files = [contentArg];
-      else if (Object.keys(parsedArgs).length === 0) {
+      else if (paramsSchema.path) parsedArgs.path = contentArg;
+      else if (paramsSchema.files) parsedArgs.files = [contentArg];
+      else {
         const firstProp = Object.keys(paramsSchema)[0];
         if (firstProp) parsedArgs[firstProp] = contentArg;
       }
@@ -2350,7 +2281,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
   });
 
   const systemRules = [
-    "【工具调用透明化与高效并行规范】\n1. 极简聚焦与克制并发：单轮工具调用严格控制在 1~3 个核心目标（绝对严禁超过 3 个）。优先调取最直接相关的核心代码或检索关键定义，获取结果后再按需发起后续调用，严禁一次性盲目铺开罗列数十个调用！\n2. 核心执行约束：必须优先通过底层函数调用机制（Tool Calls）发起调用。若输出操作卡片，正文必须与底层发起的 Tool Calls 严格一一对应，每轮卡片数量上限为 3 个，绝对严禁在正文中脱离底层调用无休止输出卡片纯文本！\n3. 卡片输出规范：在需要调用工具的轮次，正文必须且仅输出如下格式的操作卡片（单轮最多 3 个），每个操作卡片之间使用双换行（\\n\\n）分隔：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n4. 严禁提前输出总结或方案草稿：在所有信息收集、代码排查或修改操作全部完成之前，严禁在中间轮次输出结论、答复文本、分析讲解或开场白！\n5. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n6. 当所有工具调用完毕、进入最终答复轮次时，直接输出完整最终解答，终局轮次严禁输出操作卡片。"
+    "【工具调用透明化与高效并行规范】\n1. 高效并行调用：当需要查阅多个文件、检索多个不同关键词或执行多个无相互依赖的操作时，必须在单轮响应中一次性发起所有工具调用进行并发执行，严禁拆分成多轮逐个调用。\n2. 严禁提前输出总结或方案草稿：在所有信息收集、代码排查或修改操作全部完成之前，严禁在中间轮次输出结论、答复文本、分析讲解或开场白！\n3. 在需要调用工具的轮次，正文必须且仅输出如下格式的操作卡片。若单轮并发调用多个工具，每个操作卡片之间必须使用双换行（\\n\\n）空行彻底分隔，严禁单行连续粘连：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n4. 核心执行约束：输出上述操作卡片的同时，必须同时发起真实的底层工具调用（Tool Calls），严禁仅在正文中打印卡片文本而不发起工具调用！\n5. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n6. 当所有工具调用完毕、进入最终答复轮次时，直接输出完整最终解答，终局轮次严禁输出操作卡片。"
   ];
   const hasCloudflare = tools.some((t) => {
     const n = (t.function?.name || "").toLowerCase();
