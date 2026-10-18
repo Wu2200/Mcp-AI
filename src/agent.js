@@ -1,0 +1,1769 @@
+import crypto from "node:crypto";
+import {
+  getActiveChannel,
+  upstreamChatCompletionsUrl,
+  addDebugLog,
+  sendJson,
+  setCorsHeaders,
+  enabledModels
+} from "./store.js";
+import {
+  mcpToolRegistry,
+  callMcpTool,
+  getAllTools,
+  selectRelevantTools,
+  isWriteTool,
+  extractErrorMessage
+} from "./mcp.js";
+
+export function formatCardMarkdown(text) {
+  if (!text || typeof text !== "string") return text;
+  return text
+    .replace(/([^\n\r])\s*(目标说明[：:])/g, "$1\n\n$2")
+    .replace(/([^\n\r])\s*(调用工具[：:])/g, "$1\n$2")
+    .replace(/([^\n\r])\s*(检索内容[：:])/g, "$1\n$2");
+}
+
+export function parseTextToolCalls(text, activeTools) {
+  if (!text || typeof text !== "string" || !Array.isArray(activeTools) || activeTools.length === 0) {
+    return [];
+  }
+  const cleanText = formatCardMarkdown(text);
+  const regex = /目标说明[：:]\s*([^\n\r]*)\r?\n+调用工具[：:]\s*`?([a-zA-Z0-9_\-]+)`?\r?\n+检索内容[：:]\s*`?([\s\S]*?)`?(?=(?:\r?\n\s*目标说明[：:]|\r?\n\s*调用工具[：:]|$))/g;
+  const calls = [];
+  let match;
+
+  while ((match = regex.exec(cleanText)) !== null) {
+    const rawToolName = match[2].trim();
+    let contentArg = match[3].trim().replace(/^`+|`+$/g, "").trim();
+
+    const matchedTool = activeTools.find((t) => {
+      const name = t.function?.name || "";
+      return name === rawToolName || name.endsWith(`_${rawToolName}`) || rawToolName.endsWith(name);
+    });
+
+    if (!matchedTool) continue;
+    const finalToolName = matchedTool.function.name;
+    const paramsSchema = matchedTool.function.parameters?.properties || {};
+
+    let parsedArgs = {};
+    if (contentArg.startsWith("{") && contentArg.endsWith("}")) {
+      try {
+        parsedArgs = JSON.parse(contentArg);
+      } catch {}
+    }
+
+    if (Object.keys(parsedArgs).length === 0 && paramsSchema.owner && paramsSchema.repo) {
+      const repoPathMatch = contentArg.match(/^([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+)(?::(.*))?$/);
+      if (repoPathMatch) {
+        parsedArgs.owner = repoPathMatch[1].trim();
+        parsedArgs.repo = repoPathMatch[2].trim();
+        const filePath = (repoPathMatch[3] || "").trim().replace(/^[:/\\s]+/, "").replace(/^`|`$/g, "");
+        if (paramsSchema.path && filePath) parsedArgs.path = filePath;
+      }
+    }
+
+    if (Object.keys(parsedArgs).length === 0 && contentArg.includes(":")) {
+      const kvMatches = contentArg.matchAll(/([a-zA-Z0-9_]+)\s*[:：]\s*([^,\n]+)/g);
+      for (const m of kvMatches) {
+        const k = m[1].trim();
+        const v = m[2].trim();
+        if (paramsSchema[k]) {
+          parsedArgs[k] = v;
+        }
+      }
+    }
+
+    if (Object.keys(parsedArgs).length === 0) {
+      if (paramsSchema.query) parsedArgs.query = contentArg;
+      else if (paramsSchema.q) parsedArgs.q = contentArg;
+      else if (paramsSchema.path) parsedArgs.path = contentArg;
+      else if (paramsSchema.files) parsedArgs.files = [contentArg];
+      else {
+        const properties = Object.keys(paramsSchema);
+        if (properties.length === 1) parsedArgs[properties[0]] = contentArg;
+      }
+    }
+
+    calls.push({
+      id: `call_text_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      name: finalToolName,
+      arguments: JSON.stringify(parsedArgs),
+      goal: match[1].trim()
+    });
+  }
+
+  return calls;
+}
+
+export function toolArguments(toolCall) {
+  try {
+    const raw = toolCall.function?.arguments;
+    if (typeof raw === "object" && raw !== null) return raw;
+    const value = JSON.parse(raw || "{}");
+    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+    return value;
+  } catch {
+    return null;
+  }
+}
+
+export async function executeConcurrentPool(items, concurrency, workerFn) {
+  if (!Array.isArray(items) || items.length === 0) return [];
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const poolSize = Math.min(concurrency, items.length);
+  const workers = Array.from({ length: poolSize }, async () => {
+    while (nextIndex < items.length) {
+      const idx = nextIndex++;
+      results[idx] = await workerFn(items[idx], idx);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+export function formatToolCallDetails(args) {
+  if (!args || typeof args !== "object") return "";
+  const parts = [];
+
+  if (args.owner && args.repo) {
+    parts.push(`仓库: ${args.owner}/${args.repo}`);
+  } else if (args.repo) {
+    parts.push(`仓库: ${args.repo}`);
+  } else if (args.owner) {
+    parts.push(`所有者: ${args.owner}`);
+  }
+
+  if (args.path) {
+    parts.push(`路径: ${args.path}`);
+  } else if (args.file || args.filePath || args.filename) {
+    parts.push(`文件: ${args.file || args.filePath || args.filename}`);
+  }
+
+  if (args.old_str !== undefined && args.new_str !== undefined) {
+    parts.push(`局部替换 (${String(args.old_str).length} 字符 -> ${String(args.new_str).length} 字符)`);
+  } else if (Array.isArray(args.edits) && args.edits.length > 0) {
+    parts.push(`批量局部替换 (${args.edits.length} 处)`);
+  }
+
+  if (Array.isArray(args.files) && args.files.length > 0) {
+    const filePaths = args.files
+      .map((f) => (typeof f === "string" ? f : f?.path || ""))
+      .filter(Boolean);
+    if (filePaths.length > 0) {
+      parts.push(`涉及文件: ${filePaths.slice(0, 3).join(", ")}${filePaths.length > 3 ? " 等" : ""}`);
+    }
+  }
+
+  if (args.query) {
+    const q = String(args.query).replace(/[\r\n\t]+/g, " ").trim();
+    parts.push(`查询: ${q.length > 60 ? `${q.slice(0, 60)}...` : q}`);
+  } else if (args.q) {
+    const q = String(args.q).replace(/[\r\n\t]+/g, " ").trim();
+    parts.push(`查询: ${q.length > 60 ? `${q.slice(0, 60)}...` : q}`);
+  }
+
+  if (args.branch) {
+    parts.push(`分支: ${args.branch}`);
+  } else if (args.ref) {
+    parts.push(`引用: ${args.ref}`);
+  }
+
+  if (args.pullNumber || args.pull_number) {
+    parts.push(`PR #${args.pullNumber || args.pull_number}`);
+  }
+
+  if (args.issue_number || args.issueNumber) {
+    parts.push(`Issue #${args.issue_number || args.issueNumber}`);
+  }
+
+  if (args.message) {
+    const m = String(args.message).replace(/[\r\n\t]+/g, " ").trim();
+    parts.push(`说明: ${m.length > 40 ? `${m.slice(0, 40)}...` : m}`);
+  }
+
+  if (args.url) {
+    const u = String(args.url).trim();
+    parts.push(`地址: ${u.length > 60 ? `${u.slice(0, 60)}...` : u}`);
+  }
+
+  if (parts.length === 0) {
+    const keys = Object.keys(args).filter((k) => typeof args[k] === "string" || typeof args[k] === "number");
+    for (const k of keys.slice(0, 2)) {
+      const v = String(args[k]).replace(/[\r\n\t]+/g, " ").trim();
+      if (v) {
+        parts.push(`${k}: ${v.length > 40 ? `${v.slice(0, 40)}...` : v}`);
+      }
+    }
+  }
+
+  return parts.join(", ");
+}
+
+export function redactToolArguments(value, key = "") {
+  if (/api.?key|token|secret|password|authorization|credential/i.test(key)) {
+    return "[已隐藏]";
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => redactToolArguments(item));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([childKey, childValue]) => [
+        childKey,
+        redactToolArguments(childValue, childKey)
+      ])
+    );
+  }
+  if (typeof value === "string" && value.length > 500) {
+    return `${value.slice(0, 500)}...`;
+  }
+  return value;
+}
+
+export function buildChineseToolGoal(rawAction, userText) {
+  const action = String(rawAction || "").toLowerCase();
+  const knownGoals = [
+    [/get_me$/, "获取当前 GitHub 用户的基本信息"],
+    [/get_file_contents$/, "读取指定文件或目录内容"],
+    [/get_repository_tree$/, "查看仓库目录结构"],
+    [/list_commits$/, "查看仓库提交记录"],
+    [/get_commit$/, "查看提交详情"],
+    [/search_code$/, "搜索仓库代码"],
+    [/search_repositories$/, "搜索 GitHub 仓库"],
+    [/list_pull_requests$/, "查看拉取请求列表"],
+    [/get_pull_request$/, "查看拉取请求详情"],
+    [/list_issues$/, "查看仓库问题列表"],
+    [/search_issues$/, "搜索相关问题"],
+    [/create_or_update_file$/, "创建或更新仓库文件"],
+    [/github_edit_file$/, "修改 GitHub 仓库文件"]
+  ];
+  const knownGoal = knownGoals.find(([pattern]) => pattern.test(action));
+  if (knownGoal) return knownGoal[1];
+
+  const request = typeof userText === "string"
+    ? userText.replace(/[\r\n\t]+/g, " ").trim()
+    : "";
+  if (/[\u3400-\u9fff]/.test(request)) {
+    return `根据用户请求执行：${request.slice(0, 120)}`;
+  }
+  return "根据用户请求执行相关工具操作";
+}
+
+export function formatToolActionCard(toolCall, activeTools, userText = "") {
+  const toolName = toolCall.function?.name || toolCall.name || "unknown_tool";
+  const toolInfo = mcpToolRegistry.get(toolName) || Array.from(mcpToolRegistry.entries())
+    .find(([key, info]) => key.endsWith(toolName) || toolName.endsWith(info.rawName))?.[1];
+  const rawAction = toolInfo?.rawName || toolName;
+  const rawArguments = toolCall.function?.arguments ?? toolCall.arguments;
+  const parsedArguments = toolArguments({ function: { arguments: rawArguments } }) || {};
+  const safeArguments = redactToolArguments(parsedArguments);
+  const explicitGoal = String(toolCall.goal || "").replace(/[\r\n]+/g, " ").trim();
+  const goal = (/[\u3400-\u9fff]/.test(explicitGoal) ? explicitGoal : buildChineseToolGoal(rawAction, userText))
+    .slice(0, 180);
+  let details = formatToolCallDetails(safeArguments);
+  if (!details) {
+    details = JSON.stringify(safeArguments);
+    if (details.length > 300) details = `${details.slice(0, 300)}...`;
+  }
+  return `目标说明：${goal}\n调用工具：\`${rawAction}\`\n检索内容：${details}`;
+}
+
+export function generateToolCallKey(toolName, args) {
+  if (!args || typeof args !== "object") return `${toolName}:{}`;
+  try {
+    const sortedKeys = Object.keys(args).sort();
+    const normalized = {};
+    for (const k of sortedKeys) {
+      normalized[k] = args[k];
+    }
+    return `${toolName}:${JSON.stringify(normalized)}`;
+  } catch {
+    return `${toolName}:${JSON.stringify(args)}`;
+  }
+}
+
+export function sendSSEChunk(clientResponse, delta, model = "default") {
+  const chunk = {
+    id: `chatcmpl-${Date.now()}`,
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [
+      {
+        index: 0,
+        delta,
+        finish_reason: null
+      }
+    ]
+  };
+  clientResponse.write(`data: ${JSON.stringify(chunk)}\n\n`);
+}
+
+export function sendReasoningChunk(clientResponse, text, model = "default") {
+  sendSSEChunk(clientResponse, { reasoning_content: text }, model);
+}
+
+export function isTruncatedFinishReason(reason) {
+  if (!reason || typeof reason !== "string") return false;
+  const r = reason.toLowerCase().trim();
+  return (
+    r === "length" ||
+    r === "max_tokens" ||
+    r === "model_length" ||
+    r.includes("max_output_tokens") ||
+    r === "incomplete"
+  );
+}
+
+export function extractFinishReason(parsedChunkOrJson) {
+  if (!parsedChunkOrJson || typeof parsedChunkOrJson !== "object") return null;
+  const choice = parsedChunkOrJson.choices?.[0];
+  if (choice) {
+    if (choice.finish_reason) return choice.finish_reason;
+    if (choice.finishReason) return choice.finishReason;
+  }
+  const candidate = parsedChunkOrJson.candidates?.[0];
+  if (candidate?.finishReason) return candidate.finishReason;
+  if (parsedChunkOrJson.finish_reason) return parsedChunkOrJson.finish_reason;
+  if (parsedChunkOrJson.finishReason) return parsedChunkOrJson.finish_reason;
+  if (parsedChunkOrJson.status === "incomplete" && parsedChunkOrJson.incomplete_details?.reason) {
+    return parsedChunkOrJson.incomplete_details.reason;
+  }
+  return null;
+}
+
+export function isTitleGenerationRequest(userText) {
+  if (!userText || typeof userText !== "string") return false;
+  return (
+    /give this conversation a name/i.test(userText) ||
+    /based on the chat history,\s*give this conversation/i.test(userText) ||
+    /generate a (?:short )?title for this conversation/i.test(userText)
+  );
+}
+
+export function detectActionIntent(userText) {
+  if (!userText || typeof userText !== "string") {
+    return { needsTool: false, isWrite: false };
+  }
+  const text = userText.trim();
+  if (isTitleGenerationRequest(text)) {
+    return { needsTool: false, isWrite: false };
+  }
+
+  const isConsultation =
+    /^(?:为什么|为啥|为何|请问|帮我看下为什么|分析|排查原因|查下原因|怎么回事|怎么会|why|how|what)/i.test(text) ||
+    /(?:为什么|为啥|为何|怎么回事|正常吗)[？?\s]*$/i.test(text);
+  if (isConsultation && !/(?:帮我|直接|请|现在).*(?:修改|改一下|修复|更新|写入|提交|替换)/i.test(text)) {
+    return { needsTool: false, isWrite: false };
+  }
+
+  const writeVerb = /(修改|修改下|改下|改一下|修一下|修复|更新|更新下|添加|增加|加一个|删除|删掉|重写|创建|新建|写入|覆盖|替换|调整|优化|补齐|同步|把.+改成|提交|推送|commit|push|write|update|create|delete|edit)/i;
+  const writeTarget = /(代码|文件|配置|仓库|bug|接口|函数|样式|组件|依赖|项目|分支|插件|脚本|产物|测试|pr|github|readme|dist|\.[a-z0-9]{1,6})/i;
+  const isDirectWrite = writeVerb.test(text) && (writeTarget.test(text) || text.length <= 60);
+
+  const readVerb = /(查看|看一下|读取|获取|搜索|查一下|查找|找一下|列出|分析|检查|排查|看看|读一下|fetch|get|read|search|list)/i;
+  const readTarget = /(文件|代码|目录|仓库|分支|提交|日志|报错|错误|问题|原因|commit|pr|issue|内容|log|\.[a-z0-9]{1,6})/i;
+  const isDirectRead = readVerb.test(text) && (readTarget.test(text) || text.length <= 60);
+
+  const isWrite = Boolean(isDirectWrite);
+  const needsTool = Boolean(isDirectWrite || isDirectRead);
+  return { needsTool, isWrite };
+}
+
+export function isModelEnabledForMcp(modelName) {
+  if (!modelName || enabledModels.size === 0) return false;
+  const target = modelName.trim().toLowerCase();
+  for (const m of enabledModels) {
+    const pattern = m.trim().toLowerCase();
+    if (!pattern) continue;
+    if (pattern === target) return true;
+    if (pattern.includes("*")) {
+      const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+      const regex = new RegExp(`^${escaped}$`, "i");
+      if (regex.test(target)) return true;
+    }
+  }
+  return false;
+}
+
+export async function passThrough(requestBody, clientResponse, reqMeta, abortSignal) {
+  setCorsHeaders(clientResponse);
+  const isStream = requestBody.stream === true;
+  const channel = getActiveChannel();
+  if (!channel) {
+    throw new Error("未配置上游渠道环境变量");
+  }
+  const targetUrl = upstreamChatCompletionsUrl(channel);
+
+  addDebugLog("UPSTREAM", `[直通模式] [${channel.name}] 转发请求至上游: ${requestBody.model || "default"} - stream=${isStream}`, {
+    channel: channel.name,
+    url: targetUrl,
+    model: requestBody.model,
+    stream: isStream,
+    messagesCount: requestBody.messages?.length || 0,
+    upstreamPayloadSummary: {
+      reasoning_effort: requestBody.reasoning_effort,
+      thinkingConfig: requestBody.thinkingConfig,
+      thinking_budget: requestBody.thinking_budget
+    }
+  });
+
+  let currentMessages = [...(requestBody.messages || [])];
+  let continueRound = 0;
+  const MAX_AUTO_CONTINUES = 30;
+  let hasInitiatedStream = false;
+  let fullAccumulatedContent = "";
+
+  while (continueRound <= MAX_AUTO_CONTINUES) {
+    if (abortSignal?.aborted || clientResponse.destroyed) {
+      addDebugLog("DOWNSTREAM", `[直通模式] 客户端已断开，终止请求与续接`);
+      break;
+    }
+
+    let upstreamResponse;
+    const roundStartTime = Date.now();
+    if (continueRound > 0) {
+      addDebugLog("UPSTREAM", `[直通模式] [${channel.name}] 第 ${continueRound + 1} 轮断点续接上游请求 - 消息量: ${currentMessages.length}`);
+    }
+
+    try {
+      upstreamResponse = await fetch(targetUrl, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${channel.apiKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          ...requestBody,
+          messages: currentMessages
+        }),
+        signal: abortSignal
+      });
+    } catch (err) {
+      if (abortSignal?.aborted || err.name === "AbortError") {
+        addDebugLog("DOWNSTREAM", `[直通模式] 客户端已断开，上游请求已中止`);
+        return;
+      }
+      throw err;
+    }
+
+    const duration = Date.now() - roundStartTime;
+    addDebugLog("UPSTREAM", `[直通模式] [${channel.name}] 上游响应状态: ${upstreamResponse.status} - 耗时 ${duration}ms`, {
+      channel: channel.name,
+      status: upstreamResponse.status,
+      contentType: upstreamResponse.headers.get("Content-Type")
+    });
+
+    if (abortSignal?.aborted || clientResponse.destroyed) {
+      addDebugLog("DOWNSTREAM", `[直通模式] 客户端已断开，终止处理`);
+      return;
+    }
+
+    if (!upstreamResponse.ok) {
+      const errTxt = await upstreamResponse.text();
+      addDebugLog("ERROR", `[直通模式] [${channel.name}] 上游报错 (${upstreamResponse.status})`, errTxt);
+      if (isStream && hasInitiatedStream) {
+        const errorChunk = {
+          id: `chatcmpl-${Date.now()}`,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: requestBody.model || "default",
+          choices: [
+            {
+              index: 0,
+              delta: { content: `\n\n⚠️ [上游接口返回错误 ${upstreamResponse.status}]: ${errTxt.slice(0, 500)}` },
+              finish_reason: "stop"
+            }
+          ]
+        };
+        clientResponse.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
+        clientResponse.write("data: [DONE]\n\n");
+        clientResponse.end();
+      } else {
+        sendJson(clientResponse, upstreamResponse.status, {
+          error: { code: upstreamResponse.status, message: errTxt }
+        });
+      }
+      return;
+    }
+
+    if (!isStream) {
+      const json = await upstreamResponse.json();
+      if (abortSignal?.aborted || clientResponse.destroyed) return;
+      const rawReason = extractFinishReason(json);
+      const choice = json.choices?.[0];
+      const content = choice?.message?.content || "";
+      fullAccumulatedContent += content;
+
+      if (isTruncatedFinishReason(rawReason) && content && !abortSignal?.aborted && !clientResponse.destroyed) {
+        continueRound += 1;
+        addDebugLog("AGENT", `⚠️ [抗截断触发] 直通非流式检测到截断 (${rawReason})！正在自动进行第 ${continueRound} 次无感断点续接...`, {
+          round: continueRound,
+          finishReason: rawReason,
+          accumulatedLength: fullAccumulatedContent.length
+        });
+        currentMessages = [
+          ...currentMessages,
+          { role: "assistant", content },
+          { role: "user", content: "请紧接着上一句未说完的内容继续输出，不要重复前面已输出的任何字，不要有任何多余的开场白。" }
+        ];
+        continue;
+      }
+
+      if (continueRound > 0 && choice?.message) {
+        choice.message.content = fullAccumulatedContent;
+      }
+      addDebugLog("UPSTREAM", `[直通模式] [${channel.name}] 非流式完成输出 - 结束原因: ${rawReason || "stop"}`);
+      sendJson(clientResponse, 200, json);
+      return;
+    }
+
+    if (!hasInitiatedStream) {
+      clientResponse.writeHead(200, {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive"
+      });
+      hasInitiatedStream = true;
+    }
+
+    let buffer = "";
+    let roundContent = "";
+    let lastFinishReason = null;
+    const reader = upstreamResponse.body.getReader();
+    const decoder = new TextDecoder();
+
+    try {
+      while (true) {
+        if (abortSignal?.aborted || clientResponse.destroyed) {
+          addDebugLog("DOWNSTREAM", `[直通模式] 客户端在流式传输中断开连接，已停止上游拉取`);
+          await reader.cancel().catch(() => {});
+          break;
+        }
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith("data:")) continue;
+          const dataStr = trimmed.slice(5).trim();
+          if (dataStr === "[DONE]") continue;
+
+          try {
+            const parsed = JSON.parse(dataStr);
+            const choice = parsed.choices?.[0];
+            const reason = extractFinishReason(parsed);
+            if (reason) {
+              lastFinishReason = reason;
+            }
+            if (choice?.delta?.content) {
+              roundContent += choice.delta.content;
+            }
+
+            if (isTruncatedFinishReason(reason)) {
+              const sanitized = {
+                ...parsed,
+                choices: choice ? [{ ...choice, finish_reason: null, finishReason: null }] : []
+              };
+              clientResponse.write(`data: ${JSON.stringify(sanitized)}\n\n`);
+            } else {
+              clientResponse.write(`${line}\n\n`);
+            }
+          } catch {
+            clientResponse.write(`${line}\n\n`);
+          }
+        }
+      }
+    } catch (err) {
+      if (abortSignal?.aborted || err.name === "AbortError") {
+        addDebugLog("DOWNSTREAM", `[直通模式] 客户端中断传输`);
+        return;
+      }
+      throw err;
+    }
+
+    if (abortSignal?.aborted || clientResponse.destroyed) {
+      addDebugLog("DOWNSTREAM", `[直通模式] 客户端已断开，终止自动续接`);
+      break;
+    }
+
+    fullAccumulatedContent += roundContent;
+
+    if (isTruncatedFinishReason(lastFinishReason) && roundContent && !abortSignal?.aborted && !clientResponse.destroyed) {
+      continueRound += 1;
+      addDebugLog("AGENT", `⚠️ [抗截断触发] 直通流式检测到截断 (${lastFinishReason})！正在自动进行第 ${continueRound} 次无感断点续接...`, {
+        round: continueRound,
+        finishReason: lastFinishReason,
+        accumulatedLength: fullAccumulatedContent.length
+      });
+      currentMessages = [
+        ...currentMessages,
+        { role: "assistant", content: roundContent },
+        { role: "user", content: "请紧接着上一句未说完的内容继续输出，不要重复前面已输出的任何字，不要有任何多余的开场白。" }
+      ];
+      continue;
+    }
+
+    addDebugLog("UPSTREAM", `[直通模式] [${channel.name}] 流式完成输出 - 结束原因: ${lastFinishReason || "stop"}`);
+    break;
+  }
+
+  if (!abortSignal?.aborted && !clientResponse.destroyed) {
+    clientResponse.write("data: [DONE]\n\n");
+    clientResponse.end();
+  }
+}
+
+export function convertGeminiToOpenAIMessages(body) {
+  const messages = [];
+  if (body.systemInstruction?.parts) {
+    const sysText = body.systemInstruction.parts.map((p) => p.text || "").join("\n");
+    if (sysText) messages.push({ role: "system", content: sysText });
+  }
+  if (Array.isArray(body.contents)) {
+    for (const c of body.contents) {
+      const role = c.role === "model" ? "assistant" : "user";
+      const parts = Array.isArray(c.parts) ? c.parts : [];
+      const contentItems = [];
+      const toolCalls = [];
+      let hasImage = false;
+
+      for (const p of parts) {
+        if (p.text) {
+          contentItems.push({ type: "text", text: p.text });
+        }
+        const idata = p.inlineData || p.inline_data;
+        if (idata) {
+          hasImage = true;
+          const mime = idata.mimeType || idata.mime_type || "image/jpeg";
+          const b64 = idata.data || "";
+          const url = b64.startsWith("data:") ? b64 : `data:${mime};base64,${b64}`;
+          contentItems.push({
+            type: "image_url",
+            image_url: { url }
+          });
+        }
+        const fdata = p.fileData || p.file_data;
+        if (fdata) {
+          hasImage = true;
+          const uri = fdata.fileUri || fdata.file_uri || "";
+          contentItems.push({
+            type: "image_url",
+            image_url: { url: uri }
+          });
+        }
+        if (p.functionCall) {
+          toolCalls.push({
+            id: `call_${crypto.randomUUID()}`,
+            type: "function",
+            function: {
+              name: p.functionCall.name,
+              arguments: JSON.stringify(p.functionCall.args || {})
+            }
+          });
+        }
+        if (p.functionResponse) {
+          messages.push({
+            role: "tool",
+            tool_call_id: p.functionResponse.id || `call_${crypto.randomUUID()}`,
+            content: JSON.stringify(p.functionResponse.response || {})
+          });
+        }
+      }
+
+      let finalContent = null;
+      if (hasImage) {
+        finalContent = contentItems;
+      } else if (contentItems.length > 0) {
+        finalContent = contentItems.map((item) => item.text).join("");
+      }
+
+      if (finalContent !== null || toolCalls.length > 0) {
+        const msg = { role, content: finalContent };
+        if (toolCalls.length > 0) msg.tool_calls = toolCalls;
+        messages.push(msg);
+      }
+    }
+  }
+  return messages;
+}
+
+export function convertOpenAiChunkToGemini(parsedChunk) {
+  const choice = parsedChunk.choices?.[0];
+  const delta = choice?.delta;
+  const parts = [];
+
+  if (delta?.reasoning_content) {
+    parts.push({
+      thought: true,
+      text: delta.reasoning_content
+    });
+  }
+
+  if (delta?.content) {
+    parts.push({
+      text: formatCardMarkdown(delta.content)
+    });
+  }
+
+  const rawReason = extractFinishReason(parsedChunk);
+  let finishReason = undefined;
+  if (rawReason) {
+    const r = String(rawReason).toLowerCase().trim();
+    if (r === "stop") finishReason = "STOP";
+    else if (isTruncatedFinishReason(rawReason)) finishReason = "MAX_TOKENS";
+  }
+
+  return {
+    candidates: [
+      {
+        content: {
+          parts: parts.length > 0 ? parts : [{ text: "" }],
+          role: "model"
+        },
+        finishReason,
+        index: 0
+      }
+    ]
+  };
+}
+
+export async function passThroughAndTransformGemini(requestBody, clientResponse, isStream, abortSignal) {
+  const startTime = Date.now();
+  const channel = getActiveChannel();
+  if (!channel) {
+    throw new Error("未配置上游渠道环境变量");
+  }
+  const targetUrl = upstreamChatCompletionsUrl(channel);
+
+  addDebugLog("UPSTREAM", `[Gemini 直通模式] [${channel.name}] 转发转换至上游: ${requestBody.model || "default"}`, {
+    channel: channel.name,
+    url: targetUrl,
+    model: requestBody.model,
+    stream: isStream,
+    messagesCount: requestBody.messages?.length || 0
+  });
+
+  let currentMessages = [...requestBody.messages];
+  let continueRound = 0;
+  const MAX_AUTO_CONTINUES = 30;
+  let hasInitiatedStream = false;
+
+  while (continueRound <= MAX_AUTO_CONTINUES) {
+    if (abortSignal?.aborted || clientResponse.destroyed) {
+      addDebugLog("DOWNSTREAM", `[Gemini 直通模式] 客户端已断开，终止续接`);
+      break;
+    }
+
+    let upstreamResponse;
+    try {
+      upstreamResponse = await fetch(targetUrl, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${channel.apiKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          ...requestBody,
+          messages: currentMessages
+        }),
+        signal: abortSignal
+      });
+    } catch (err) {
+      if (abortSignal?.aborted || err.name === "AbortError") {
+        addDebugLog("DOWNSTREAM", `[Gemini 直通模式] 客户端已中止请求`);
+        return;
+      }
+      throw err;
+    }
+
+    const duration = Date.now() - startTime;
+    addDebugLog("UPSTREAM", `[Gemini 直通模式] [${channel.name}] 上游响应状态: ${upstreamResponse.status} - 耗时 ${duration}ms`, {
+      channel: channel.name,
+      status: upstreamResponse.status,
+      contentType: upstreamResponse.headers.get("Content-Type")
+    });
+
+    if (abortSignal?.aborted || clientResponse.destroyed) return;
+
+    if (!upstreamResponse.ok) {
+      const errTxt = await upstreamResponse.text();
+      sendJson(clientResponse, upstreamResponse.status, {
+        error: { code: upstreamResponse.status, message: errTxt }
+      });
+      return;
+    }
+
+    if (!isStream) {
+      const json = await upstreamResponse.json();
+      if (abortSignal?.aborted || clientResponse.destroyed) return;
+      const choice = json.choices?.[0];
+      const candidateText = choice?.message?.content || "";
+      const reasoning = choice?.message?.reasoning_content || "";
+      const parts = [];
+      if (reasoning) parts.push({ thought: true, text: reasoning });
+      if (candidateText) parts.push({ text: candidateText });
+
+      const rawReason = extractFinishReason(json);
+      const geminiResp = {
+        candidates: [
+          {
+            content: { parts: parts.length > 0 ? parts : [{ text: "" }], role: "model" },
+            finishReason: isTruncatedFinishReason(rawReason) ? "MAX_TOKENS" : "STOP",
+            index: 0
+          }
+        ]
+      };
+      sendJson(clientResponse, 200, geminiResp);
+      return;
+    }
+
+    if (!hasInitiatedStream) {
+      setCorsHeaders(clientResponse);
+      clientResponse.writeHead(200, {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive"
+      });
+      hasInitiatedStream = true;
+    }
+
+    let buffer = "";
+    let accumulatedContent = "";
+    let lastFinishReason = null;
+    const reader = upstreamResponse.body.getReader();
+    const decoder = new TextDecoder();
+
+    try {
+      while (true) {
+        if (abortSignal?.aborted || clientResponse.destroyed) {
+          addDebugLog("DOWNSTREAM", `[Gemini 直通模式] 客户端在流式传输中断开连接，已停止上游拉取`);
+          await reader.cancel().catch(() => {});
+          break;
+        }
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith("data:")) continue;
+          const dataStr = trimmed.slice(5).trim();
+          if (dataStr === "[DONE]") continue;
+          try {
+            const parsed = JSON.parse(dataStr);
+            const choice = parsed.choices?.[0];
+            const reason = extractFinishReason(parsed);
+            if (reason) {
+              lastFinishReason = reason;
+            }
+            if (choice?.delta?.content) {
+              accumulatedContent += choice.delta.content;
+            }
+            if (isTruncatedFinishReason(reason)) {
+              const geminiChunk = convertOpenAiChunkToGemini({
+                ...parsed,
+                choices: choice ? [{ ...choice, finish_reason: null, finishReason: null }] : []
+              });
+              clientResponse.write(`data: ${JSON.stringify(geminiChunk)}\n\n`);
+            } else {
+              const geminiChunk = convertOpenAiChunkToGemini(parsed);
+              clientResponse.write(`data: ${JSON.stringify(geminiChunk)}\n\n`);
+            }
+          } catch {}
+        }
+      }
+    } catch (err) {
+      if (abortSignal?.aborted || err.name === "AbortError") {
+        addDebugLog("DOWNSTREAM", `[Gemini 直通模式] 客户端中断传输`);
+        return;
+      }
+      throw err;
+    }
+
+    if (abortSignal?.aborted || clientResponse.destroyed) {
+      addDebugLog("DOWNSTREAM", `[Gemini 直通模式] 客户端已断开，终止自动续接`);
+      break;
+    }
+
+    if (isTruncatedFinishReason(lastFinishReason) && accumulatedContent && !abortSignal?.aborted && !clientResponse.destroyed) {
+      continueRound += 1;
+      addDebugLog("AGENT", `⚠️ [抗截断触发] 检测到上游返回截断 (${lastFinishReason})！正在自动进行第 ${continueRound} 次无感断点续接...`, {
+        round: continueRound,
+        finishReason: lastFinishReason,
+        accumulatedLength: accumulatedContent.length
+      });
+      currentMessages = [
+        ...currentMessages,
+        { role: "assistant", content: accumulatedContent },
+        { role: "user", content: "请紧接着上一句未说完的内容继续输出，不要重复前面已输出的任何字，不要有任何多余的开场白。" }
+      ];
+      continue;
+    }
+
+    break;
+  }
+
+  if (!abortSignal?.aborted && !clientResponse.destroyed) {
+    clientResponse.write("data: [DONE]\n\n");
+    clientResponse.end();
+  }
+}
+
+export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
+  if (!Array.isArray(requestBody.messages) || requestBody.messages.length === 0) {
+    throw new Error("messages 必须是非空数组");
+  }
+
+  const channel = getActiveChannel();
+  if (!channel) {
+    throw new Error("未配置上游渠道环境变量");
+  }
+  const targetUrl = upstreamChatCompletionsUrl(channel);
+
+  const isStream = requestBody.stream === true;
+  let messages = [...requestBody.messages];
+
+  const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
+  const userText = typeof lastUserMsg?.content === "string"
+    ? lastUserMsg.content
+    : (Array.isArray(lastUserMsg?.content) ? lastUserMsg.content.map((c) => c.text || "").join(" ") : "");
+
+  const clientTools = Array.isArray(requestBody.tools)
+    ? requestBody.tools.filter((t) => t && t.type === "function")
+    : [];
+  const rawMcpTools = getAllTools();
+  const relevantMcpTools = selectRelevantTools(userText, rawMcpTools);
+  const tools = [...clientTools, ...relevantMcpTools];
+
+  const { needsTool, isWrite } = detectActionIntent(userText);
+
+  addDebugLog("AGENT", `启动 MCP 调度 [${channel.name}] - 模型 [${requestBody.model}] - 挂载工具数: ${tools.length} - 动作需求: ${needsTool} (写操作: ${isWrite})`, {
+    channel: channel.name,
+    model: requestBody.model,
+    stream: isStream,
+    toolCount: tools.length,
+    needsTool,
+    isWrite,
+    initialMessages: messages.length
+  });
+
+  const systemRules = [
+    "【工具调用透明化与高效并行规范】\n1. 单轮最多规划并发调用 3 个最相关的真实工具；若目标较多，先执行优先级最高的 1~3 项，取得结果后再决定下一步，禁止一次性铺开大量调用。\n2. 严禁提前输出总结或方案草稿：在所有信息收集、代码排查或修改操作全部完成之前，严禁在中间轮次输出结论、答复文本、分析讲解或开场白！\n3. 优先使用原生 Tool Calls。仅当上游未发出原生调用时，才允许使用操作卡片作为兼容兜底；每轮最多 3 张，且必须对应真实工具调用。多个卡片之间必须使用双换行（\\n\\n）空行彻底分隔，严禁单行连续粘连：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n4. 核心执行约束：输出上述操作卡片的同时，必须同时发起真实的底层工具调用（Tool Calls），严禁仅在正文中打印卡片文本而不发起工具调用！\n5. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n6. 当所有工具调用完毕、进入最终答复轮次时，直接输出完整最终解答，终局轮次严禁输出操作卡片。"
+  ];
+  const hasCloudflare = tools.some((t) => {
+    const n = (t.function?.name || "").toLowerCase();
+    return n.includes("cloudflare");
+  });
+  if (hasCloudflare) {
+    systemRules.push(
+      "【Cloudflare 工具执行规范】\n1. 沙箱内已预置带有鉴权的全局客户端 `cloudflare.request({ method, path, body, contentType, rawBody })` 与全局变量 `accountId`。严禁自行拼接 BaseURL 或使用原生 fetch()，必须直接使用 `cloudflare.request`。\n2. 读取 Worker 脚本: `cloudflare.request({ method: 'GET', path: `/accounts/${accountId}/workers/scripts/${name}` })`。\n3. 更新单文件 Worker 脚本: `cloudflare.request({ method: 'PUT', path: `/accounts/${accountId}/workers/scripts/${name}`, body: codeString, contentType: 'application/javascript', rawBody: true })`（若为模块 Worker 则按 multipart/form-data 格式）。切勿盲目遍历搜索庞大的 OpenAPI 规范。\n4. 若操作对象是 Cloudflare 资源，切勿跨平台在 GitHub 相关工具上搜索无关个人或仓库。"
+    );
+  }
+  if (isWrite) {
+    systemRules.push(
+      "【执行规范】检测到代码或配置修改任务。请根据目标资源类型选择匹配的工具：\n- 若修改 GitHub 仓库文件，优先调用局部修改工具（如 github_edit_file）替换代码片段；\n- 若修改 Cloudflare Worker/KV 等远程云资源，直接使用 Cloudflare 工具处理，严禁跨平台跑到 GitHub 检索无关个人或仓库；\n- 修改已有代码前先快速获取关键逻辑上下文，一旦定位根因立即收敛修改，避免多轮无效探索。"
+    );
+  }
+
+  const combinedSystemPrompt = systemRules.join("\n\n");
+  if (messages.length > 0 && messages[0].role === "system") {
+    messages[0] = {
+      ...messages[0],
+      content: `${messages[0].content}\n\n${combinedSystemPrompt}`
+    };
+  } else {
+    messages.unshift({
+      role: "system",
+      content: combinedSystemPrompt
+    });
+  }
+
+  if (isStream) {
+    setCorsHeaders(clientResponse);
+    clientResponse.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no"
+    });
+  }
+
+  let keepAliveTimer = null;
+  if (isStream) {
+    keepAliveTimer = setInterval(() => {
+      if (abortSignal?.aborted || clientResponse.destroyed) {
+        clearInterval(keepAliveTimer);
+        return;
+      }
+      try {
+        clientResponse.write(": keep-alive\n\n");
+      } catch {}
+    }, 4000);
+  }
+
+  let finalFinishReason = null;
+  let executedToolCount = 0;
+  const toolCallHistory = new Map();
+  const dialogReadCache = new Map();
+  let hasWriteSuccess = false;
+  let consecutiveFailures = 0;
+  const displayedActionCards = [];
+  const MAX_AGENT_ROUNDS = 35;
+  const MAX_TOOL_CALLS_PER_ROUND = 3;
+
+  try {
+    for (let round = 0; round < MAX_AGENT_ROUNDS; round += 1) {
+      if (abortSignal?.aborted || clientResponse.destroyed) {
+        addDebugLog("DOWNSTREAM", `客户端已断开，终止 MCP 调度循环`);
+        break;
+      }
+
+      if (messages.length > 30) {
+        for (let i = 0; i < messages.length - 15; i += 1) {
+          const m = messages[i];
+          if (m && m.role === "tool" && typeof m.content === "string" && m.content.length > 2000) {
+            m.content = m.content.slice(0, 1000) + "\n\n[历史输出已精简]";
+          }
+        }
+      }
+
+      let roundMessages = [...messages];
+      if (consecutiveFailures >= 2 && roundMessages.length > 0 && roundMessages[0].role === "system") {
+        roundMessages[0] = {
+          ...roundMessages[0],
+          content: `${roundMessages[0].content}\n\n【错误自愈与收敛提示】检测到前序工具调用返回错误。请先检查参数与目标环境是否正确，切勿在未知或不存在的端点上机械试错；若核心逻辑已通过排查查明，请直接聚焦于问题修复与交付，避免过度扩散探索。`
+        };
+      }
+
+      const activeTools = tools;
+      let activeToolChoice = "auto";
+
+      const payload = {
+        ...requestBody,
+        messages: roundMessages,
+        stream: isStream
+      };
+
+      if (activeTools.length > 0) {
+        payload.tools = activeTools;
+        payload.tool_choice = activeToolChoice;
+      }
+
+      const roundStartTime = Date.now();
+      addDebugLog("UPSTREAM", `[${channel.name}] 第 ${round + 1} 轮上游调用请求 - 消息量: ${roundMessages.length}`, {
+        channel: channel.name,
+        round: round + 1,
+        toolsEnabled: Boolean(payload.tools),
+        tool_choice: payload.tool_choice,
+        messagesCount: roundMessages.length
+      });
+
+      let upstreamResponse;
+      try {
+        upstreamResponse = await fetch(targetUrl, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${channel.apiKey}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(payload),
+          signal: abortSignal
+        });
+      } catch (err) {
+        if (abortSignal?.aborted || err.name === "AbortError") {
+          addDebugLog("DOWNSTREAM", `第 ${round + 1} 轮上游请求被客户端中止`);
+          return;
+        }
+        throw err;
+      }
+
+      const roundDuration = Date.now() - roundStartTime;
+      if (abortSignal?.aborted || clientResponse.destroyed) return;
+
+      if (!upstreamResponse.ok) {
+        const errText = await upstreamResponse.text();
+        addDebugLog("ERROR", `[${channel.name}] 第 ${round + 1} 轮上游报错 (${upstreamResponse.status}) - 耗时 ${roundDuration}ms`, errText);
+
+        if (isStream) {
+          const errorChunk = {
+            id: `chatcmpl-${Date.now()}`,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: requestBody.model || "default",
+            choices: [
+              {
+                index: 0,
+                delta: { content: `\n\n⚠️ [上游接口返回错误 ${upstreamResponse.status}]: ${errText.slice(0, 500)}` },
+                finish_reason: "stop"
+              }
+            ]
+          };
+          if (!clientResponse.destroyed && !abortSignal?.aborted) {
+            clientResponse.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
+            clientResponse.write("data: [DONE]\n\n");
+            clientResponse.end();
+          }
+          return;
+        }
+        throw new Error(`上游接口返回错误 (${upstreamResponse.status})：${errText.slice(0, 500)}`);
+      }
+
+      if (!isStream) {
+        const json = await upstreamResponse.json();
+        if (abortSignal?.aborted || clientResponse.destroyed) return;
+        const choice = json.choices?.[0];
+        const message = choice?.message;
+        const toolCalls = message?.tool_calls || [];
+        finalFinishReason = extractFinishReason(json);
+
+        let mcpCalls = toolCalls.filter((tc) => {
+          if (!tc || !tc.function?.name) return false;
+          const name = tc.function.name;
+          if (mcpToolRegistry.has(name)) return true;
+          for (const [k, v] of mcpToolRegistry.entries()) {
+            if (k.endsWith(name) || name.endsWith(v.rawName)) return true;
+          }
+          return false;
+        });
+
+        let usedTextToolCallFallback = false;
+        if (mcpCalls.length === 0 && activeTools.length > 0 && message?.content) {
+          const textCalls = parseTextToolCalls(message.content, activeTools);
+          if (textCalls.length > 0) {
+            usedTextToolCallFallback = true;
+            addDebugLog("AGENT", `[自愈触发] 非流式检测到模型输出了 ${textCalls.length} 个操作卡片，自动转化为真实 MCP 调用`);
+            mcpCalls = textCalls.map((tc) => ({
+              id: tc.id,
+              type: "function",
+              goal: tc.goal,
+              function: { name: tc.name, arguments: tc.arguments }
+            }));
+          }
+        }
+
+        if (mcpCalls.length > MAX_TOOL_CALLS_PER_ROUND) {
+          addDebugLog("AGENT", `单轮工具调用超过上限，已截取前 ${MAX_TOOL_CALLS_PER_ROUND} 个`, {
+            requested: mcpCalls.length,
+            allowed: MAX_TOOL_CALLS_PER_ROUND
+          });
+          mcpCalls = mcpCalls.slice(0, MAX_TOOL_CALLS_PER_ROUND);
+        }
+
+        if (mcpCalls.length === 0) {
+          if (typeof message?.content === "string" && /(?:目标说明|调用工具|检索内容)\s*[：:]/.test(message.content)) {
+            message.content = "输出了无法匹配到已启用工具的操作卡片，未执行任何工具。请根据当前可用工具直接回答。";
+          }
+          if (displayedActionCards.length > 0 && message) {
+            const finalText = typeof message.content === "string" ? message.content : "";
+            message.content = [displayedActionCards.join("\n\n"), finalText].filter(Boolean).join("\n\n");
+          }
+          addDebugLog("AGENT", `第 ${round + 1} 轮完成 - 非流式响应返回客户端 (累计执行工具 ${executedToolCount} 次)`, {
+            finishReason: finalFinishReason,
+            contentLength: message?.content?.length || 0
+          });
+          sendJson(clientResponse, 200, json);
+          return;
+        }
+
+        displayedActionCards.push(...mcpCalls.map((tc) => formatToolActionCard(tc, activeTools, userText)));
+
+        if (usedTextToolCallFallback) {
+          messages.push({
+            ...message,
+            content: null,
+            tool_calls: mcpCalls.map((tc) => ({
+              id: tc.id,
+              type: "function",
+              function: { name: tc.function.name, arguments: tc.function.arguments }
+            }))
+          });
+        } else {
+          messages.push(message);
+        }
+
+        let roundHasFailure = false;
+        const CONCURRENCY_LIMIT = 4;
+        const callResults = await executeConcurrentPool(mcpCalls, CONCURRENCY_LIMIT, async (tc, index) => {
+          if (abortSignal?.aborted || clientResponse.destroyed) {
+            return {
+              tool_call_id: tc.id,
+              content: JSON.stringify({ error: "Client aborted" }),
+              isToolError: true
+            };
+          }
+          if (index > 0 && mcpCalls.length > 1) {
+            await new Promise((resolve) => setTimeout(resolve, Math.min(index * 60, 300)));
+          }
+          let toolInfo = mcpToolRegistry.get(tc.function.name);
+          if (!toolInfo) {
+            for (const [k, v] of mcpToolRegistry.entries()) {
+              if (k.endsWith(tc.function.name) || tc.function.name.endsWith(v.rawName)) {
+                toolInfo = v;
+                break;
+              }
+            }
+          }
+          const rawAction = toolInfo?.rawName || tc.function.name;
+          const isWrite = isWriteTool(rawAction);
+          const args = toolArguments(tc);
+          let resultText = "";
+          let isToolError = false;
+          if (args === null) {
+            resultText = JSON.stringify({ error: "Invalid tool arguments" });
+            isToolError = true;
+          } else {
+            const callKey = generateToolCallKey(tc.function.name, args);
+            const prevAttempts = toolCallHistory.get(callKey) || 0;
+            const cachedContent = !isWrite ? dialogReadCache.get(callKey) : null;
+
+            if (cachedContent !== undefined && cachedContent !== null) {
+              toolCallHistory.set(callKey, prevAttempts + 1);
+              if (prevAttempts >= 5) {
+                resultText = JSON.stringify({ note: "已多次复用该工具的缓存结果，当前信息完整且最新。请直接根据已有信息继续执行或回答用户。" });
+              } else {
+                resultText = cachedContent;
+                addDebugLog("TOOL", `MCP 工具 [${tc.function.name}] 命中本次对话只读缓存，直接复用 (${cachedContent.length} 字符)`, { arguments: args });
+              }
+              isToolError = false;
+            } else if (prevAttempts >= 2) {
+              resultText = JSON.stringify({ error: "该工具已使用完全相同的参数重复调用多次，系统已拦截重复执行。请勿继续重复调用，请根据当前信息直接回答用户。" });
+              isToolError = true;
+            } else {
+              toolCallHistory.set(callKey, prevAttempts + 1);
+              try {
+                const toolRes = await callMcpTool(tc.function.name, args);
+                resultText = toolRes.content;
+                isToolError = toolRes.isError;
+                if (!isToolError) {
+                  executedToolCount += 1;
+                  if (isWrite) {
+                    hasWriteSuccess = true;
+                    dialogReadCache.clear();
+                  } else {
+                    dialogReadCache.set(callKey, resultText);
+                  }
+                }
+              } catch (err) {
+                resultText = JSON.stringify({ error: err instanceof Error ? err.message : "Tool execution failed" });
+                isToolError = true;
+              }
+            }
+          }
+          return {
+            tool_call_id: tc.id,
+            content: resultText,
+            isToolError
+          };
+        });
+
+        for (const res of callResults) {
+          if (res.isToolError) {
+            roundHasFailure = true;
+          }
+          messages.push({
+            role: "tool",
+            tool_call_id: res.tool_call_id,
+            content: res.content
+          });
+        }
+
+        if (roundHasFailure) {
+          consecutiveFailures += 1;
+        } else {
+          consecutiveFailures = 0;
+        }
+        continue;
+      }
+
+      const reader = upstreamResponse.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let accumulatedToolCalls = [];
+      let assistantContent = "";
+      let hasToolCalls = false;
+      let roundFinishReason = null;
+      let stoppedForTextToolCalls = false;
+
+      try {
+        while (true) {
+          if (abortSignal?.aborted || clientResponse.destroyed) {
+            addDebugLog("DOWNSTREAM", `[AGENT] 客户端在流式传输中断开连接，已停止上游拉取`);
+            await reader.cancel().catch(() => {});
+            break;
+          }
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || !trimmed.startsWith("data:")) continue;
+            const dataStr = trimmed.slice(5).trim();
+            if (dataStr === "[DONE]") continue;
+
+            try {
+              const parsed = JSON.parse(dataStr);
+              const choice = parsed.choices?.[0];
+              const delta = choice?.delta;
+              const reason = extractFinishReason(parsed);
+              if (reason) {
+                roundFinishReason = reason;
+              }
+
+              if (delta?.tool_calls) {
+                hasToolCalls = true;
+                for (const tc of delta.tool_calls) {
+                  const index = tc.index ?? 0;
+                  if (!accumulatedToolCalls[index]) {
+                    accumulatedToolCalls[index] = {
+                      id: tc.id || `call_${crypto.randomUUID()}`,
+                      name: tc.function?.name || "",
+                      arguments: ""
+                    };
+                  }
+                  if (tc.id) accumulatedToolCalls[index].id = tc.id;
+                  if (tc.function?.name) accumulatedToolCalls[index].name = tc.function.name;
+                  if (tc.function?.arguments) accumulatedToolCalls[index].arguments += tc.function.arguments;
+                }
+              }
+
+              if (delta?.content) {
+                assistantContent += delta.content;
+                if (!hasToolCalls && activeTools.length > 0) {
+                  const textCalls = parseTextToolCalls(assistantContent, activeTools);
+                  if (textCalls.length >= MAX_TOOL_CALLS_PER_ROUND) {
+                    stoppedForTextToolCalls = true;
+                    await reader.cancel().catch(() => {});
+                    break;
+                  }
+                }
+              }
+
+              if (delta?.reasoning_content) {
+                if (!clientResponse.destroyed && !abortSignal?.aborted) {
+                  const reasoningChunk = {
+                    id: parsed.id || `chatcmpl-${Date.now()}`,
+                    object: "chat.completion.chunk",
+                    created: parsed.created || Math.floor(Date.now() / 1000),
+                    model: parsed.model || requestBody.model || "default",
+                    choices: [
+                      {
+                        index: 0,
+                        delta: { reasoning_content: delta.reasoning_content },
+                        finish_reason: null
+                      }
+                    ]
+                  };
+                  clientResponse.write(`data: ${JSON.stringify(reasoningChunk)}\n\n`);
+                }
+              }
+            } catch {}
+          }
+          if (stoppedForTextToolCalls) break;
+        }
+      } catch (err) {
+        if (abortSignal?.aborted || err.name === "AbortError") {
+          addDebugLog("DOWNSTREAM", `[AGENT] 客户端中断传输`);
+          return;
+        }
+        throw err;
+      }
+
+      if (abortSignal?.aborted || clientResponse.destroyed) {
+        addDebugLog("DOWNSTREAM", `客户端已断开，终止后续 MCP 处理与续接`);
+        break;
+      }
+
+      let mcpCalls = accumulatedToolCalls.filter((tc) => {
+        if (!tc || !tc.name) return false;
+        if (mcpToolRegistry.has(tc.name)) return true;
+        for (const [k, v] of mcpToolRegistry.entries()) {
+          if (k.endsWith(tc.name) || tc.name.endsWith(v.rawName)) return true;
+        }
+        return false;
+      });
+
+      let usedTextToolCallFallback = false;
+      if (mcpCalls.length === 0 && activeTools.length > 0 && assistantContent) {
+        const textCalls = parseTextToolCalls(assistantContent, activeTools);
+        if (textCalls.length > 0) {
+          usedTextToolCallFallback = true;
+          addDebugLog("AGENT", `[自愈触发] 流式检测到模型仅输出了 ${textCalls.length} 个操作卡片而未触发原生 tool_calls，自动转化为真实 MCP 调用`);
+          mcpCalls = textCalls;
+        }
+      }
+
+      if (mcpCalls.length > MAX_TOOL_CALLS_PER_ROUND) {
+        addDebugLog("AGENT", `单轮工具调用超过上限，已截取前 ${MAX_TOOL_CALLS_PER_ROUND} 个`, {
+          requested: mcpCalls.length,
+          allowed: MAX_TOOL_CALLS_PER_ROUND
+        });
+        mcpCalls = mcpCalls.slice(0, MAX_TOOL_CALLS_PER_ROUND);
+      }
+
+      if (mcpCalls.length === 0) {
+        if (!/(?:目标说明|调用工具|检索内容)\s*[：:]/.test(assistantContent)) {
+          if (assistantContent && !abortSignal?.aborted && !clientResponse.destroyed) {
+            sendSSEChunk(clientResponse, { content: assistantContent }, requestBody.model);
+          }
+        } else if (!abortSignal?.aborted && !clientResponse.destroyed) {
+          sendSSEChunk(clientResponse, { content: "输出了无法匹配到已启用工具的操作卡片，未执行任何工具。请根据当前可用工具直接回答。" }, requestBody.model);
+        }
+        if (isTruncatedFinishReason(roundFinishReason) && assistantContent && !/(?:目标说明|调用工具|检索内容)\s*[：:]/.test(assistantContent) && !abortSignal?.aborted && !clientResponse.destroyed) {
+          addDebugLog("AGENT", `⚠️ [抗截断触发] MCP 调度检测到截断 (${roundFinishReason})！正在自动进行无感断点续接...`, {
+            round: round + 1,
+            finishReason: roundFinishReason,
+            accumulatedLength: assistantContent.length
+          });
+          messages.push({ role: "assistant", content: assistantContent });
+          messages.push({ role: "user", content: "请紧接着上一句未说完的内容继续输出，不要重复前面已输出的任何字，不要有任何多余的开场白。" });
+          continue;
+        }
+
+        if (!abortSignal?.aborted && !clientResponse.destroyed) {
+          clientResponse.write("data: [DONE]\n\n");
+          clientResponse.end();
+        }
+        addDebugLog("AGENT", `第 ${round + 1} 轮流式完成输出 - 结束原因: ${roundFinishReason || "stop"} (累计执行工具 ${executedToolCount} 次)`, {
+          round: round + 1,
+          finishReason: roundFinishReason,
+          totalRounds: round + 1
+        });
+        return;
+      }
+
+      const visibleActionCards = mcpCalls.map((tc) => formatToolActionCard(tc, activeTools, userText));
+      if (visibleActionCards.length > 0 && !abortSignal?.aborted && !clientResponse.destroyed) {
+        sendSSEChunk(clientResponse, { content: `${visibleActionCards.join("\n\n")}\n\n` }, requestBody.model);
+      }
+
+      messages.push({
+        role: "assistant",
+        content: usedTextToolCallFallback ? null : (assistantContent || null),
+        tool_calls: mcpCalls.map((tc) => ({
+          id: tc.id || `call_${crypto.randomUUID()}`,
+          type: "function",
+          function: { name: tc.name, arguments: tc.arguments }
+        }))
+      });
+
+      let roundHasFailure = false;
+      const CONCURRENCY_LIMIT = 4;
+      const callResults = await executeConcurrentPool(mcpCalls, CONCURRENCY_LIMIT, async (tc, index) => {
+        if (abortSignal?.aborted || clientResponse.destroyed) {
+          return {
+            tool_call_id: tc.id || `call_${crypto.randomUUID()}`,
+            content: JSON.stringify({ error: "Client aborted" }),
+            isToolError: true
+          };
+        }
+        if (index > 0 && mcpCalls.length > 1) {
+          await new Promise((resolve) => setTimeout(resolve, Math.min(index * 60, 300)));
+        }
+
+        let toolInfo = mcpToolRegistry.get(tc.name);
+        if (!toolInfo) {
+          for (const [k, v] of mcpToolRegistry.entries()) {
+            if (k.endsWith(tc.name) || tc.name.endsWith(v.rawName)) {
+              toolInfo = v;
+              break;
+            }
+          }
+        }
+
+        const displayName = toolInfo?.serverName || "MCP";
+        const rawAction = toolInfo?.rawName || tc.name;
+        const isWrite = isWriteTool(rawAction);
+        const args = toolArguments({ function: { arguments: tc.arguments } });
+        const actionDetails = formatToolCallDetails(args);
+        const detailSuffix = actionDetails ? ` | ${actionDetails}` : "";
+
+        let resultText = "";
+        let isToolError = false;
+        let errorMessage = "";
+        let isCacheHit = false;
+
+        if (args === null) {
+          errorMessage = "无效参数";
+          resultText = JSON.stringify({ error: errorMessage });
+          isToolError = true;
+        } else {
+          const callKey = generateToolCallKey(tc.name, args);
+          const prevAttempts = toolCallHistory.get(callKey) || 0;
+          const cachedContent = !isWrite ? dialogReadCache.get(callKey) : null;
+
+          if (cachedContent !== undefined && cachedContent !== null) {
+            isCacheHit = true;
+            toolCallHistory.set(callKey, prevAttempts + 1);
+            if (prevAttempts >= 5) {
+              resultText = JSON.stringify({ note: "已多次复用该工具的缓存结果，当前信息完整且最新。请直接根据已有信息继续执行或回答用户。" });
+            } else {
+              resultText = cachedContent;
+              addDebugLog("TOOL", `MCP 工具 [${tc.name}] 命中本次对话只读缓存，直接复用 (${cachedContent.length} 字符)`, { arguments: args });
+            }
+            isToolError = false;
+          } else if (prevAttempts >= 2) {
+            errorMessage = "重复调用已被系统拦截";
+            resultText = JSON.stringify({ error: "该工具已使用完全相同的参数重复调用多次，系统已拦截重复执行。请勿继续重复调用，请根据当前信息直接回答用户。" });
+            isToolError = true;
+          } else {
+            toolCallHistory.set(callKey, prevAttempts + 1);
+
+            if (!abortSignal?.aborted && !clientResponse.destroyed) {
+              sendReasoningChunk(
+                clientResponse,
+                `\n> ⏳ 正在调用 [${displayName}] 执行操作: \`${rawAction}\`${detailSuffix}...\n`,
+                requestBody.model
+              );
+            }
+
+            try {
+              const onWaitNotice = (waitSec) => {
+                if (!abortSignal?.aborted && !clientResponse.destroyed) {
+                  sendReasoningChunk(
+                    clientResponse,
+                    `\n> ⏳ 触发访问频控，正在等待 ${waitSec + 1} 秒后自动重试...\n`,
+                    requestBody.model
+                  );
+                }
+              };
+              const toolRes = await callMcpTool(tc.name, args, onWaitNotice);
+              resultText = toolRes.content;
+              isToolError = toolRes.isError;
+              if (isToolError) {
+                errorMessage = extractErrorMessage(toolRes.content);
+              } else {
+                executedToolCount += 1;
+                if (isWrite) {
+                  hasWriteSuccess = true;
+                  dialogReadCache.clear();
+                } else {
+                  dialogReadCache.set(callKey, resultText);
+                }
+              }
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : "Tool execution failed";
+              errorMessage = extractErrorMessage(msg);
+              resultText = JSON.stringify({ error: msg });
+              isToolError = true;
+            }
+          }
+        }
+
+        if (!abortSignal?.aborted && !clientResponse.destroyed) {
+          if (isCacheHit) {
+            sendReasoningChunk(
+              clientResponse,
+              `\n> ⚡ [${displayName}] \`${rawAction}\`${detailSuffix} (复用对话缓存)\n`,
+              requestBody.model
+            );
+          } else if (isToolError) {
+            const failReason = errorMessage ? `: ${errorMessage}` : "";
+            sendReasoningChunk(
+              clientResponse,
+              `\n> ❌ [${displayName}] 执行失败${detailSuffix}${failReason}\n`,
+              requestBody.model
+            );
+          } else {
+            sendReasoningChunk(
+              clientResponse,
+              `\n> ✅ [${displayName}] 执行完成${detailSuffix}\n`,
+              requestBody.model
+            );
+          }
+        }
+
+        return {
+          tool_call_id: tc.id || `call_${crypto.randomUUID()}`,
+          content: resultText,
+          isToolError
+        };
+      });
+
+      for (const res of callResults) {
+        if (res.isToolError) {
+          roundHasFailure = true;
+        }
+        messages.push({
+          role: "tool",
+          tool_call_id: res.tool_call_id,
+          content: res.content
+        });
+      }
+
+      if (roundHasFailure) {
+        consecutiveFailures += 1;
+      } else {
+        consecutiveFailures = 0;
+      }
+    }
+  } finally {
+    if (keepAliveTimer) clearInterval(keepAliveTimer);
+    dialogReadCache.clear();
+  }
+}
+
+export async function handleGeminiGenerateContent(modelName, isStream, geminiBody, clientResponse, reqMeta, abortSignal) {
+  const openAiMessages = convertGeminiToOpenAIMessages(geminiBody);
+  const openAiBody = {
+    model: modelName,
+    messages: openAiMessages,
+    stream: isStream,
+    temperature: geminiBody.generationConfig?.temperature,
+    max_tokens: geminiBody.generationConfig?.maxOutputTokens
+  };
+
+  if (geminiBody.generationConfig?.thinkingConfig) {
+    openAiBody.thinkingConfig = geminiBody.generationConfig.thinkingConfig;
+    const tc = geminiBody.generationConfig.thinkingConfig;
+
+    let level = "";
+    if (typeof tc.thinkingLevel === "string") {
+      level = tc.thinkingLevel.toLowerCase().trim();
+    }
+
+    if (typeof tc.thinkingBudget === "number") {
+      openAiBody.thinking_budget = tc.thinkingBudget;
+      if (tc.thinkingBudget <= 0) level = "off";
+      else if (tc.thinkingBudget < 2048) level = "low";
+      else if (tc.thinkingBudget < 8192) level = "medium";
+      else level = "high";
+    }
+
+    if (level) {
+      openAiBody.reasoning_effort = level;
+      if (level === "off") {
+        openAiBody.thinking_budget = 0;
+      } else if (level === "low") {
+        openAiBody.thinking_budget = 1024;
+      } else if (level === "medium") {
+        openAiBody.thinking_budget = 4096;
+      } else if (level === "high") {
+        openAiBody.thinking_budget = 16384;
+      }
+    }
+  }
+
+  if (geminiBody.generationConfig) {
+    for (const [k, v] of Object.entries(geminiBody.generationConfig)) {
+      if (!["temperature", "maxOutputTokens"].includes(k)) {
+        openAiBody[k] = v;
+      }
+    }
+  }
+
+  const mcpEnabled = isModelEnabledForMcp(modelName) && mcpToolRegistry.size > 0;
+
+  addDebugLog("DOWNSTREAM", `收到 Gemini 格式请求 [${modelName}] - stream=${isStream}`, {
+    model: modelName,
+    stream: isStream,
+    mcpEnabled,
+    messagesCount: openAiMessages.length,
+    thinkingConfig: geminiBody.generationConfig?.thinkingConfig || null,
+    reasoning_effort: openAiBody.reasoning_effort || null
+  });
+
+  if (!isStream) {
+    const fakeClientResponse = {
+      _headers: {},
+      _body: "",
+      statusCode: 200,
+      get destroyed() { return clientResponse.destroyed; },
+      get writableEnded() { return clientResponse.writableEnded; },
+      setHeader(k, v) { this._headers[k] = v; },
+      writeHead(code, headers) { this.statusCode = code; Object.assign(this._headers, headers); },
+      write(chunk) { this._body += chunk.toString(); },
+      end(chunk) {
+        if (abortSignal?.aborted || clientResponse.destroyed) return;
+        if (chunk) this._body += chunk.toString();
+        try {
+          const json = JSON.parse(this._body);
+          const candidateText = json.choices?.[0]?.message?.content || "";
+          const reasoning = json.choices?.[0]?.message?.reasoning_content || "";
+          const parts = [];
+          if (reasoning) parts.push({ thought: true, text: reasoning });
+          if (candidateText) parts.push({ text: candidateText });
+          const rawReason = extractFinishReason(json);
+          const geminiResp = {
+            candidates: [
+              {
+                content: { parts: parts.length > 0 ? parts : [{ text: "" }], role: "model" },
+                finishReason: isTruncatedFinishReason(rawReason) ? "MAX_TOKENS" : "STOP",
+                index: 0
+              }
+            ]
+          };
+          sendJson(clientResponse, 200, geminiResp);
+        } catch {
+          sendJson(clientResponse, 500, { error: { message: "Gemini 响应解析失败" } });
+        }
+      }
+    };
+    if (mcpEnabled) {
+      await runAgent(openAiBody, fakeClientResponse, reqMeta, abortSignal);
+    } else {
+      await passThroughAndTransformGemini(openAiBody, clientResponse, false, abortSignal);
+    }
+    return;
+  }
+
+  if (mcpEnabled) {
+    setCorsHeaders(clientResponse);
+    clientResponse.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive"
+    });
+
+    let buffer = "";
+    const fakeStreamClientResponse = {
+      _headers: {},
+      get destroyed() { return clientResponse.destroyed; },
+      get writableEnded() { return clientResponse.writableEnded; },
+      setHeader(k, v) { this._headers[k] = v; },
+      writeHead(code, headers) { Object.assign(this._headers, headers); },
+      write(chunk) {
+        if (abortSignal?.aborted || clientResponse.destroyed) return;
+        buffer += chunk.toString();
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith("data:")) continue;
+          const dataStr = trimmed.slice(5).trim();
+          if (dataStr === "[DONE]") {
+            if (!clientResponse.writableEnded) clientResponse.write("data: [DONE]\n\n");
+            continue;
+          }
+          try {
+            const parsed = JSON.parse(dataStr);
+            const geminiChunk = convertOpenAiChunkToGemini(parsed);
+            if (!clientResponse.writableEnded) clientResponse.write(`data: ${JSON.stringify(geminiChunk)}\n\n`);
+          } catch {}
+        }
+      },
+      end() {
+        if (!clientResponse.writableEnded) {
+          clientResponse.end();
+        }
+      }
+    };
+    await runAgent(openAiBody, fakeStreamClientResponse, reqMeta, abortSignal);
+  } else {
+    await passThroughAndTransformGemini(openAiBody, clientResponse, true, abortSignal);
+  }
+}

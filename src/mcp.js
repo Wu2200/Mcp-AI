@@ -1,0 +1,913 @@
+import crypto from "node:crypto";
+import {
+  mcpServers,
+  mcpToolRegistry,
+  enabledModels,
+  addDebugLog,
+  getActiveChannel,
+  upstreamChatCompletionsUrl,
+  getStoredServers,
+  saveServerToStorage
+} from "./store.js";
+
+export async function parseMcpResponse(res) {
+  const contentType = res.headers.get("Content-Type") || "";
+  if (contentType.includes("text/event-stream")) {
+    const text = await res.text();
+    for (const line of text.split("\n")) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith("data:")) {
+        try {
+          return JSON.parse(trimmed.slice(5).trim());
+        } catch {}
+      }
+    }
+  }
+  return await res.json();
+}
+
+export async function connectToMcpServer({ name, url, token }) {
+  const serverId = crypto.randomUUID();
+  const cleanUrl = url.trim().replace(/\/+$/, "");
+  const headers = {
+    Accept: "application/json, text/event-stream",
+    "Content-Type": "application/json",
+    "User-Agent": "mcp-agent-proxy/1.0.0"
+  };
+
+  if (token) {
+    const rawToken = token.trim();
+    headers["Authorization"] = rawToken.startsWith("Bearer ") ? rawToken : `Bearer ${rawToken}`;
+  }
+
+  const initPayload = {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "mcp-agent-proxy", version: "1.0.0" }
+    }
+  };
+
+  try {
+    await fetch(cleanUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(initPayload),
+      signal: AbortSignal.timeout(20000)
+    });
+
+    await fetch(cleanUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "notifications/initialized"
+      }),
+      signal: AbortSignal.timeout(20000)
+    }).catch(() => {});
+  } catch {}
+
+  const listPayload = { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} };
+  const listRes = await fetch(cleanUrl, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(listPayload),
+    signal: AbortSignal.timeout(20000)
+  });
+
+  if (!listRes.ok) {
+    const err = await listRes.text();
+    throw new Error(`MCP 响应错误 (${listRes.status}): ${err.slice(0, 300)}`);
+  }
+
+  const listData = await parseMcpResponse(listRes);
+  if (listData.error) {
+    throw new Error(listData.error.message || JSON.stringify(listData.error));
+  }
+  const rawTools = listData.result?.tools || [];
+
+  if (rawTools.length === 0) {
+    throw new Error("该 MCP 未返回任何工具，请检查 Token 权限或服务地址。");
+  }
+
+  const registeredTools = [];
+  for (const t of rawTools) {
+    const safePrefix = name.toLowerCase().replace(/[^a-z0-9_]/g, "_");
+    const sanitizedToolName = t.name.replace(/[^a-zA-Z0-9_-]/g, "_");
+    const toolKey = sanitizedToolName.startsWith(`${safePrefix}_`)
+      ? sanitizedToolName
+      : `${safePrefix}_${sanitizedToolName}`;
+
+    registeredTools.push({
+      key: toolKey,
+      rawName: t.name,
+      description: t.description || t.name,
+      enabled: true,
+      status: "unchecked",
+      statusMessage: "",
+      openAiTool: {
+        type: "function",
+        function: {
+          name: toolKey,
+          description: `[${name}] ${t.description || t.name}`,
+          parameters: t.inputSchema || { type: "object", properties: {} }
+        }
+      }
+    });
+
+    mcpToolRegistry.set(toolKey, {
+      serverId,
+      serverName: name,
+      rawName: t.name,
+      postEndpoint: cleanUrl,
+      headers
+    });
+  }
+
+  const serverInfo = {
+    id: serverId,
+    name,
+    url: cleanUrl,
+    rawToken: token,
+    status: "active",
+    postEndpoint: cleanUrl,
+    headers,
+    toolCount: registeredTools.length,
+    tools: registeredTools
+  };
+
+  registerVirtualTools(serverInfo);
+  mcpServers.set(serverId, serverInfo);
+  await saveServerToStorage();
+  addDebugLog("TOOL", `成功挂载 MCP 服务: ${name}`, { serverId, url: cleanUrl, toolCount: serverInfo.tools.length });
+  return serverInfo;
+}
+
+export function extractMcpResultContent(data) {
+  if (!data) return "{}";
+  let contentStr = "";
+
+  const rawResult = data.result !== undefined ? data.result : data;
+  if (!rawResult) return "{}";
+
+  if (Array.isArray(rawResult.content)) {
+    const pieces = [];
+    for (const item of rawResult.content) {
+      if (!item) continue;
+      if (item.type === "text" && item.text) {
+        pieces.push(item.text);
+      } else if ((item.type === "resource" || item.type === "embedded_resource") && item.resource) {
+        if (item.resource.text) {
+          pieces.push(item.resource.text);
+        } else if (item.resource.blob) {
+          try {
+            const decoded = Buffer.from(item.resource.blob, "base64").toString("utf8");
+            pieces.push(decoded);
+          } catch {
+            pieces.push(item.resource.blob);
+          }
+        }
+      } else if (item.text) {
+        pieces.push(item.text);
+      }
+    }
+    if (pieces.length > 0) {
+      contentStr = pieces.join("\n\n");
+    }
+  }
+
+  if (!contentStr && rawResult.content && rawResult.encoding === "base64" && typeof rawResult.content === "string") {
+    try {
+      contentStr = Buffer.from(rawResult.content, "base64").toString("utf8");
+    } catch {}
+  }
+
+  if (!contentStr) {
+    contentStr = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult, null, 2);
+  }
+
+  return contentStr;
+}
+
+export function extractErrorMessage(text) {
+  if (!text) return "";
+  if (typeof text === "object") {
+    if (typeof text.error === "string") return text.error;
+    if (text.error?.message) return text.error.message;
+    if (typeof text.message === "string") return text.message;
+    return JSON.stringify(text).slice(0, 200);
+  }
+  let str = String(text).trim();
+  str = str.replace(/^(?:执行失败\s*[:：]?\s*)+/i, "");
+  try {
+    const parsed = JSON.parse(str);
+    return extractErrorMessage(parsed);
+  } catch {}
+  const jsonMatch = str.match(/\{[\s\S]*\}/);
+  if (jsonMatch) {
+    try {
+      const parsed = JSON.parse(jsonMatch[0]);
+      const inner = parsed.error?.message || parsed.message || parsed.error;
+      if (typeof inner === "string") {
+        const prefix = str.slice(0, jsonMatch.index).replace(/^(?:执行失败\s*[:：]?\s*)+/i, "").trim();
+        return prefix ? `${prefix} ${inner}` : inner;
+      }
+    } catch {}
+  }
+  const singleLine = str.replace(/[\r\n\t]+/g, " ").trim();
+  return singleLine.length > 200 ? `${singleLine.slice(0, 200)}...` : singleLine;
+}
+
+export function parseRateLimitWaitSeconds(errorText) {
+  if (!errorText || typeof errorText !== "string") return 0;
+  const match =
+    errorText.match(/retry after\s+(\d+)\s*s/i) ||
+    errorText.match(/retry after\s+(\d+)\s*seconds?/i) ||
+    errorText.match(/wait\s+(\d+)\s*s/i) ||
+    errorText.match(/wait\s+(\d+)\s*seconds?/i);
+  if (match) {
+    const sec = parseInt(match[1], 10);
+    if (!isNaN(sec) && sec > 0 && sec <= 120) {
+      return sec;
+    }
+  }
+  if (/rate limit exceeded|secondary rate limit|too many requests/i.test(errorText)) {
+    return 35;
+  }
+  return 0;
+}
+
+export async function invokeMcpRawTool(serverInfo, rawName, args, onWaitNotice = null) {
+  const maxRetries = 2;
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    let res;
+    try {
+      res = await fetch(serverInfo.postEndpoint, {
+        method: "POST",
+        headers: serverInfo.headers,
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: Date.now(),
+          method: "tools/call",
+          params: { name: rawName, arguments: args }
+        }),
+        signal: AbortSignal.timeout(35000)
+      });
+    } catch (err) {
+      if (attempt === maxRetries) throw err;
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      continue;
+    }
+
+    if (!res.ok) {
+      const txt = await res.text();
+      const waitSec = parseRateLimitWaitSeconds(txt);
+      if (waitSec > 0 && attempt < maxRetries) {
+        if (typeof onWaitNotice === "function") {
+          onWaitNotice(waitSec);
+        }
+        addDebugLog("TOOL", `[频控保护] 接口调用触发限制，正在等待 ${waitSec + 1} 秒后自动重试...`);
+        await new Promise((resolve) => setTimeout(resolve, (waitSec + 1) * 1000));
+        continue;
+      }
+      throw new Error(`MCP HTTP ${res.status}: ${txt.slice(0, 300)}`);
+    }
+
+    const data = await parseMcpResponse(res);
+    if (data.error) {
+      const errMsg = data.error.message || JSON.stringify(data.error);
+      const waitSec = parseRateLimitWaitSeconds(errMsg);
+      if (waitSec > 0 && attempt < maxRetries) {
+        if (typeof onWaitNotice === "function") {
+          onWaitNotice(waitSec);
+        }
+        addDebugLog("TOOL", `[频控保护] 接口调用触发限制，正在等待 ${waitSec + 1} 秒后自动重试...`);
+        await new Promise((resolve) => setTimeout(resolve, (waitSec + 1) * 1000));
+        continue;
+      }
+      throw new Error(errMsg);
+    }
+
+    const rawResult = data.result !== undefined ? data.result : data;
+    const isToolError = Boolean(rawResult && (rawResult.isError === true || rawResult.is_error === true));
+    const textContent = extractMcpResultContent(data);
+
+    if (isToolError) {
+      const waitSec = parseRateLimitWaitSeconds(textContent);
+      if (waitSec > 0 && attempt < maxRetries) {
+        if (typeof onWaitNotice === "function") {
+          onWaitNotice(waitSec);
+        }
+        addDebugLog("TOOL", `[频控保护] 工具返回频率限制错误，正在等待 ${waitSec + 1} 秒后自动重试...`);
+        await new Promise((resolve) => setTimeout(resolve, (waitSec + 1) * 1000));
+        continue;
+      }
+    }
+
+    return { data, rawResult, isToolError, textContent };
+  }
+}
+
+export function extractFileContentAndSha(mcpRes) {
+  const { rawResult, textContent } = mcpRes;
+  let fileContent = "";
+  let fileSha = "";
+
+  if (rawResult && Array.isArray(rawResult.content)) {
+    for (const item of rawResult.content) {
+      if (!item) continue;
+      if (item.type === "text" && item.text) {
+        const shaMatch = item.text.match(/SHA:\s*([0-9a-f]{40})/i);
+        if (shaMatch) {
+          fileSha = shaMatch[1];
+        }
+      }
+      if ((item.type === "resource" || item.type === "embedded_resource") && item.resource) {
+        if (typeof item.resource.text === "string") {
+          fileContent = item.resource.text;
+        } else if (item.resource.blob) {
+          try {
+            fileContent = Buffer.from(item.resource.blob, "base64").toString("utf8");
+          } catch {
+            fileContent = item.resource.blob;
+          }
+        }
+      }
+    }
+  }
+
+  if (!fileContent && textContent) {
+    const shaMatch = textContent.match(/SHA:\s*([0-9a-f]{40})/i);
+    if (shaMatch && !fileSha) {
+      fileSha = shaMatch[1];
+    }
+    fileContent = textContent.replace(/^successfully downloaded[^\n]*\r?\n+/, "");
+  }
+
+  if (!fileSha && textContent) {
+    const firstLine = textContent.split("\n")[0] || "";
+    const shaMatch = firstLine.match(/\b([0-9a-f]{40})\b/i);
+    if (shaMatch) {
+      fileSha = shaMatch[1];
+    }
+  }
+
+  return { fileContent, fileSha };
+}
+
+export function applyStringReplacements(content, edits, filePath = "") {
+  let updated = content;
+  for (let i = 0; i < edits.length; i += 1) {
+    const { old_str, new_str } = edits[i];
+    if (typeof old_str !== "string" || typeof new_str !== "string") {
+      throw new Error(`第 ${i + 1} 处修改参数错误：old_str 与 new_str 必须为字符串`);
+    }
+    if (old_str === new_str) {
+      throw new Error(`第 ${i + 1} 处修改无效：old_str 与 new_str 完全相同`);
+    }
+
+    let targetStr = old_str;
+    let idx = updated.indexOf(targetStr);
+
+    if (idx === -1) {
+      if (updated.includes("\r\n") && !targetStr.includes("\r\n")) {
+        const crlfTarget = targetStr.replace(/\n/g, "\r\n");
+        if (updated.includes(crlfTarget)) {
+          targetStr = crlfTarget;
+          idx = updated.indexOf(targetStr);
+        }
+      } else if (!updated.includes("\r\n") && targetStr.includes("\r\n")) {
+        const lfTarget = targetStr.replace(/\r\n/g, "\n");
+        if (updated.includes(lfTarget)) {
+          targetStr = lfTarget;
+          idx = updated.indexOf(targetStr);
+        }
+      }
+    }
+
+    if (idx === -1) {
+      const trimmedOld = targetStr.trim();
+      if (trimmedOld && updated.includes(trimmedOld)) {
+        const occurrences = updated.split(trimmedOld).length - 1;
+        if (occurrences === 1) {
+          targetStr = trimmedOld;
+          idx = updated.indexOf(targetStr);
+        }
+      }
+    }
+
+    if (idx === -1) {
+      throw new Error(`在文件 ${filePath} 中未找到指定的待替换片段 (old_str)。请核对代码内容、空格缩进及换行是否准确。待查找片段预览:\n${old_str.slice(0, 200)}`);
+    }
+
+    const count = updated.split(targetStr).length - 1;
+    if (count > 1) {
+      throw new Error(`在文件 ${filePath} 中找到多处 (${count} 处) 完全相同的待替换片段。为防止误替换，请在 old_str 中包含更多上下文代码行以确保唯一性。`);
+    }
+
+    let replacement = new_str;
+    if (targetStr.includes("\r\n") && !replacement.includes("\r\n")) {
+      replacement = replacement.replace(/\n/g, "\r\n");
+    } else if (!targetStr.includes("\r\n") && replacement.includes("\r\n")) {
+      replacement = replacement.replace(/\r\n/g, "\n");
+    }
+
+    updated = updated.slice(0, idx) + replacement + updated.slice(idx + targetStr.length);
+  }
+  return updated;
+}
+
+export async function executeGithubEditFile(serverInfo, readToolRawName, writeToolRawName, args, onWaitNotice = null) {
+  const { owner, repo, path: filePath, old_str, new_str, edits, message, branch } = args || {};
+
+  if (!owner || !repo || !filePath) {
+    throw new Error("缺少必需参数：owner, repo, path");
+  }
+
+  let editList = [];
+  if (Array.isArray(edits) && edits.length > 0) {
+    editList = edits;
+  } else if (typeof old_str === "string" && typeof new_str === "string") {
+    editList = [{ old_str, new_str }];
+  } else {
+    throw new Error("必须提供 old_str 与 new_str，或 edits 数组");
+  }
+
+  const getArgs = { owner, repo, path: filePath };
+  if (branch) {
+    getArgs.ref = branch;
+  }
+
+  addDebugLog("TOOL", `[局部编辑] 读取文件: ${owner}/${repo}/${filePath} (分支: ${branch || "默认"})`);
+  const getRes = await invokeMcpRawTool(serverInfo, readToolRawName, getArgs, onWaitNotice);
+  if (getRes.isToolError) {
+    throw new Error(`读取文件失败: ${getRes.textContent.slice(0, 300)}`);
+  }
+
+  const { fileContent, fileSha } = extractFileContentAndSha(getRes);
+  if (!fileSha) {
+    throw new Error(`未能获取到文件 SHA，请确认文件是否存在: ${filePath}`);
+  }
+
+  const updatedContent = applyStringReplacements(fileContent, editList, filePath);
+
+  if (updatedContent === fileContent) {
+    throw new Error("替换前后文件内容未发生任何改变");
+  }
+
+  const commitMsg = (message || "").trim() || `Update ${filePath}`;
+  const putArgs = {
+    owner,
+    repo,
+    path: filePath,
+    content: updatedContent,
+    message: commitMsg,
+    sha: fileSha,
+    branch: branch || "main"
+  };
+
+  addDebugLog("TOOL", `[局部编辑] 提交更新到 GitHub: ${owner}/${repo}/${filePath} (SHA: ${fileSha})`);
+  const putRes = await invokeMcpRawTool(serverInfo, writeToolRawName, putArgs, onWaitNotice);
+  if (putRes.isToolError) {
+    throw new Error(`提交更新失败: ${putRes.textContent.slice(0, 300)}`);
+  }
+
+  return {
+    isError: false,
+    content: `局部修改成功并已提交到 GitHub。仓库: ${owner}/${repo}，文件: ${filePath}，分支: ${branch || "main"}，修改处数: ${editList.length}，原文件 SHA: ${fileSha}`
+  };
+}
+
+export function findServerTool(serverInfo, targetNames) {
+  if (!Array.isArray(serverInfo.tools)) return null;
+  return serverInfo.tools.find((t) =>
+    targetNames.some((n) => t.rawName === n || t.rawName.endsWith(`_${n}`))
+  );
+}
+
+export function registerVirtualTools(serverInfo) {
+  if (!serverInfo || !Array.isArray(serverInfo.tools)) return;
+  const readTool = findServerTool(serverInfo, ["get_file_contents"]);
+  const writeTool = findServerTool(serverInfo, ["create_or_update_file"]);
+  if (!readTool || !writeTool) return;
+
+  const serverNameLower = (serverInfo.name || "").toLowerCase();
+  const safePrefix = serverNameLower.replace(/[^a-z0-9_]/g, "_");
+  const virtualRawName = readTool.rawName.startsWith("github_") || serverNameLower.includes("github")
+    ? "github_edit_file"
+    : "edit_file";
+
+  const toolKey = virtualRawName.startsWith(`${safePrefix}_`)
+    ? virtualRawName
+    : `${safePrefix}_${virtualRawName}`;
+
+  let virtualTool = serverInfo.tools.find((t) => t.key === toolKey || t.rawName === virtualRawName);
+  if (!virtualTool) {
+    virtualTool = {
+      key: toolKey,
+      rawName: virtualRawName,
+      description: `[${serverInfo.name}] 局部编辑 GitHub 文件`,
+      enabled: true,
+      status: "supported",
+      statusMessage: "支持",
+      isVirtual: true,
+      openAiTool: {
+        type: "function",
+        function: {
+          name: toolKey,
+          description: `[${serverInfo.name}] 局部编辑 GitHub 仓库中的指定文件。通过比对替换指定的代码片段（old_str -> new_str），自动拉取最新文件、完成局部替换并提交更新，无需全量读取或全量重写。`,
+          parameters: {
+            type: "object",
+            properties: {
+              owner: {
+                type: "string",
+                description: "仓库所有者 (用户名或组织名)"
+              },
+              repo: {
+                type: "string",
+                description: "仓库名称"
+              },
+              path: {
+                type: "string",
+                description: "要修改的文件路径"
+              },
+              old_str: {
+                type: "string",
+                description: "待替换的原始代码片段。必须在文件中唯一存在，建议包含周围几行上下文以确保唯一性。"
+              },
+              new_str: {
+                type: "string",
+                description: "替换后的新代码片段。"
+              },
+              edits: {
+                type: "array",
+                description: "可选的多处同时替换列表。每项包含 old_str 与 new_str。若提供此项则按顺序批量替换。",
+                items: {
+                  type: "object",
+                  properties: {
+                    old_str: { type: "string", description: "待替换的代码片段" },
+                    new_str: { type: "string", description: "替换后的新代码片段" }
+                  },
+                  required: ["old_str", "new_str"]
+                }
+              },
+              message: {
+                type: "string",
+                description: "Git 提交说明"
+              },
+              branch: {
+                type: "string",
+                description: "目标分支名称 (可选，默认使用仓库默认分支)"
+              }
+            },
+            required: ["owner", "repo", "path", "message"]
+          }
+        }
+      }
+    };
+    serverInfo.tools.unshift(virtualTool);
+    serverInfo.toolCount = serverInfo.tools.length;
+  } else {
+    virtualTool.isVirtual = true;
+    virtualTool.status = "supported";
+    virtualTool.statusMessage = "支持";
+  }
+
+  if (serverInfo.status === "active" && virtualTool.enabled !== false) {
+    mcpToolRegistry.set(toolKey, {
+      serverId: serverInfo.id,
+      serverName: serverInfo.name,
+      rawName: virtualRawName,
+      isVirtual: true,
+      handler: async (args, onWaitNotice) => {
+        return await executeGithubEditFile(serverInfo, readTool.rawName, writeTool.rawName, args, onWaitNotice);
+      }
+    });
+  }
+}
+
+export async function callMcpTool(toolKey, args, onWaitNotice = null) {
+  let info = mcpToolRegistry.get(toolKey);
+  if (!info) {
+    for (const [k, v] of mcpToolRegistry.entries()) {
+      if (k.endsWith(toolKey) || toolKey.endsWith(v.rawName)) {
+        info = v;
+        break;
+      }
+    }
+  }
+  if (!info) throw new Error(`未找到工具：${toolKey}`);
+
+  const isCfExecute =
+    (toolKey.toLowerCase().includes("cloudflare") || (info?.serverName || "").toLowerCase().includes("cloudflare")) &&
+    (toolKey.endsWith("execute") || info?.rawName === "execute");
+
+  if (isCfExecute && typeof args?.code === "string") {
+    const rawCode = args.code;
+    if (
+      rawCode.includes("DEFAULT_BASE_URL") ||
+      /fetch\s*\(\s*[`'"]https?:\/\/api\.cloudflare\.com/i.test(rawCode) ||
+      /fetch\s*\(\s*DEFAULT_BASE_URL/i.test(rawCode)
+    ) {
+      return {
+        isError: true,
+        content: JSON.stringify({
+          error:
+            "【Cloudflare execute 规范拦截】检测到代码中试图自行定义 DEFAULT_BASE_URL 或使用原生 fetch 请求 Cloudflare API。沙箱中已内置注入了带有鉴权的全局客户端 `cloudflare.request({ method, path, body })` 与全局变量 `accountId`。直接使用原生 fetch 会因缺少内置鉴权被 Cloudflare 拦截并返回 403 Forbidden（导致 Unexpected token 'F' 报错）。请改用 `return await cloudflare.request({ method: 'GET', path: `/accounts/${accountId}/...` })` 格式。"
+        })
+      };
+    }
+  }
+
+  const startTime = Date.now();
+  if (typeof info.handler === "function") {
+    try {
+      const res = await info.handler(args, onWaitNotice);
+      const duration = Date.now() - startTime;
+      const isError = Boolean(res && res.isError);
+      const content = typeof res?.content === "string" ? res.content : JSON.stringify(res || {});
+      addDebugLog(isError ? "ERROR" : "TOOL", `虚拟 MCP 工具 [${toolKey}] 执行${isError ? "失败" : "成功"} - 耗时 ${duration}ms`, {
+        arguments: args,
+        outputPreview: content.slice(0, 500)
+      });
+      return { isError, content };
+    } catch (err) {
+      const duration = Date.now() - startTime;
+      const msg = err instanceof Error ? err.message : String(err);
+      addDebugLog("ERROR", `虚拟 MCP 工具 [${toolKey}] 异常 - 耗时 ${duration}ms`, msg);
+      return { isError: true, content: JSON.stringify({ error: msg }) };
+    }
+  }
+
+  try {
+    const { rawResult, isToolError, textContent } = await invokeMcpRawTool(info, info.rawName, args, onWaitNotice);
+    const duration = Date.now() - startTime;
+    if (isToolError) {
+      let refinedContent = textContent;
+      if (isCfExecute && (textContent.includes("Unexpected token 'F'") || textContent.includes("Forbidden"))) {
+        refinedContent = `${textContent}\n\n【诊断指引】此报错通常是因为在 execute 脚本中使用了原生 fetch 请求 Cloudflare 接口导致被 403 拦截并返回纯文本。请使用沙箱内置的 \`cloudflare.request({ method, path, body })\` 与全局变量 \`accountId\`，严禁在脚本中自拼 URL 或裸调 fetch。`;
+      }
+      addDebugLog("ERROR", `MCP 工具 [${toolKey}] 返回错误 - 耗时 ${duration}ms`, {
+        arguments: args,
+        errorOutput: refinedContent.slice(0, 500)
+      });
+      return { isError: true, content: refinedContent };
+    }
+    addDebugLog("TOOL", `MCP 工具 [${toolKey}] 执行成功 - 耗时 ${duration}ms, 输出 ${textContent.length} 字符`, {
+      arguments: args,
+      outputPreview: textContent.slice(0, 500)
+    });
+    return { isError: false, content: textContent };
+  } catch (err) {
+    const duration = Date.now() - startTime;
+    let msg = err instanceof Error ? err.message : String(err);
+    if (isCfExecute && (msg.includes("Unexpected token 'F'") || msg.includes("Forbidden"))) {
+      msg = `${msg} (诊断指引: 请使用沙箱内置的 cloudflare.request 与 accountId，严禁使用原生 fetch 或自拼 DEFAULT_BASE_URL)`;
+    }
+    addDebugLog("ERROR", `MCP 工具 [${toolKey}] 异常 - 耗时 ${duration}ms`, msg);
+    throw (err instanceof Error ? new Error(msg) : new Error(String(msg)));
+  }
+}
+
+export function getAllTools() {
+  const tools = [];
+  for (const s of mcpServers.values()) {
+    if (s.status === "active") {
+      for (const t of s.tools) {
+        if (t.enabled !== false) {
+          tools.push(t.openAiTool);
+        }
+      }
+    }
+  }
+  return tools;
+}
+
+export function selectRelevantTools(userText, allTools) {
+  if (!allTools || allTools.length === 0) {
+    return [];
+  }
+  if (!userText || typeof userText !== "string") {
+    return allTools;
+  }
+
+  const text = userText.toLowerCase();
+  const scored = allTools.map((t) => {
+    const name = (t.function?.name || "").toLowerCase();
+    const desc = (t.function?.description || "").toLowerCase();
+    let score = 0;
+
+    const parts = name.split(/[^a-z0-9]+/);
+    for (const p of parts) {
+      if (p.length >= 3 && text.includes(p)) {
+        score += 3;
+      }
+    }
+
+    if (text.includes("git") || text.includes("github") || text.includes("仓库") || text.includes("提交") || text.includes("push")) {
+      if (name.includes("git") || name.includes("push") || name.includes("commit") || name.includes("file") || name.includes("branch")) {
+        score += 5;
+      }
+    }
+
+    if (text.includes("改") || text.includes("写") || text.includes("修") || text.includes("创建") || text.includes("更新") || text.includes("替换")) {
+      if (name.includes("write") || name.includes("push") || name.includes("create") || name.includes("update") || name.includes("edit")) {
+        score += 5;
+      }
+    }
+
+    if (text.includes("搜索") || text.includes("查") || text.includes("search")) {
+      if (name.includes("search") || desc.includes("search") || desc.includes("搜索")) {
+        score += 5;
+      }
+    }
+
+    return { tool: t, score };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored.map((item) => item.tool);
+}
+
+export function isWriteTool(toolName) {
+  if (!toolName || typeof toolName !== "string") return false;
+  const lower = toolName.toLowerCase();
+  const writePatterns = [
+    "write", "create", "update", "delete", "edit", "patch",
+    "push", "modify", "merge", "fork", "cancel", "rerun",
+    "trigger", "comment", "star", "unstar", "manage"
+  ];
+  return writePatterns.some((pattern) => lower.includes(pattern));
+}
+
+export async function checkAllTools(modelName) {
+  const channel = getActiveChannel();
+  if (!channel) {
+    throw new Error("请先配置 UPSTREAM_1 等上游渠道环境变量");
+  }
+  const targetUrl = upstreamChatCompletionsUrl(channel);
+
+  let targetModel = (modelName || "").trim();
+  if (!targetModel && enabledModels.size > 0) {
+    for (const m of enabledModels) {
+      const clean = m.replace(/\*/g, "").trim();
+      if (clean) {
+        targetModel = clean;
+        break;
+      }
+    }
+  }
+
+  if (!targetModel) {
+    throw new Error("未指定检测模型，请在输入框中指定要测试的上游模型名称");
+  }
+
+  let pingRes;
+  try {
+    pingRes = await fetch(targetUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${channel.apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: targetModel,
+        messages: [{ role: "user", content: "ping" }],
+        max_tokens: 1
+      }),
+      signal: AbortSignal.timeout(20000)
+    });
+  } catch (err) {
+    throw new Error(`上游请求失败: ${err.message}。未修改任何工具状态`);
+  }
+
+  if (!pingRes.ok) {
+    const errText = await pingRes.text();
+    let msg = errText;
+    try {
+      const errJson = JSON.parse(errText);
+      msg = errJson.error?.message || errText;
+    } catch {}
+    throw new Error(`上游模型 [${targetModel}] 调用报错 (${pingRes.status}): ${msg.slice(0, 120)}。未修改任何工具状态`);
+  }
+
+  let total = 0;
+  let supported = 0;
+  let unsupported = 0;
+
+  for (const s of mcpServers.values()) {
+    if (!Array.isArray(s.tools) || s.tools.length === 0) continue;
+
+    for (const t of s.tools) {
+      total += 1;
+
+      if (t.isVirtual) {
+        supported += 1;
+        t.status = "supported";
+        t.statusMessage = "支持";
+        t.enabled = true;
+        if (s.status === "active") {
+          registerVirtualTools(s);
+        }
+        continue;
+      }
+
+      let isSupported = true;
+      let reason = "";
+
+      try {
+        const testRes = await fetch(targetUrl, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${channel.apiKey}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            model: targetModel,
+            messages: [{ role: "user", content: "test" }],
+            tools: [t.openAiTool],
+            max_tokens: 1
+          }),
+          signal: AbortSignal.timeout(20000)
+        });
+
+        if (testRes.ok) {
+          isSupported = true;
+        } else {
+          const errText = await testRes.text();
+          let msg = errText;
+          try {
+            const errJson = JSON.parse(errText);
+            msg = errJson.error?.message || errText;
+          } catch {}
+          if (testRes.status === 400 || testRes.status === 422) {
+            isSupported = false;
+            reason = msg.slice(0, 100);
+          } else {
+            isSupported = true;
+          }
+        }
+      } catch {
+        isSupported = true;
+      }
+
+      if (isSupported) {
+        supported += 1;
+        t.status = "supported";
+        t.statusMessage = "支持";
+        t.enabled = true;
+        if (s.status === "active") {
+          mcpToolRegistry.set(t.key, {
+            serverId: s.id,
+            serverName: s.name,
+            rawName: t.rawName,
+            postEndpoint: s.postEndpoint,
+            headers: s.headers
+          });
+        }
+      } else {
+        unsupported += 1;
+        t.status = "unsupported";
+        t.statusMessage = reason || "参数格式不支持";
+        t.enabled = false;
+        mcpToolRegistry.delete(t.key);
+      }
+    }
+
+    await saveServerToStorage();
+  }
+
+  addDebugLog("AGENT", `AI一键检测完成 - 渠道 [${channel.name}] - 测试模型 [${targetModel}] - 共 ${total} 个工具，支持 ${supported} 个，不支持已自动禁用 ${unsupported} 个`);
+  return { total, supported, unsupported, model: targetModel };
+}
+
+export async function loadMcpServersFromStorage() {
+  const list = await getStoredServers();
+  for (const item of list) {
+    const status = item.status || "active";
+    item.status = status;
+    for (const t of item.tools || []) {
+      t.enabled = typeof t.enabled === "boolean" ? t.enabled : true;
+      t.status = t.status || "unchecked";
+      t.statusMessage = t.statusMessage || "";
+    }
+    mcpServers.set(item.id, item);
+    registerVirtualTools(item);
+    if (status === "active") {
+      for (const t of item.tools || []) {
+        if (t.enabled !== false && !t.isVirtual) {
+          mcpToolRegistry.set(t.key, {
+            serverId: item.id,
+            serverName: item.name,
+            rawName: t.rawName,
+            postEndpoint: item.postEndpoint,
+            headers: item.headers
+          });
+        }
+      }
+    }
+  }
+}
