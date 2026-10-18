@@ -866,12 +866,41 @@ function formatCardMarkdown(text) {
 
 
 
-function parseTextToolCalls(text, activeTools) {
+function extractContextRepo(messages) {
+  let owner = "";
+  let repo = "";
+  if (!Array.isArray(messages)) return { owner, repo };
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m?.tool_calls) {
+      for (const tc of m.tool_calls) {
+        const args = toolArguments(tc);
+        if (args?.owner && args?.repo) {
+          return { owner: String(args.owner).trim(), repo: String(args.repo).trim() };
+        }
+      }
+    }
+    const content = typeof m?.content === "string" ? m.content : "";
+    const repoMatches = content.matchAll(/\b([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+)\b/g);
+    for (const rm of repoMatches) {
+      const p1 = rm[1].toLowerCase();
+      if (!["application", "text", "image", "audio", "video", "multipart"].includes(p1)) {
+        if (!owner && !repo) {
+          owner = rm[1];
+          repo = rm[2];
+        }
+      }
+    }
+  }
+  return { owner, repo };
+}
+
+function parseTextToolCalls(text, activeTools, defaultOwner = "", defaultRepo = "") {
   if (!text || typeof text !== "string" || !Array.isArray(activeTools) || activeTools.length === 0) {
     return [];
   }
   const cleanText = formatCardMarkdown(text);
-  const regex = /目标说明[：:]\s*([^\n\r]*)\r?\n+调用工具[：:]\s*`?([a-zA-Z0-9_\-]+)`?\r?\n+检索内容[：:]\s*`?([\s\S]*?)`?(?=(?:\r?\n\s*目标说明[：:]|\r?\n\s*调用工具[：:]|$))/g;
+  const regex = /(?:目标说明[：:]\s*([^\n\r]*)\r?\n+)?调用工具[：:]\s*`?([a-zA-Z0-9_\-]+)`?\r?\n+检索内容[：:]\s*`?([\s\S]*?)`?(?=(?:\r?\n\s*目标说明[：:]|\r?\n\s*调用工具[：:]|$))/g;
   const calls = [];
   let match;
 
@@ -889,14 +918,19 @@ function parseTextToolCalls(text, activeTools) {
     const paramsSchema = matchedTool.function.parameters?.properties || {};
 
     let parsedArgs = {};
-    if (contentArg.startsWith("{") && contentArg.endsWith("}")) {
+
+    let jsonCandidate = contentArg;
+    if (jsonCandidate.includes("```")) {
+      jsonCandidate = jsonCandidate.replace(/```(?:json)?\s*([\s\S]*?)```/i, "$1").trim();
+    }
+    if (jsonCandidate.startsWith("{") && jsonCandidate.endsWith("}")) {
       try {
-        parsedArgs = JSON.parse(contentArg);
+        parsedArgs = JSON.parse(jsonCandidate);
       } catch {}
     }
 
-    if (Object.keys(parsedArgs).length === 0 && contentArg.includes(":")) {
-      const kvMatches = contentArg.matchAll(/([a-zA-Z0-9_]+)\s*[:：]\s*([^,\n]+)/g);
+    if (Object.keys(parsedArgs).length === 0 && (contentArg.includes(":") || contentArg.includes("="))) {
+      const kvMatches = contentArg.matchAll(/([a-zA-Z0-9_]+)\s*[:=：]\s*["']?([^,\n"'\s]+)["']?/g);
       for (const m of kvMatches) {
         const k = m[1].trim();
         const v = m[2].trim();
@@ -906,12 +940,47 @@ function parseTextToolCalls(text, activeTools) {
       }
     }
 
-    if (Object.keys(parsedArgs).length === 0) {
+    if (paramsSchema.owner && paramsSchema.repo) {
+      if (!parsedArgs.owner || !parsedArgs.repo) {
+        const repoPathMatch = contentArg.match(/^([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+)(?::|\s+path:|\s+file:|\/)(.+)$/i);
+        if (repoPathMatch) {
+          parsedArgs.owner = repoPathMatch[1].trim();
+          parsedArgs.repo = repoPathMatch[2].trim();
+          if (paramsSchema.path && !parsedArgs.path) {
+            parsedArgs.path = repoPathMatch[3].trim().replace(/^[:/\s]+/, "");
+          }
+        } else {
+          const repoOnlyMatch = contentArg.match(/^([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+)(?:\s*\((.*)\))?$/);
+          if (repoOnlyMatch) {
+            parsedArgs.owner = repoOnlyMatch[1].trim();
+            parsedArgs.repo = repoOnlyMatch[2].trim();
+            if (repoOnlyMatch[3]) {
+              const innerKv = repoOnlyMatch[3].matchAll(/([a-zA-Z0-9_]+)\s*[:=：]\s*([^,\n]+)/g);
+              for (const ik of innerKv) {
+                const k = ik[1].trim();
+                let v = ik[2].trim();
+                if (paramsSchema[k]) {
+                  if (v === "true") v = true;
+                  else if (v === "false") v = false;
+                  else if (/^\d+$/.test(v)) v = parseInt(v, 10);
+                  parsedArgs[k] = v;
+                }
+              }
+            }
+          }
+        }
+      }
+
+      if (!parsedArgs.owner && defaultOwner) parsedArgs.owner = defaultOwner;
+      if (!parsedArgs.repo && defaultRepo) parsedArgs.repo = defaultRepo;
+    }
+
+    if (Object.keys(parsedArgs).length === 0 || (paramsSchema.query && !parsedArgs.query)) {
       if (paramsSchema.query) parsedArgs.query = contentArg;
       else if (paramsSchema.q) parsedArgs.q = contentArg;
-      else if (paramsSchema.path) parsedArgs.path = contentArg;
-      else if (paramsSchema.files) parsedArgs.files = [contentArg];
-      else {
+      else if (paramsSchema.path && !parsedArgs.path) parsedArgs.path = contentArg;
+      else if (paramsSchema.files && !parsedArgs.files) parsedArgs.files = [contentArg];
+      else if (Object.keys(parsedArgs).length === 0) {
         const firstProp = Object.keys(paramsSchema)[0];
         if (firstProp) parsedArgs[firstProp] = contentArg;
       }
