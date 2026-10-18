@@ -993,7 +993,7 @@ export function checkPrimaryBuildStatus(contentStr, primaryWorkflowName = "") {
     const runs = Array.isArray(data.workflow_runs)
       ? data.workflow_runs
       : (Array.isArray(data.jobs) ? data.jobs : (data.status ? [data] : []));
-    if (runs.length === 0) return { completed: true, status: "completed" };
+    if (runs.length === 0) return { completed: true, status: "completed", isFailure: false };
 
     const isAux = (name = "") => /cleanup|lint|format|stale|dependabot|pages|greeting|notify|label/i.test(name);
     let targetRun = runs.find((r) => primaryWorkflowName && r.name && r.name.toLowerCase() === primaryWorkflowName.toLowerCase());
@@ -1002,15 +1002,19 @@ export function checkPrimaryBuildStatus(contentStr, primaryWorkflowName = "") {
     }
 
     const status = (targetRun.status || "").toLowerCase();
-    const isCompleted = status === "completed" || Boolean(targetRun.conclusion);
+    const conclusion = (targetRun.conclusion || "").toLowerCase();
+    const isCompleted = status === "completed" || Boolean(conclusion);
+    const isFailure = conclusion === "failure" || status === "failure";
+
     return {
       completed: isCompleted,
+      isFailure,
       status: targetRun.status || "unknown",
       conclusion: targetRun.conclusion || null,
       runName: targetRun.name || "主要构建"
     };
   } catch {
-    return { completed: true, status: "unknown" };
+    return { completed: true, status: "unknown", isFailure: false };
   }
 }
 
@@ -1053,7 +1057,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
   });
 
   const systemRules = [
-    "【工具调用规范】\n1. 单轮最多规划并发调用 3 个最相关的真实工具；若目标较多，先执行优先级最高的 1~3 项，取得结果后再决定下一步，禁止一次性铺开大量调用。\n2. 严禁提前输出总结或方案草稿：在所有信息收集、代码排查或修改操作全部完成之前，严禁在中间轮次输出结论、答复文本、分析讲解或开场白！\n3. 【GitHub Actions 规则】若用户仅是查询历史构建记录、耗时、工作流或排查日志，直接调用相关查询工具即可，无需任何等待；仅当本轮对话中刚刚修改提交了代码、且需要确认刚触发的云端编译结果时，系统才会自动等待构建完成。严禁重复发起连续的 actions 工具死循环轮询！\n4. 优先使用原生 Tool Calls。仅当上游未发出原生调用时，才允许使用操作卡片作为兼容兜底；每轮最多 3 张，且必须对应真实工具调用。多个卡片之间必须使用双换行（\\n\\n）空行彻底分隔，严禁单行连续粘连：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n5. 核心执行约束：输出上述操作卡片的同时，必须同时发起真实的底层工具调用（Tool Calls），严禁仅在正文中打印卡片文本而不发起工具调用！\n6. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n7. 当所有工具调用完毕、进入最终答复轮次时，直接输出完整最终解答，终局轮次严禁输出操作卡片。"
+    "【工具调用规范】\n1. 单轮最多规划并发调用 3 个最相关的真实工具；若目标较多，先执行优先级最高的 1~3 项，取得结果后再决定下一步，禁止一次性铺开大量调用。\n2. 严禁提前输出总结或方案草稿：在所有信息收集、代码排查或修改操作全部完成之前，严禁在中间轮次输出结论、答复文本、分析讲解或开场白！\n3. 【GitHub Actions 与自愈修复规范】代码修改并提交后，系统会在底层自动动态等待主要构建完成并拉取结果。若构建成功或仍在运行中，严禁原地无休止轮询；但若构建失败（failure），必须立即激活自愈流程：调用 get_job_logs 查看编译错误日志，定位代码报错并再次使用 github_edit_file 进行修复提交，直至修复成功或向用户汇报根因！若用户只是查看历史构建记录或耗时，直接查询即可。\n4. 优先使用原生 Tool Calls。仅当上游未发出原生调用时，才允许使用操作卡片作为兼容兜底；每轮最多 3 张，且必须对应真实工具调用。多个卡片之间必须使用双换行（\\n\\n）空行彻底分隔，严禁单行连续粘连：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n5. 核心执行约束：输出上述操作卡片的同时，必须同时发起真实的底层工具调用（Tool Calls），严禁仅在正文中打印卡片文本而不发起工具调用！\n6. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n7. 当所有工具调用完毕、进入最终答复轮次时，直接输出完整最终解答，终局轮次严禁输出操作卡片。"
   ];
   const hasCloudflare = tools.some((t) => {
     const n = (t.function?.name || "").toLowerCase();
@@ -1340,7 +1344,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                 }
                 let toolRes = null;
                 try {
-                  toolRes = await callMcpTool(tc.function.name, args);
+                  toolRes = await callMcpTool(tc.function.name, args, null);
                 } catch (err) {
                   resultText = JSON.stringify({ error: err instanceof Error ? err.message : "获取构建状态失败" });
                   isToolError = true;
@@ -1361,7 +1365,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                     }
                     if (abortSignal?.aborted || clientResponse.destroyed) break;
                     try {
-                      toolRes = await callMcpTool(tc.function.name, args);
+                      toolRes = await callMcpTool(tc.function.name, args, null);
                       buildStatus = checkPrimaryBuildStatus(toolRes.content, primaryWorkflowName);
                     } catch {
                       break;
@@ -1369,7 +1373,14 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                   }
 
                   const totalWaited = waitSec + (extensionCount * 15);
-                  resultText = `${toolRes.content}\n\n【系统提示】已完成构建检查（主要工作流：${primaryWorkflowName}，共等待 ${totalWaited} 秒，当前状态：${buildStatus.status || "完成"}）。请立即向用户交付最终答复，说明代码改动及构建结果。`;
+                  if (buildStatus.isFailure) {
+                    actionsWaitChecked = false;
+                    resultText = `${toolRes.content}\n\n【构建失败自愈提示】检测到主要构建 [${primaryWorkflowName}] 失败 (${buildStatus.conclusion || "failure"})。请立即调用 get_job_logs 获取编译错误日志，分析报错原因并使用 github_edit_file 修复代码！`;
+                  } else if (buildStatus.completed) {
+                    resultText = `${toolRes.content}\n\n【构建成功提示】主要工作流 [${primaryWorkflowName}] 构建成功！耗时约 ${totalWaited} 秒。请立即向用户交付最终汇报。`;
+                  } else {
+                    resultText = `${toolRes.content}\n\n【构建进行中提示】主要工作流 [${primaryWorkflowName}] 已在后台正常编译中（已等待 ${totalWaited} 秒）。无需继续原地空转死等，请立即向用户汇报修改详情并告知构建已在后台触发。`;
+                  }
                   isToolError = toolRes.isError;
                   if (!isToolError) executedToolCount += 1;
                 }
@@ -1399,6 +1410,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                     executedToolCount += 1;
                     if (isWrite) {
                       hasWriteSuccess = true;
+                      actionsWaitChecked = false;
                       dialogReadCache.clear();
                     } else {
                       dialogReadCache.set(callKey, resultText);
@@ -1663,7 +1675,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
               errorMessage = "重复检查已被拦截";
               resultText = JSON.stringify({
                 status: "already_checked",
-                note: "已完成本次提交的构建状态检查，规则限制只查看一次构建状态，严禁重复查询！请立即向用户交付最终汇报与修改详情。"
+                note: "已完成本次提交的构建状态检查。规则限制只查看一次构建状态，严禁重复查询！请立即向用户交付最终汇报与修改详情。"
               });
               isToolError = false;
             } else {
@@ -1714,7 +1726,15 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                 }
 
                 const totalWaited = waitSec + (extensionCount * 15);
-                resultText = `${toolRes.content}\n\n【系统提示】已完成构建检查（主要工作流：${primaryWorkflowName}，共等待 ${totalWaited} 秒，当前状态：${buildStatus.status || "完成"}）。请立即向用户交付最终汇报，说明代码改动及构建结果。`;
+                if (buildStatus.isFailure) {
+                  // 构建失败：解锁并引导模型调 get_job_logs 自动修复
+                  actionsWaitChecked = false;
+                  resultText = `${toolRes.content}\n\n【构建失败自愈提示】检测到主要构建 [${primaryWorkflowName}] 失败 (${buildStatus.conclusion || "failure"})。请立即调用 get_job_logs 获取编译错误日志，分析报错原因并使用 github_edit_file 修复代码！`;
+                } else if (buildStatus.completed) {
+                  resultText = `${toolRes.content}\n\n【构建成功提示】主要工作流 [${primaryWorkflowName}] 构建成功！耗时约 ${totalWaited} 秒。请立即向用户交付最终汇报。`;
+                } else {
+                  resultText = `${toolRes.content}\n\n【构建进行中提示】主要工作流 [${primaryWorkflowName}] 已在后台正常编译中（已等待 ${totalWaited} 秒）。无需继续原地空转死等，请立即向用户汇报修改详情并告知构建已在后台触发。`;
+                }
                 isToolError = toolRes.isError;
                 if (!isToolError) executedToolCount += 1;
               }
@@ -1760,12 +1780,11 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                 const toolRes = await callMcpTool(tc.name, args, onWaitNotice);
                 resultText = toolRes.content;
                 isToolError = toolRes.isError;
-                if (isToolError) {
-                  errorMessage = extractErrorMessage(toolRes.content);
-                } else {
+                if (!isToolError) {
                   executedToolCount += 1;
                   if (isWrite) {
                     hasWriteSuccess = true;
+                    actionsWaitChecked = false; // 新代码提交后，重置构建检查锁，允许检查新提交的构建
                     dialogReadCache.clear();
                   } else {
                     dialogReadCache.set(callKey, resultText);
