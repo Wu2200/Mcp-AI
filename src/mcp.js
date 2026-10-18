@@ -10,6 +10,8 @@ import {
   saveServerToStorage
 } from "./store.js";
 
+export { mcpServers, mcpToolRegistry };
+
 export async function parseMcpResponse(res) {
   const contentType = res.headers.get("Content-Type") || "";
   if (contentType.includes("text/event-stream")) {
