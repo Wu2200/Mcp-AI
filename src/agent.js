@@ -1591,6 +1591,16 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
         const actionDetails = formatToolCallDetails(args);
         const detailSuffix = actionDetails ? ` | ${actionDetails}` : "";
 
+        const onWaitNotice = (waitSec) => {
+          if (!abortSignal?.aborted && !clientResponse.destroyed) {
+            sendReasoningChunk(
+              clientResponse,
+              `\n> ⏳ 触发访问频控，正在等待 ${waitSec + 1} 秒后自动重试...\n`,
+              requestBody.model
+            );
+          }
+        };
+
         let resultText = "";
         let isToolError = false;
         let errorMessage = "";
@@ -1694,15 +1704,6 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
               }
 
               try {
-                const onWaitNotice = (waitSec) => {
-                  if (!abortSignal?.aborted && !clientResponse.destroyed) {
-                    sendReasoningChunk(
-                      clientResponse,
-                      `\n> ⏳ 触发访问频控，正在等待 ${waitSec + 1} 秒后自动重试...\n`,
-                      requestBody.model
-                    );
-                  }
-                };
                 const toolRes = await callMcpTool(tc.name, args, onWaitNotice);
                 resultText = toolRes.content;
                 isToolError = toolRes.isError;
