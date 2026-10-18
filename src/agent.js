@@ -250,8 +250,8 @@ export function buildChineseToolGoal(rawAction, userText) {
     [/search_issues$/, "搜索相关问题"],
     [/create_or_update_file$/, "创建或更新仓库文件"],
     [/github_edit_file$/, "修改 GitHub 仓库文件"],
-    [/actions_list$/, "查看 GitHub Actions 运行记录"],
-    [/actions_get$/, "查看 GitHub Actions 任务详情"],
+    [/actions_list$/, "等待 90 秒后查看 GitHub Actions 构建是否成功"],
+    [/actions_get$/, "等待 90 秒后查看 GitHub Actions 任务详情"],
     [/actions_run_trigger$/, "触发 GitHub Actions 构建"],
     [/get_job_logs$/, "获取 Actions 构建日志"]
   ];
@@ -282,6 +282,10 @@ export function formatToolActionCard(toolCall, activeTools, userText = "") {
   if (!details) {
     details = JSON.stringify(safeArguments);
     if (details.length > 300) details = `${details.slice(0, 300)}...`;
+  }
+  const isActions = /actions_(list|get)/i.test(rawAction);
+  if (isActions) {
+    details = `${details ? `${details} | ` : ""}正在进行 90 秒等待并拉取构建结果`;
   }
   return `目标说明：${goal}\n调用工具：\`${rawAction}\`\n检索内容：${details}`;
 }
@@ -974,7 +978,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
   });
 
   const systemRules = [
-    "【工具调用透明化与高效并行规范】\n1. 单轮最多规划并发调用 3 个最相关的真实工具；若目标较多，先执行优先级最高的 1~3 项，取得结果后再决定下一步，禁止一次性铺开大量调用。\n2. 严禁提前输出总结或方案草稿：在所有信息收集、代码排查或修改操作全部完成之前，严禁在中间轮次输出结论、答复文本、分析讲解或开场白！\n3. 严禁死等或轮询构建状态：当代码已提交成功，若 GitHub Actions 已触发并在运行中（in_progress/queued），严禁连续轮询等待其完成！应直接结束工具调用并向用户交付结果，告知构建已在后台触发即可。\n4. 优先使用原生 Tool Calls。仅当上游未发出原生调用时，才允许使用操作卡片作为兼容兜底；每轮最多 3 张，且必须对应真实工具调用。多个卡片之间必须使用双换行（\\n\\n）空行彻底分隔，严禁单行连续粘连：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n5. 核心执行约束：输出上述操作卡片的同时，必须同时发起真实的底层工具调用（Tool Calls），严禁仅在正文中打印卡片文本而不发起工具调用！\n6. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n7. 当所有工具调用完毕、进入最终答复轮次时，直接输出完整最终解答，终局轮次严禁输出操作卡片。"
+    "【工具调用透明化与高效并行规范】\n1. 单轮最多规划并发调用 3 个最相关的真实工具；若目标较多，先执行优先级最高的 1~3 项，取得结果后再决定下一步，禁止一次性铺开大量调用。\n2. 严禁提前输出总结或方案草稿：在所有信息收集、代码排查或修改操作全部完成之前，严禁在中间轮次输出结论、答复文本、分析讲解或开场白！\n3. 【GitHub Actions 构建检查规范】代码修改并提交成功后，若需确认构建状态，仅允许发起 1 次 Actions 工具调用（如 actions_list）。系统会在底层自动输出等待卡片并倒计时等待 90 秒后再拉取最新构建结果。全过程严格只查看 1 次！90 秒等待与查询完成后，严禁再次发起任何 actions 工具轮询，必须立即向用户输出最终答复，汇报代码修改详情与当前构建状态。\n4. 优先使用原生 Tool Calls。仅当上游未发出原生调用时，才允许使用操作卡片作为兼容兜底；每轮最多 3 张，且必须对应真实工具调用。多个卡片之间必须使用双换行（\\n\\n）空行彻底分隔，严禁单行连续粘连：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n5. 核心执行约束：输出上述操作卡片的同时，必须同时发起真实的底层工具调用（Tool Calls），严禁仅在正文中打印卡片文本而不发起工具调用！\n6. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n7. 当所有工具调用完毕、进入最终答复轮次时，直接输出完整最终解答，终局轮次严禁输出操作卡片。"
   ];
   const hasCloudflare = tools.some((t) => {
     const n = (t.function?.name || "").toLowerCase();
@@ -1029,6 +1033,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
 
   let finalFinishReason = null;
   let executedToolCount = 0;
+  let actionsCheckCount = 0;
   const toolCallHistory = new Map();
   const dialogReadCache = new Map();
   let hasWriteSuccess = false;
@@ -1242,25 +1247,44 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
             const prevAttempts = toolCallHistory.get(callKey) || 0;
             const isActionsPoll = /actions_(list|get)/i.test(rawAction);
 
-            if (isActionsPoll && prevAttempts >= 2) {
-              resultText = JSON.stringify({
-                status: "in_progress",
-                note: "构建已触发并在后台正常排队或运行中。切勿继续机械轮询，请立即根据已有修改向用户进行最终回答与交付汇报！"
-              });
-              isToolError = false;
+            if (isActionsPoll) {
+              if (actionsCheckCount >= 1) {
+                resultText = JSON.stringify({
+                  status: "already_checked",
+                  note: "已完成 90 秒等待与唯一一次构建检查。规则限制只查看一次构建状态，严禁重复查询！请立即向用户交付最终汇报与代码说明。"
+                });
+                isToolError = false;
+              } else {
+                actionsCheckCount += 1;
+                addDebugLog("TOOL", `[Actions 检查] 开始进行 90 秒倒计时等待云端构建完成...`);
+                const TOTAL_WAIT_SEC = 90;
+                for (let s = 0; s < TOTAL_WAIT_SEC; s += 1) {
+                  if (abortSignal?.aborted || clientResponse.destroyed) break;
+                  await new Promise((r) => setTimeout(r, 1000));
+                }
+                try {
+                  const toolRes = await callMcpTool(tc.function.name, args);
+                  resultText = `${toolRes.content}\n\n【系统提示】已完成 90 秒等待并拉取到构建最新状态（全过程仅检查此一次）。请不要继续轮询，请立即向用户交付完整的最终答复。`;
+                  isToolError = toolRes.isError;
+                  if (!isToolError) executedToolCount += 1;
+                } catch (err) {
+                  resultText = JSON.stringify({ error: err instanceof Error ? err.message : "获取构建状态失败" });
+                  isToolError = true;
+                }
+              }
             } else {
-              const cachedContent = !isWrite && !isActionsPoll ? dialogReadCache.get(callKey) : null;
+              const cachedContent = !isWrite ? dialogReadCache.get(callKey) : null;
 
               if (cachedContent !== undefined && cachedContent !== null) {
                 toolCallHistory.set(callKey, prevAttempts + 1);
-                if (prevAttempts >= 3) {
+                if (prevAttempts >= 5) {
                   resultText = JSON.stringify({ note: "已多次复用该工具的缓存结果，当前信息完整且最新。请直接根据已有信息继续执行或回答用户。" });
                 } else {
                   resultText = cachedContent;
                   addDebugLog("TOOL", `MCP 工具 [${tc.function.name}] 命中本次对话只读缓存，直接复用 (${cachedContent.length} 字符)`, { arguments: args });
                 }
                 isToolError = false;
-              } else if (prevAttempts >= 2 && !isActionsPoll) {
+              } else if (prevAttempts >= 2) {
                 resultText = JSON.stringify({ error: "该工具已使用完全相同的参数重复调用多次，系统已拦截重复执行。请勿继续重复调用，请根据当前信息直接回答用户。" });
                 isToolError = true;
               } else {
@@ -1274,7 +1298,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                     if (isWrite) {
                       hasWriteSuccess = true;
                       dialogReadCache.clear();
-                    } else if (!isActionsPoll) {
+                    } else {
                       dialogReadCache.set(callKey, resultText);
                     }
                   }
@@ -1531,26 +1555,77 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
           const prevAttempts = toolCallHistory.get(callKey) || 0;
           const isActionsPoll = /actions_(list|get)/i.test(rawAction);
 
-          if (isActionsPoll && prevAttempts >= 2) {
-            resultText = JSON.stringify({
-              status: "in_progress",
-              note: "构建已触发并在后台正常排队或运行中。切勿继续机械轮询，请立即根据已有修改向用户进行最终回答与交付汇报！"
-            });
-            isToolError = false;
+          if (isActionsPoll) {
+            if (actionsCheckCount >= 1) {
+              errorMessage = "重复检查已被拦截";
+              resultText = JSON.stringify({
+                status: "already_checked",
+                note: "已完成 90 秒等待与唯一一次构建检查，规则限制只查看一次构建状态，严禁重复查询！请立即向用户交付最终汇报与修改详情。"
+              });
+              isToolError = false;
+            } else {
+              actionsCheckCount += 1;
+              addDebugLog("TOOL", `[Actions 检查] 开始倒计时 90 秒等待云端构建完成...`);
+
+              if (!abortSignal?.aborted && !clientResponse.destroyed) {
+                sendReasoningChunk(
+                  clientResponse,
+                  `\n> ⏳ 正在等待 GitHub Actions 云端构建运行，预计等待 90 秒后拉取最新状态...\n`,
+                  requestBody.model
+                );
+              }
+
+              const TOTAL_WAIT_SEC = 90;
+              for (let sec = 1; sec <= TOTAL_WAIT_SEC; sec += 1) {
+                if (abortSignal?.aborted || clientResponse.destroyed) break;
+                await new Promise((r) => setTimeout(r, 1000));
+                if (sec % 15 === 0 && sec < TOTAL_WAIT_SEC && !abortSignal?.aborted && !clientResponse.destroyed) {
+                  sendReasoningChunk(
+                    clientResponse,
+                    `\n> ⏳ 正在等待 GitHub Actions 云端构建运行（已等待 ${sec}s / ${TOTAL_WAIT_SEC}s）...\n`,
+                    requestBody.model
+                  );
+                }
+              }
+
+              if (!abortSignal?.aborted && !clientResponse.destroyed) {
+                sendReasoningChunk(
+                  clientResponse,
+                  `\n> 🔍 90 秒等待结束，正在拉取 GitHub Actions 最新状态...\n`,
+                  requestBody.model
+                );
+              }
+
+              try {
+                const toolRes = await callMcpTool(tc.name, args, onWaitNotice);
+                resultText = `${toolRes.content}\n\n【系统特别提示】已完成 90 秒等待并获取构建最新状态（全过程仅检查此一次）。请不要继续轮询，请立即向用户交付完整的最终答复（包括代码修改详情和当前构建状态）。`;
+                isToolError = toolRes.isError;
+                if (isToolError) {
+                  errorMessage = extractErrorMessage(toolRes.content);
+                } else {
+                  executedToolCount += 1;
+                }
+              } catch (err) {
+                const msg = err instanceof Error ? err.message : "获取构建状态失败";
+                errorMessage = extractErrorMessage(msg);
+                resultText = JSON.stringify({ error: msg });
+                isToolError = true;
+              }
+            }
           } else {
-            const cachedContent = !isWrite && !isActionsPoll ? dialogReadCache.get(callKey) : null;
+            const cachedContent = !isWrite ? dialogReadCache.get(callKey) : null;
 
             if (cachedContent !== undefined && cachedContent !== null) {
               isCacheHit = true;
               toolCallHistory.set(callKey, prevAttempts + 1);
-              if (prevAttempts >= 3) {
+              if (prevAttempts >= 5) {
                 resultText = JSON.stringify({ note: "已多次复用该工具的缓存结果，当前信息完整且最新。请直接根据已有信息继续执行或回答用户。" });
               } else {
                 resultText = cachedContent;
                 addDebugLog("TOOL", `MCP 工具 [${tc.name}] 命中本次对话只读缓存，直接复用 (${cachedContent.length} 字符)`, { arguments: args });
               }
               isToolError = false;
-            } else if (prevAttempts >= 2 && !isActionsPoll) {
+            } else if (prevAttempts >= 2) {
               errorMessage = "重复调用已被系统拦截";
               resultText = JSON.stringify({ error: "该工具已使用完全相同的参数重复调用多次，系统已拦截重复执行。请勿继续重复调用，请根据当前信息直接回答用户。" });
               isToolError = true;
@@ -1585,7 +1660,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                   if (isWrite) {
                     hasWriteSuccess = true;
                     dialogReadCache.clear();
-                  } else if (!isActionsPoll) {
+                  } else {
                     dialogReadCache.set(callKey, resultText);
                   }
                 }
@@ -1606,6 +1681,20 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
               `\n> ⚡ [${displayName}] \`${rawAction}\`${detailSuffix} (复用对话缓存)\n`,
               requestBody.model
             );
+          } else if (isActionsPoll) {
+            if (isToolError) {
+              sendReasoningChunk(
+                clientResponse,
+                `\n> ❌ [${displayName}] 构建状态获取失败${errorMessage ? `: ${errorMessage}` : ""}\n`,
+                requestBody.model
+              );
+            } else {
+              sendReasoningChunk(
+                clientResponse,
+                `\n> ✅ [${displayName}] 90 秒等待结束，已成功获取最新构建状态\n`,
+                requestBody.model
+              );
+            }
           } else if (isToolError) {
             const failReason = errorMessage ? `: ${errorMessage}` : "";
             sendReasoningChunk(
