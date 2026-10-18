@@ -930,7 +930,8 @@ function parseTextToolCalls(text, activeTools) {
     calls.push({
       id: `call_text_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
       name: finalToolName,
-      arguments: JSON.stringify(parsedArgs)
+      arguments: JSON.stringify(parsedArgs),
+      goal: match[1].trim()
     });
   }
 
@@ -1476,6 +1477,54 @@ function formatToolCallDetails(args) {
   }
 
   return parts.join(", ");
+}
+
+function redactToolArguments(value, key = "") {
+  if (/api.?key|token|secret|password|authorization|credential/i.test(key)) {
+    return "[已隐藏]";
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => redactToolArguments(item));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([childKey, childValue]) => [
+        childKey,
+        redactToolArguments(childValue, childKey)
+      ])
+    );
+  }
+  if (typeof value === "string" && value.length > 500) {
+    return `${value.slice(0, 500)}...`;
+  }
+  return value;
+}
+
+function formatToolActionCard(toolCall, activeTools) {
+  const toolName = toolCall.function?.name || toolCall.name || "unknown_tool";
+  const toolInfo = mcpToolRegistry.get(toolName) || Array.from(mcpToolRegistry.entries())
+    .find(([key, info]) => key.endsWith(toolName) || toolName.endsWith(info.rawName))?.[1];
+  const rawAction = toolInfo?.rawName || toolName;
+  const rawArguments = toolCall.function?.arguments ?? toolCall.arguments;
+  const parsedArguments = toolArguments({ function: { arguments: rawArguments } }) || {};
+  const safeArguments = redactToolArguments(parsedArguments);
+  const toolDefinition = activeTools.find((tool) => {
+    const name = tool.function?.name || "";
+    return name === toolName || name.endsWith(`_${toolName}`) || toolName.endsWith(`_${name}`);
+  });
+  const description = String(toolDefinition?.function?.description || "")
+    .replace(/^\[[^\]]+\]\s*/, "")
+    .split(/[\r\n]/, 1)[0]
+    .trim();
+  const goal = String(toolCall.goal || description || `执行工具 ${rawAction}`)
+    .replace(/[\r\n]+/g, " ")
+    .slice(0, 180);
+  let details = formatToolCallDetails(safeArguments);
+  if (!details) {
+    details = JSON.stringify(safeArguments);
+    if (details.length > 300) details = `${details.slice(0, 300)}...`;
+  }
+  return `目标说明：${goal}\n调用工具：\`${rawAction}\`\n检索内容：${details}`;
 }
 
 function isWriteTool(toolName) {
@@ -2350,6 +2399,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
   const dialogReadCache = new Map();
   let hasWriteSuccess = false;
   let consecutiveFailures = 0;
+  const displayedActionCards = [];
   const MAX_AGENT_ROUNDS = 35;
   const MAX_TOOL_CALLS_PER_ROUND = 3;
 
@@ -2477,6 +2527,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
             mcpCalls = textCalls.map((tc) => ({
               id: tc.id,
               type: "function",
+              goal: tc.goal,
               function: { name: tc.name, arguments: tc.arguments }
             }));
           }
@@ -2494,6 +2545,10 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
           if (typeof message?.content === "string" && /(?:目标说明|调用工具|检索内容)\s*[：:]/.test(message.content)) {
             message.content = "输出了无法匹配到已启用工具的操作卡片，未执行任何工具。请根据当前可用工具直接回答。";
           }
+          if (displayedActionCards.length > 0 && message) {
+            const finalText = typeof message.content === "string" ? message.content : "";
+            message.content = [displayedActionCards.join("\n\n"), finalText].filter(Boolean).join("\n\n");
+          }
           addDebugLog("AGENT", `第 ${round + 1} 轮完成 - 非流式响应返回客户端 (累计执行工具 ${executedToolCount} 次)`, {
             finishReason: finalFinishReason,
             contentLength: message?.content?.length || 0
@@ -2501,6 +2556,8 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
           sendJson(clientResponse, 200, json);
           return;
         }
+
+        displayedActionCards.push(...mcpCalls.map((tc) => formatToolActionCard(tc, activeTools)));
 
         if (usedTextToolCallFallback) {
           messages.push({
@@ -2768,6 +2825,11 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
           totalRounds: round + 1
         });
         return;
+      }
+
+      const visibleActionCards = mcpCalls.map((tc) => formatToolActionCard(tc, activeTools));
+      if (visibleActionCards.length > 0 && !abortSignal?.aborted && !clientResponse.destroyed) {
+        sendSSEChunk(clientResponse, { content: `${visibleActionCards.join("\n\n")}\n\n` }, requestBody.model);
       }
 
       messages.push({
