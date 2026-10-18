@@ -895,6 +895,16 @@ function parseTextToolCalls(text, activeTools) {
       } catch {}
     }
 
+    if (Object.keys(parsedArgs).length === 0 && paramsSchema.owner && paramsSchema.repo) {
+      const repoPathMatch = contentArg.match(/^([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+)(?::(.*))?$/);
+      if (repoPathMatch) {
+        parsedArgs.owner = repoPathMatch[1].trim();
+        parsedArgs.repo = repoPathMatch[2].trim();
+        const filePath = (repoPathMatch[3] || "").trim().replace(/^[:/\\s]+/, "").replace(/^`|`$/g, "");
+        if (paramsSchema.path && filePath) parsedArgs.path = filePath;
+      }
+    }
+
     if (Object.keys(parsedArgs).length === 0 && contentArg.includes(":")) {
       const kvMatches = contentArg.matchAll(/([a-zA-Z0-9_]+)\s*[:：]\s*([^,\n]+)/g);
       for (const m of kvMatches) {
@@ -912,8 +922,8 @@ function parseTextToolCalls(text, activeTools) {
       else if (paramsSchema.path) parsedArgs.path = contentArg;
       else if (paramsSchema.files) parsedArgs.files = [contentArg];
       else {
-        const firstProp = Object.keys(paramsSchema)[0];
-        if (firstProp) parsedArgs[firstProp] = contentArg;
+        const properties = Object.keys(paramsSchema);
+        if (properties.length === 1) parsedArgs[properties[0]] = contentArg;
       }
     }
 
@@ -2281,7 +2291,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
   });
 
   const systemRules = [
-    "【工具调用透明化与高效并行规范】\n1. 高效并行调用：当需要查阅多个文件、检索多个不同关键词或执行多个无相互依赖的操作时，必须在单轮响应中一次性发起所有工具调用进行并发执行，严禁拆分成多轮逐个调用。\n2. 严禁提前输出总结或方案草稿：在所有信息收集、代码排查或修改操作全部完成之前，严禁在中间轮次输出结论、答复文本、分析讲解或开场白！\n3. 在需要调用工具的轮次，正文必须且仅输出如下格式的操作卡片。若单轮并发调用多个工具，每个操作卡片之间必须使用双换行（\\n\\n）空行彻底分隔，严禁单行连续粘连：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n4. 核心执行约束：输出上述操作卡片的同时，必须同时发起真实的底层工具调用（Tool Calls），严禁仅在正文中打印卡片文本而不发起工具调用！\n5. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n6. 当所有工具调用完毕、进入最终答复轮次时，直接输出完整最终解答，终局轮次严禁输出操作卡片。"
+    "【工具调用透明化与高效并行规范】\n1. 单轮最多规划并发调用 3 个最相关的真实工具；若目标较多，先执行优先级最高的 1~3 项，取得结果后再决定下一步，禁止一次性铺开大量调用。\n2. 严禁提前输出总结或方案草稿：在所有信息收集、代码排查或修改操作全部完成之前，严禁在中间轮次输出结论、答复文本、分析讲解或开场白！\n3. 优先使用原生 Tool Calls。仅当上游未发出原生调用时，才允许使用操作卡片作为兼容兜底；每轮最多 3 张，且必须对应真实工具调用。多个卡片之间必须使用双换行（\\n\\n）空行彻底分隔，严禁单行连续粘连：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n4. 核心执行约束：输出上述操作卡片的同时，必须同时发起真实的底层工具调用（Tool Calls），严禁仅在正文中打印卡片文本而不发起工具调用！\n5. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n6. 当所有工具调用完毕、进入最终答复轮次时，直接输出完整最终解答，终局轮次严禁输出操作卡片。"
   ];
   const hasCloudflare = tools.some((t) => {
     const n = (t.function?.name || "").toLowerCase();
@@ -2341,6 +2351,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
   let hasWriteSuccess = false;
   let consecutiveFailures = 0;
   const MAX_AGENT_ROUNDS = 35;
+  const MAX_TOOL_CALLS_PER_ROUND = 3;
 
   try {
     for (let round = 0; round < MAX_AGENT_ROUNDS; round += 1) {
@@ -2457,9 +2468,11 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
           return false;
         });
 
+        let usedTextToolCallFallback = false;
         if (mcpCalls.length === 0 && activeTools.length > 0 && message?.content) {
           const textCalls = parseTextToolCalls(message.content, activeTools);
           if (textCalls.length > 0) {
+            usedTextToolCallFallback = true;
             addDebugLog("AGENT", `[自愈触发] 非流式检测到模型输出了 ${textCalls.length} 个操作卡片，自动转化为真实 MCP 调用`);
             mcpCalls = textCalls.map((tc) => ({
               id: tc.id,
@@ -2469,7 +2482,18 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
           }
         }
 
+        if (mcpCalls.length > MAX_TOOL_CALLS_PER_ROUND) {
+          addDebugLog("AGENT", `单轮工具调用超过上限，已截取前 ${MAX_TOOL_CALLS_PER_ROUND} 个`, {
+            requested: mcpCalls.length,
+            allowed: MAX_TOOL_CALLS_PER_ROUND
+          });
+          mcpCalls = mcpCalls.slice(0, MAX_TOOL_CALLS_PER_ROUND);
+        }
+
         if (mcpCalls.length === 0) {
+          if (typeof message?.content === "string" && /(?:目标说明|调用工具|检索内容)\s*[：:]/.test(message.content)) {
+            message.content = "输出了无法匹配到已启用工具的操作卡片，未执行任何工具。请根据当前可用工具直接回答。";
+          }
           addDebugLog("AGENT", `第 ${round + 1} 轮完成 - 非流式响应返回客户端 (累计执行工具 ${executedToolCount} 次)`, {
             finishReason: finalFinishReason,
             contentLength: message?.content?.length || 0
@@ -2478,7 +2502,19 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
           return;
         }
 
-        messages.push(message);
+        if (usedTextToolCallFallback) {
+          messages.push({
+            ...message,
+            content: null,
+            tool_calls: mcpCalls.map((tc) => ({
+              id: tc.id,
+              type: "function",
+              function: { name: tc.function.name, arguments: tc.function.arguments }
+            }))
+          });
+        } else {
+          messages.push(message);
+        }
 
         let roundHasFailure = false;
         const CONCURRENCY_LIMIT = 4;
@@ -2581,6 +2617,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
       let assistantContent = "";
       let hasToolCalls = false;
       let roundFinishReason = null;
+      let stoppedForTextToolCalls = false;
 
       try {
         while (true) {
@@ -2630,21 +2667,13 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
 
               if (delta?.content) {
                 assistantContent += delta.content;
-                if (!clientResponse.destroyed && !abortSignal?.aborted) {
-                  const contentChunk = {
-                    id: parsed.id || `chatcmpl-${Date.now()}`,
-                    object: "chat.completion.chunk",
-                    created: parsed.created || Math.floor(Date.now() / 1000),
-                    model: parsed.model || requestBody.model || "default",
-                    choices: [
-                      {
-                        index: 0,
-                        delta: { content: delta.content },
-                        finish_reason: null
-                      }
-                    ]
-                  };
-                  clientResponse.write(`data: ${JSON.stringify(contentChunk)}\n\n`);
+                if (!hasToolCalls && activeTools.length > 0) {
+                  const textCalls = parseTextToolCalls(assistantContent, activeTools);
+                  if (textCalls.length >= MAX_TOOL_CALLS_PER_ROUND) {
+                    stoppedForTextToolCalls = true;
+                    await reader.cancel().catch(() => {});
+                    break;
+                  }
                 }
               }
 
@@ -2668,6 +2697,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
               }
             } catch {}
           }
+          if (stoppedForTextToolCalls) break;
         }
       } catch (err) {
         if (abortSignal?.aborted || err.name === "AbortError") {
@@ -2691,16 +2721,33 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
         return false;
       });
 
+      let usedTextToolCallFallback = false;
       if (mcpCalls.length === 0 && activeTools.length > 0 && assistantContent) {
         const textCalls = parseTextToolCalls(assistantContent, activeTools);
         if (textCalls.length > 0) {
+          usedTextToolCallFallback = true;
           addDebugLog("AGENT", `[自愈触发] 流式检测到模型仅输出了 ${textCalls.length} 个操作卡片而未触发原生 tool_calls，自动转化为真实 MCP 调用`);
           mcpCalls = textCalls;
         }
       }
 
+      if (mcpCalls.length > MAX_TOOL_CALLS_PER_ROUND) {
+        addDebugLog("AGENT", `单轮工具调用超过上限，已截取前 ${MAX_TOOL_CALLS_PER_ROUND} 个`, {
+          requested: mcpCalls.length,
+          allowed: MAX_TOOL_CALLS_PER_ROUND
+        });
+        mcpCalls = mcpCalls.slice(0, MAX_TOOL_CALLS_PER_ROUND);
+      }
+
       if (mcpCalls.length === 0) {
-        if (isTruncatedFinishReason(roundFinishReason) && assistantContent && !abortSignal?.aborted && !clientResponse.destroyed) {
+        if (!/(?:目标说明|调用工具|检索内容)\s*[：:]/.test(assistantContent)) {
+          if (assistantContent && !abortSignal?.aborted && !clientResponse.destroyed) {
+            sendSSEChunk(clientResponse, { content: assistantContent }, requestBody.model);
+          }
+        } else if (!abortSignal?.aborted && !clientResponse.destroyed) {
+          sendSSEChunk(clientResponse, { content: "输出了无法匹配到已启用工具的操作卡片，未执行任何工具。请根据当前可用工具直接回答。" }, requestBody.model);
+        }
+        if (isTruncatedFinishReason(roundFinishReason) && assistantContent && !/(?:目标说明|调用工具|检索内容)\s*[：:]/.test(assistantContent) && !abortSignal?.aborted && !clientResponse.destroyed) {
           addDebugLog("AGENT", `⚠️ [抗截断触发] MCP 调度检测到截断 (${roundFinishReason})！正在自动进行无感断点续接...`, {
             round: round + 1,
             finishReason: roundFinishReason,
@@ -2725,7 +2772,7 @@ async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
 
       messages.push({
         role: "assistant",
-        content: assistantContent || null,
+        content: usedTextToolCallFallback ? null : (assistantContent || null),
         tool_calls: mcpCalls.map((tc) => ({
           id: tc.id || `call_${crypto.randomUUID()}`,
           type: "function",
