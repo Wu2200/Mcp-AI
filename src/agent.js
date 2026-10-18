@@ -250,8 +250,8 @@ export function buildChineseToolGoal(rawAction, userText) {
     [/search_issues$/, "搜索相关问题"],
     [/create_or_update_file$/, "创建或更新仓库文件"],
     [/github_edit_file$/, "修改 GitHub 仓库文件"],
-    [/actions_list$/, "等待 90 秒后查看 GitHub Actions 构建是否成功"],
-    [/actions_get$/, "等待 90 秒后查看 GitHub Actions 任务详情"],
+    [/actions_list$/, "根据上次主构建耗时动态等待并查看 Actions 结果"],
+    [/actions_get$/, "根据上次主构建耗时动态等待并查看 Actions 详情"],
     [/actions_run_trigger$/, "触发 GitHub Actions 构建"],
     [/get_job_logs$/, "获取 Actions 构建日志"]
   ];
@@ -285,7 +285,7 @@ export function formatToolActionCard(toolCall, activeTools, userText = "") {
   }
   const isActions = /actions_(list|get)/i.test(rawAction);
   if (isActions) {
-    details = `${details ? `${details} | ` : ""}正在进行 90 秒等待并拉取构建结果`;
+    details = `${details ? `${details} | ` : ""}正在根据上次主要构建耗时动态等待 (+10s) 并拉取结果`;
   }
   return `目标说明：${goal}\n调用工具：\`${rawAction}\`\n检索内容：${details}`;
 }
@@ -939,6 +939,58 @@ export async function passThroughAndTransformGemini(requestBody, clientResponse,
   }
 }
 
+export async function estimatePrimaryBuildWaitSeconds(owner, repo) {
+  if (!owner || !repo) {
+    return { waitSec: 70, primaryWorkflowName: "主构建", lastDuration: 60 };
+  }
+  try {
+    const res = await callMcpTool("actions_list", {
+      method: "list_workflow_runs",
+      owner,
+      repo,
+      perPage: 15
+    });
+    if (res.isError || !res.content) {
+      return { waitSec: 70, primaryWorkflowName: "主构建", lastDuration: 60 };
+    }
+    const data = JSON.parse(res.content);
+    const runs = Array.isArray(data.workflow_runs) ? data.workflow_runs : [];
+    const successRuns = runs.filter((r) => r.status === "completed" && r.conclusion === "success");
+    if (successRuns.length === 0) {
+      return { waitSec: 70, primaryWorkflowName: "默认构建", lastDuration: 60 };
+    }
+
+    const isAuxiliary = (name = "", path = "") => {
+      const lower = `${name} ${path}`.toLowerCase();
+      return /cleanup|lint|format|stale|dependabot|pages|greeting|notify|label/i.test(lower);
+    };
+
+    let candidateRuns = successRuns.filter((r) => !isAuxiliary(r.name, r.path));
+    if (candidateRuns.length === 0) candidateRuns = successRuns;
+
+    const runsWithDuration = candidateRuns.map((r) => {
+      const start = new Date(r.run_started_at || r.created_at).getTime();
+      const end = new Date(r.updated_at).getTime();
+      const durSec = Math.max(1, Math.round((end - start) / 1000));
+      return { run: r, durSec };
+    });
+
+    runsWithDuration.sort((a, b) => b.durSec - a.durSec);
+    const primary = runsWithDuration[0];
+    const lastDuration = primary.durSec;
+    let waitSec = lastDuration + 10;
+    waitSec = Math.max(25, Math.min(180, waitSec));
+
+    return {
+      waitSec,
+      primaryWorkflowName: primary.run.name || "主要构建",
+      lastDuration
+    };
+  } catch {
+    return { waitSec: 70, primaryWorkflowName: "主构建", lastDuration: 60 };
+  }
+}
+
 export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal) {
   if (!Array.isArray(requestBody.messages) || requestBody.messages.length === 0) {
     throw new Error("messages 必须是非空数组");
@@ -978,7 +1030,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
   });
 
   const systemRules = [
-    "【工具调用透明化与高效并行规范】\n1. 单轮最多规划并发调用 3 个最相关的真实工具；若目标较多，先执行优先级最高的 1~3 项，取得结果后再决定下一步，禁止一次性铺开大量调用。\n2. 严禁提前输出总结或方案草稿：在所有信息收集、代码排查或修改操作全部完成之前，严禁在中间轮次输出结论、答复文本、分析讲解或开场白！\n3. 【GitHub Actions 构建检查规范】代码修改并提交成功后，若需确认构建状态，仅允许发起 1 次 Actions 工具调用（如 actions_list）。系统会在底层自动输出等待卡片并倒计时等待 90 秒后再拉取最新构建结果。全过程严格只查看 1 次！90 秒等待与查询完成后，严禁再次发起任何 actions 工具轮询，必须立即向用户输出最终答复，汇报代码修改详情与当前构建状态。\n4. 优先使用原生 Tool Calls。仅当上游未发出原生调用时，才允许使用操作卡片作为兼容兜底；每轮最多 3 张，且必须对应真实工具调用。多个卡片之间必须使用双换行（\\n\\n）空行彻底分隔，严禁单行连续粘连：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n5. 核心执行约束：输出上述操作卡片的同时，必须同时发起真实的底层工具调用（Tool Calls），严禁仅在正文中打印卡片文本而不发起工具调用！\n6. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n7. 当所有工具调用完毕、进入最终答复轮次时，直接输出完整最终解答，终局轮次严禁输出操作卡片。"
+    "【工具调用透明化与高效并行规范】\n1. 单轮最多规划并发调用 3 个最相关的真实工具；若目标较多，先执行优先级最高的 1~3 项，取得结果后再决定下一步，禁止一次性铺开大量调用。\n2. 严禁提前输出总结或方案草稿：在所有信息收集、代码排查或修改操作全部完成之前，严禁在中间轮次输出结论、答复文本、分析讲解或开场白！\n3. 【GitHub Actions 构建检查规范】代码修改并提交成功后，若需确认构建状态，仅允许发起 1 次 Actions 工具调用（如 actions_list）。系统会在底层自动查询该仓库上次主要构建的成功耗时，并在该耗时基础上+10秒进行动态倒计时等待，随后拉取最新构建结果。全过程严格只查看 1 次！等待与查询完成后，严禁再次发起任何 actions 工具轮询，必须立即向用户输出最终答复，汇报代码修改详情与当前构建状态。\n4. 优先使用原生 Tool Calls。仅当上游未发出原生调用时，才允许使用操作卡片作为兼容兜底；每轮最多 3 张，且必须对应真实工具调用。多个卡片之间必须使用双换行（\\n\\n）空行彻底分隔，严禁单行连续粘连：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n5. 核心执行约束：输出上述操作卡片的同时，必须同时发起真实的底层工具调用（Tool Calls），严禁仅在正文中打印卡片文本而不发起工具调用！\n6. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n7. 当所有工具调用完毕、进入最终答复轮次时，直接输出完整最终解答，终局轮次严禁输出操作卡片。"
   ];
   const hasCloudflare = tools.some((t) => {
     const n = (t.function?.name || "").toLowerCase();
@@ -1251,20 +1303,20 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
               if (actionsCheckCount >= 1) {
                 resultText = JSON.stringify({
                   status: "already_checked",
-                  note: "已完成 90 秒等待与唯一一次构建检查。规则限制只查看一次构建状态，严禁重复查询！请立即向用户交付最终汇报与代码说明。"
+                  note: "已完成动态等待与唯一一次构建检查。规则限制只查看一次构建状态，严禁重复查询！请立即向用户交付最终汇报与代码说明。"
                 });
                 isToolError = false;
               } else {
                 actionsCheckCount += 1;
-                addDebugLog("TOOL", `[Actions 检查] 开始进行 90 秒倒计时等待云端构建完成...`);
-                const TOTAL_WAIT_SEC = 90;
-                for (let s = 0; s < TOTAL_WAIT_SEC; s += 1) {
+                const { waitSec, primaryWorkflowName, lastDuration } = await estimatePrimaryBuildWaitSeconds(args.owner, args.repo);
+                addDebugLog("TOOL", `[Actions 动态等待] 预估主要构建 [${primaryWorkflowName}] 上次耗时 ${lastDuration}s，本次等待 ${waitSec}s`);
+                for (let s = 0; s < waitSec; s += 1) {
                   if (abortSignal?.aborted || clientResponse.destroyed) break;
                   await new Promise((r) => setTimeout(r, 1000));
                 }
                 try {
                   const toolRes = await callMcpTool(tc.function.name, args);
-                  resultText = `${toolRes.content}\n\n【系统提示】已完成 90 秒等待并拉取到构建最新状态（全过程仅检查此一次）。请不要继续轮询，请立即向用户交付完整的最终答复。`;
+                  resultText = `${toolRes.content}\n\n【系统提示】已根据该仓库上次主要构建 [${primaryWorkflowName}] 成功耗时 (${lastDuration}s) 动态等待了 ${waitSec} 秒 (${lastDuration}s + 10s)，并拉取到构建最新状态（全过程仅检查此一次）。请不要继续轮询，请立即向用户交付完整的最终答复。`;
                   isToolError = toolRes.isError;
                   if (!isToolError) executedToolCount += 1;
                 } catch (err) {
@@ -1560,22 +1612,23 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
               errorMessage = "重复检查已被拦截";
               resultText = JSON.stringify({
                 status: "already_checked",
-                note: "已完成 90 秒等待与唯一一次构建检查，规则限制只查看一次构建状态，严禁重复查询！请立即向用户交付最终汇报与修改详情。"
+                note: "已完成动态等待与唯一一次构建检查，规则限制只查看一次构建状态，严禁重复查询！请立即向用户交付最终汇报与修改详情。"
               });
               isToolError = false;
             } else {
               actionsCheckCount += 1;
-              addDebugLog("TOOL", `[Actions 检查] 开始倒计时 90 秒等待云端构建完成...`);
+              const { waitSec, primaryWorkflowName, lastDuration } = await estimatePrimaryBuildWaitSeconds(args.owner, args.repo);
+              addDebugLog("TOOL", `[Actions 动态预估] 仓库 ${args.owner}/${args.repo} 主要构建 [${primaryWorkflowName}] 上次成功耗时 ${lastDuration}s，本次动态设定等待 ${waitSec}s`);
 
               if (!abortSignal?.aborted && !clientResponse.destroyed) {
                 sendReasoningChunk(
                   clientResponse,
-                  `\n> ⏳ 正在等待 GitHub Actions 云端构建运行，预计等待 90 秒后拉取最新状态...\n`,
+                  `\n> 📊 [智能预估] 识别到该仓库主要构建为 [${primaryWorkflowName}]，上次成功耗时 ${lastDuration} 秒，本次自动设定等待 ${waitSec} 秒 (${lastDuration}s + 10s)...\n`,
                   requestBody.model
                 );
               }
 
-              const TOTAL_WAIT_SEC = 90;
+              const TOTAL_WAIT_SEC = waitSec;
               for (let sec = 1; sec <= TOTAL_WAIT_SEC; sec += 1) {
                 if (abortSignal?.aborted || clientResponse.destroyed) break;
                 await new Promise((r) => setTimeout(r, 1000));
@@ -1591,14 +1644,14 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
               if (!abortSignal?.aborted && !clientResponse.destroyed) {
                 sendReasoningChunk(
                   clientResponse,
-                  `\n> 🔍 90 秒等待结束，正在拉取 GitHub Actions 最新状态...\n`,
+                  `\n> 🔍 ${TOTAL_WAIT_SEC} 秒等待结束，正在拉取 GitHub Actions 最新状态...\n`,
                   requestBody.model
                 );
               }
 
               try {
                 const toolRes = await callMcpTool(tc.name, args, onWaitNotice);
-                resultText = `${toolRes.content}\n\n【系统特别提示】已完成 90 秒等待并获取构建最新状态（全过程仅检查此一次）。请不要继续轮询，请立即向用户交付完整的最终答复（包括代码修改详情和当前构建状态）。`;
+                resultText = `${toolRes.content}\n\n【系统特别提示】已根据该仓库上次主要构建 [${primaryWorkflowName}] 的成功耗时 (${lastDuration}s) 动态等待了 ${TOTAL_WAIT_SEC} 秒 (${lastDuration}s + 10s)，并拉取到了最新构建结果（全过程仅检查此一次）。请不要继续轮询，请立即向用户交付完整的最终答复（包括代码修改详情与当前构建状态）。`;
                 isToolError = toolRes.isError;
                 if (isToolError) {
                   errorMessage = extractErrorMessage(toolRes.content);
@@ -1691,7 +1744,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
             } else {
               sendReasoningChunk(
                 clientResponse,
-                `\n> ✅ [${displayName}] 90 秒等待结束，已成功获取最新构建状态\n`,
+                `\n> ✅ [${displayName}] 构建等待结束，已成功获取最新构建状态\n`,
                 requestBody.model
               );
             }
