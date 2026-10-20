@@ -648,6 +648,17 @@ server.keepAliveTimeout = 1800000;
 server.requestTimeout = 1800000;
 server.headersTimeout = 1800000;
 
+process.on("SIGTERM", () => {
+  server.close(() => {
+    process.exit(0);
+  });
+  setTimeout(() => process.exit(0), 1500);
+});
+
+process.on("SIGINT", () => {
+  process.exit(0);
+});
+
 server.listen(PORT, "0.0.0.0", () => {
   const ch = getActiveChannel()?.name || "未配置";
   console.log(`[MCP-AI] 服务就绪 (端口: ${PORT} | 生效渠道: ${ch} | MCP工具: ${mcpToolRegistry.size}个)`);
