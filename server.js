@@ -50,11 +50,11 @@ import {
 } from "./src/agent.js";
 
 process.on("uncaughtException", (err) => {
-  console.error("[FATAL] 进程未捕获异常 (uncaughtException):", err);
+  console.error("[FATAL] 进程未捕获异常 (uncaughtException):", err?.message || err);
 });
 
 process.on("unhandledRejection", (reason) => {
-  console.error("[FATAL] 未处理的 Promise 拒绝 (unhandledRejection):", reason);
+  console.error("[FATAL] 未处理的 Promise 拒绝 (unhandledRejection):", reason?.message || reason);
 });
 
 function getLoginHtml() {
@@ -649,7 +649,6 @@ server.requestTimeout = 1800000;
 server.headersTimeout = 1800000;
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`[MCP-AI] 服务已成功启动并监听 0.0.0.0:${PORT}`);
-  console.log(`[MCP-AI] 已加载上游渠道数: ${upstreamChannels.length}，当前生效: ${getActiveChannel()?.name || "未配置"}`);
-  console.log(`[MCP-AI] 已挂载 MCP 外部工具数: ${mcpToolRegistry.size}`);
+  const ch = getActiveChannel()?.name || "未配置";
+  console.log(`[MCP-AI] 服务就绪 (端口: ${PORT} | 生效渠道: ${ch} | MCP工具: ${mcpToolRegistry.size}个)`);
 });
