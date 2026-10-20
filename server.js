@@ -50,10 +50,16 @@ import {
 } from "./src/agent.js";
 
 process.on("uncaughtException", (err) => {
+  if (err && (err.message === "aborted" || err.code === "ECONNRESET" || err.code === "EPIPE")) {
+    return;
+  }
   console.error("[FATAL] 进程未捕获异常 (uncaughtException):", err?.message || err);
 });
 
 process.on("unhandledRejection", (reason) => {
+  if (reason && (reason.message === "aborted" || reason.code === "ECONNRESET" || reason.name === "AbortError" || reason.isClientAbort)) {
+    return;
+  }
   console.error("[FATAL] 未处理的 Promise 拒绝 (unhandledRejection):", reason?.message || reason);
 });
 
@@ -155,6 +161,13 @@ await loadMcpServersFromStorage();
 await loadSettingsFromStorage();
 
 const server = http.createServer(async (request, response) => {
+  request.on("error", (err) => {
+    if (err?.message === "aborted" || err?.code === "ECONNRESET") return;
+  });
+  response.on("error", (err) => {
+    if (err?.code === "EPIPE" || err?.code === "ECONNRESET") return;
+  });
+
   try {
     if (request.method === "OPTIONS") {
       setCorsHeaders(response);
@@ -495,7 +508,21 @@ const server = http.createServer(async (request, response) => {
       const modelName = decodeURIComponent(rawModel).replace(/^models\//, "");
       const action = geminiMatch[2];
       const isStream = action === "streamGenerateContent" || reqUrl.searchParams.get("alt") === "sse";
-      const body = await readRequestBody(request);
+
+      let body;
+      try {
+        body = await readRequestBody(request);
+      } catch (err) {
+        if (err.statusCode === 413) {
+          sendOpenAIError(response, 413, "请求体过大（上限 30MB），请压缩图片后重试", "payload_too_large");
+          return;
+        }
+        if (err.isClientAbort || err.message === "aborted" || request.destroyed || response.destroyed) {
+          return;
+        }
+        sendOpenAIError(response, 400, "请求体解析失败: " + err.message);
+        return;
+      }
 
       const abortController = new AbortController();
       let clientDisconnectedLogged = false;
@@ -508,13 +535,11 @@ const server = http.createServer(async (request, response) => {
           abortController.abort();
         }
       };
-      request.on("close", onClientClose);
       response.on("close", onClientClose);
 
       try {
         await handleGeminiGenerateContent(modelName, isStream, body, response, { ip: request.socket.remoteAddress }, abortController.signal);
       } finally {
-        request.off("close", onClientClose);
         response.off("close", onClientClose);
       }
       return;
@@ -568,7 +593,21 @@ const server = http.createServer(async (request, response) => {
           return;
         }
 
-        const body = await readRequestBody(request);
+        let body;
+        try {
+          body = await readRequestBody(request);
+        } catch (err) {
+          if (err.statusCode === 413) {
+            sendOpenAIError(response, 413, "请求体过大（上限 30MB），请压缩图片后重试", "payload_too_large");
+            return;
+          }
+          if (err.isClientAbort || err.message === "aborted" || request.destroyed || response.destroyed) {
+            return;
+          }
+          sendOpenAIError(response, 400, "请求体解析失败: " + err.message);
+          return;
+        }
+
         const lastMsg = Array.isArray(body.messages) ? body.messages[body.messages.length - 1] : null;
         const lastMsgText = typeof lastMsg?.content === "string"
           ? lastMsg.content
@@ -595,7 +634,6 @@ const server = http.createServer(async (request, response) => {
             abortController.abort();
           }
         };
-        request.on("close", onClientClose);
         response.on("close", onClientClose);
 
         try {
@@ -605,7 +643,6 @@ const server = http.createServer(async (request, response) => {
             await passThrough(body, response, { ip: request.socket.remoteAddress }, abortController.signal);
           }
         } finally {
-          request.off("close", onClientClose);
           response.off("close", onClientClose);
         }
         return;
@@ -614,7 +651,7 @@ const server = http.createServer(async (request, response) => {
 
     sendOpenAIError(response, 404, "接口不存在");
   } catch (err) {
-    if (err.name === "AbortError") {
+    if (err.name === "AbortError" || err.message === "aborted" || err.code === "ECONNRESET" || err.isClientAbort) {
       return;
     }
     console.error(`[ERROR] 全局服务未捕获异常: ${err.message}`, err.stack || err);
