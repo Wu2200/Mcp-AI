@@ -489,28 +489,69 @@ export function isPanelAuthorized(request) {
   return headerToken === PANEL_PASSWORD;
 }
 
-export function readRequestBody(request) {
+export function readRequestBody(request, limit = 30 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
-    const chunks = [];
+    let chunks = [];
     let size = 0;
-    request.on("data", (chunk) => {
+    let completed = false;
+
+    const cleanup = () => {
+      chunks = null;
+      request.removeListener("data", onData);
+      request.removeListener("end", onEnd);
+      request.removeListener("error", onError);
+      request.removeListener("close", onClose);
+    };
+
+    const onError = (err) => {
+      if (completed) return;
+      completed = true;
+      cleanup();
+      const error = new Error(err?.message || "aborted");
+      error.code = err?.code;
+      error.isClientAbort = err?.message === "aborted" || err?.code === "ECONNRESET";
+      reject(error);
+    };
+
+    const onClose = () => {
+      if (completed) return;
+      if (!request.readableEnded) {
+        onError(new Error("aborted"));
+      }
+    };
+
+    const onData = (chunk) => {
+      if (completed) return;
       size += chunk.length;
-      if (size > 50 * 1024 * 1024) {
-        reject(new Error("请求过大"));
+      if (size > limit) {
+        completed = true;
+        cleanup();
+        const err = new Error("请求体过大（上限 30MB）");
+        err.statusCode = 413;
         request.destroy();
+        reject(err);
         return;
       }
       chunks.push(chunk);
-    });
-    request.on("end", () => {
+    };
+
+    const onEnd = () => {
+      if (completed) return;
+      completed = true;
       try {
         const text = Buffer.concat(chunks).toString("utf8");
+        cleanup();
         resolve(text ? JSON.parse(text) : {});
       } catch {
+        cleanup();
         reject(new Error("无效 JSON"));
       }
-    });
-    request.on("error", reject);
+    };
+
+    request.on("data", onData);
+    request.on("end", onEnd);
+    request.on("error", onError);
+    request.on("close", onClose);
   });
 }
 
