@@ -48,11 +48,16 @@ export function addDebugLog(type, summary, detail = "") {
     detail: detailStr
   };
 
-  // 输出至控制台标准输出/标准错误，供 Railway / Render 等容器平台捕获
+  // 控制台精炼输出：仅输出核心关键里程碑，过滤内部冗余中间调用
   if (type === "ERROR") {
-    console.error(`[${time}] [${type}] ${summary}${detailStr ? `\n${detailStr}` : ""}`);
-  } else {
-    console.log(`[${time}] [${type}] ${summary}`);
+    const briefErr = summary.length > 200 ? `${summary.slice(0, 200)}...` : summary;
+    console.error(`[${time}] [错误] ${briefErr}`);
+  } else if (type === "DOWNSTREAM") {
+    console.log(`[${time}] [请求] ${summary}`);
+  } else if (type === "TOOL") {
+    console.log(`[${time}] [工具] ${summary}`);
+  } else if (type === "UPSTREAM" && summary.includes("已切换当前上游渠道")) {
+    console.log(`[${time}] [渠道] ${summary}`);
   }
 
   if (!loggingEnabled) return;
@@ -64,9 +69,15 @@ export function addDebugLog(type, summary, detail = "") {
 
 export let dbPool = null;
 if (DATABASE_URL) {
+  let connectionString = DATABASE_URL;
+  try {
+    const parsedUrl = new URL(DATABASE_URL);
+    parsedUrl.searchParams.delete("sslmode");
+    connectionString = parsedUrl.toString();
+  } catch {}
   const isSslDisabled = DATABASE_URL.includes("sslmode=disable");
   dbPool = new Pool({
-    connectionString: DATABASE_URL,
+    connectionString,
     ssl: isSslDisabled ? false : { rejectUnauthorized: false }
   });
   dbPool.on("error", (err) => {
