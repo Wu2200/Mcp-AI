@@ -34,19 +34,28 @@ export const MAX_LOGS = 1000;
 export const debugLogs = [];
 
 export function addDebugLog(type, summary, detail = "") {
-  if (!loggingEnabled) return;
   const now = new Date();
   const time =
     now.toLocaleTimeString("zh-CN", { hour12: false }) +
     "." +
     String(now.getMilliseconds()).padStart(3, "0");
+  const detailStr = typeof detail === "object" ? JSON.stringify(detail, null, 2) : String(detail);
   const entry = {
     id: `log_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
     time,
     type,
     summary,
-    detail: typeof detail === "object" ? JSON.stringify(detail, null, 2) : String(detail)
+    detail: detailStr
   };
+
+  // 输出至控制台标准输出/标准错误，供 Railway / Render 等容器平台捕获
+  if (type === "ERROR") {
+    console.error(`[${time}] [${type}] ${summary}${detailStr ? `\n${detailStr}` : ""}`);
+  } else {
+    console.log(`[${time}] [${type}] ${summary}`);
+  }
+
+  if (!loggingEnabled) return;
   debugLogs.push(entry);
   if (debugLogs.length > MAX_LOGS) {
     debugLogs.shift();
