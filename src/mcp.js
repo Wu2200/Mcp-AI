@@ -317,6 +317,7 @@ export function extractFileContentAndSha(mcpRes) {
   const { rawResult, textContent } = mcpRes;
   let fileContent = "";
   let fileSha = "";
+  let fileBranch = "";
 
   if (rawResult && Array.isArray(rawResult.content)) {
     for (const item of rawResult.content) {
@@ -326,6 +327,15 @@ export function extractFileContentAndSha(mcpRes) {
         if (shaMatch) {
           fileSha = shaMatch[1];
         }
+        try {
+          const parsed = JSON.parse(item.text);
+          if (parsed && typeof parsed === "object" && typeof parsed.url === "string") {
+            const refMatch = parsed.url.match(/[?&]ref=([^&#"\s]+)/i);
+            if (refMatch && !fileBranch) {
+              fileBranch = decodeURIComponent(refMatch[1]);
+            }
+          }
+        } catch {}
       }
       if ((item.type === "resource" || item.type === "embedded_resource") && item.resource) {
         if (typeof item.resource.text === "string") {
@@ -335,6 +345,12 @@ export function extractFileContentAndSha(mcpRes) {
             fileContent = Buffer.from(item.resource.blob, "base64").toString("utf8");
           } catch {
             fileContent = item.resource.blob;
+          }
+        }
+        if (typeof item.resource.uri === "string" && !fileBranch) {
+          const uriBranchMatch = item.resource.uri.match(/\/refs\/heads\/([^/]+)\/contents\//i);
+          if (uriBranchMatch) {
+            fileBranch = decodeURIComponent(uriBranchMatch[1]);
           }
         }
       }
@@ -357,7 +373,7 @@ export function extractFileContentAndSha(mcpRes) {
     }
   }
 
-  return { fileContent, fileSha };
+  return { fileContent, fileSha, fileBranch };
 }
 
 export function applyStringReplacements(content, edits, filePath = "") {
@@ -449,7 +465,7 @@ export async function executeGithubEditFile(serverInfo, readToolRawName, writeTo
     throw new Error(`读取文件失败: ${getRes.textContent.slice(0, 300)}`);
   }
 
-  const { fileContent, fileSha } = extractFileContentAndSha(getRes);
+  const { fileContent, fileSha, fileBranch } = extractFileContentAndSha(getRes);
   if (!fileSha) {
     throw new Error(`未能获取到文件 SHA，请确认文件是否存在: ${filePath}`);
   }
@@ -460,6 +476,25 @@ export async function executeGithubEditFile(serverInfo, readToolRawName, writeTo
     throw new Error("替换前后文件内容未发生任何改变");
   }
 
+  let targetBranch = (branch || "").trim() || fileBranch;
+  if (!targetBranch) {
+    const branchTool = findServerTool(serverInfo, ["list_branches"]);
+    if (branchTool) {
+      try {
+        const branchRes = await invokeMcpRawTool(serverInfo, branchTool.rawName, { owner, repo }, onWaitNotice);
+        if (!branchRes.isToolError && branchRes.textContent) {
+          const names = Array.from(branchRes.textContent.matchAll(/"name"\s*:\s*"([^"]+)"/g), (m) => m[1]);
+          if (names.length > 0) {
+            targetBranch = names.includes("main") ? "main" : (names.includes("master") ? "master" : names[0]);
+          }
+        }
+      } catch {}
+    }
+  }
+  if (!targetBranch) {
+    targetBranch = "main";
+  }
+
   const commitMsg = (message || "").trim() || `Update ${filePath}`;
   const putArgs = {
     owner,
@@ -468,7 +503,7 @@ export async function executeGithubEditFile(serverInfo, readToolRawName, writeTo
     content: updatedContent,
     message: commitMsg,
     sha: fileSha,
-    branch: branch || "main"
+    branch: targetBranch
   };
 
   addDebugLog("TOOL", `[局部编辑] 提交更新到 GitHub: ${owner}/${repo}/${filePath} (SHA: ${fileSha})`);
@@ -479,7 +514,7 @@ export async function executeGithubEditFile(serverInfo, readToolRawName, writeTo
 
   return {
     isError: false,
-    content: `局部修改成功并已提交到 GitHub。仓库: ${owner}/${repo}，文件: ${filePath}，分支: ${branch || "main"}，修改处数: ${editList.length}，原文件 SHA: ${fileSha}`
+    content: `局部修改成功并已提交到 GitHub。仓库: ${owner}/${repo}，文件: ${filePath}，分支: ${targetBranch}，修改处数: ${editList.length}，原文件 SHA: ${fileSha}`
   };
 }
 
