@@ -784,6 +784,7 @@ export async function passThroughAndTransformGemini(requestBody, clientResponse,
   let continueRound = 0;
   const MAX_AUTO_CONTINUES = 30;
   let hasInitiatedStream = false;
+  let fullAccumulatedContent = "";
 
   while (continueRound <= MAX_AUTO_CONTINUES) {
     if (abortSignal?.aborted || clientResponse.destroyed) {
@@ -924,6 +925,8 @@ export async function passThroughAndTransformGemini(requestBody, clientResponse,
       addDebugLog("DOWNSTREAM", `[Gemini 直通模式] 客户端已断开，终止自动续接`);
       break;
     }
+
+    fullAccumulatedContent += accumulatedContent;
 
     if (isTruncatedFinishReason(lastFinishReason) && accumulatedContent && !abortSignal?.aborted && !clientResponse.destroyed) {
       continueRound += 1;
@@ -1223,7 +1226,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
             choices: [
               {
                 index: 0,
-                delta: { content: `\n\n⚠️ [上游接口返回错误 ${upstreamResponse.status}]: ${errTxt.slice(0, 500)}` },
+                delta: { content: `\n\n⚠️ [上游接口返回错误 ${upstreamResponse.status}]: ${errText.slice(0, 500)}` },
                 finish_reason: "stop"
               }
             ]
