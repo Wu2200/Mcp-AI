@@ -308,6 +308,7 @@ export function getActiveChannel() {
 const SESSION_SECRET = PANEL_PASSWORD
   ? crypto.createHash("sha256").update(`mcp-proxy-session:${PANEL_PASSWORD}`).digest("hex")
   : crypto.randomBytes(32).toString("hex");
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 export function generateSessionToken() {
   const payload = `auth:${PANEL_PASSWORD}:${Date.now()}`;
@@ -322,9 +323,17 @@ export function verifySessionToken(token) {
     const raw = Buffer.from(token, "base64url").toString("utf8");
     const parts = raw.split(":");
     if (parts.length !== 4 || parts[0] !== "auth" || parts[1] !== PANEL_PASSWORD) return false;
+    const issuedAt = Number(parts[2]);
+    const now = Date.now();
+    if (!Number.isFinite(issuedAt) || issuedAt <= 0 || now - issuedAt > SESSION_TTL_MS || issuedAt > now + 60000) {
+      return false;
+    }
     const payload = `${parts[0]}:${parts[1]}:${parts[2]}`;
     const sig = crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("hex");
-    return sig === parts[3];
+    const expectedBuf = Buffer.from(sig, "utf8");
+    const actualBuf = Buffer.from(parts[3], "utf8");
+    if (expectedBuf.length !== actualBuf.length) return false;
+    return crypto.timingSafeEqual(expectedBuf, actualBuf);
   } catch {
     return false;
   }
