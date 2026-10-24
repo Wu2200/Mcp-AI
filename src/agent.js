@@ -134,6 +134,10 @@ export function formatToolCallDetails(args) {
   if (!args || typeof args !== "object") return "";
   const parts = [];
 
+  if (args.action) {
+    parts.push(`动作: ${args.action}`);
+  }
+
   if (args.method) {
     parts.push(`操作: ${args.method}`);
   }
@@ -175,6 +179,11 @@ export function formatToolCallDetails(args) {
     }
   }
 
+  if (args.start_url || args.url) {
+    const u = String(args.start_url || args.url).trim();
+    parts.push(`网址: ${u.length > 60 ? `${u.slice(0, 60)}...` : u}`);
+  }
+
   if (args.query) {
     const q = String(args.query).replace(/[\r\n\t]+/g, " ").trim();
     parts.push(`查询: ${q.length > 60 ? `${q.slice(0, 60)}...` : q}`);
@@ -189,6 +198,15 @@ export function formatToolCallDetails(args) {
     parts.push(`引用: ${args.ref}`);
   }
 
+  if (args.session_id) {
+    parts.push(`会话: ${String(args.session_id).slice(0, 10)}...`);
+  }
+
+  if (args.code) {
+    const c = String(args.code).replace(/[\r\n\t]+/g, " ").trim();
+    parts.push(`代码: ${c.length > 50 ? `${c.slice(0, 50)}...` : c}`);
+  }
+
   if (args.pullNumber || args.pull_number) {
     parts.push(`PR #${args.pullNumber || args.pull_number}`);
   }
@@ -200,11 +218,6 @@ export function formatToolCallDetails(args) {
   if (args.message) {
     const m = String(args.message).replace(/[\r\n\t]+/g, " ").trim();
     parts.push(`说明: ${m.length > 40 ? `${m.slice(0, 40)}...` : m}`);
-  }
-
-  if (args.url) {
-    const u = String(args.url).trim();
-    parts.push(`地址: ${u.length > 60 ? `${u.slice(0, 60)}...` : u}`);
   }
 
   if (parts.length === 0) {
@@ -241,40 +254,192 @@ export function redactToolArguments(value, key = "") {
   return value;
 }
 
-export function buildChineseToolGoal(rawAction, userText) {
+export function buildChineseToolGoal(rawAction, args = {}, toolMeta = null, activeTools = []) {
   const action = String(rawAction || "").toLowerCase();
-  const knownGoals = [
-    [/get_me$/, "获取当前 GitHub 用户的基本信息"],
-    [/get_file_contents$/, "读取指定文件或目录内容"],
-    [/get_repository_tree$/, "查看仓库目录结构"],
-    [/list_commits$/, "查看仓库提交记录"],
-    [/get_commit$/, "查看提交详情"],
-    [/search_code$/, "搜索仓库代码"],
-    [/search_repositories$/, "搜索 GitHub 仓库"],
-    [/list_pull_requests$/, "查看拉取请求列表"],
-    [/get_pull_request$/, "查看拉取请求详情"],
-    [/list_issues$/, "查看仓库问题列表"],
-    [/search_issues$/, "搜索相关问题"],
-    [/create_or_update_file$/, "创建或更新仓库文件"],
-    [/github_edit_file$/, "修改 GitHub 仓库文件"],
-    [/actions_list$/, "查看 GitHub Actions 运行记录"],
-    [/actions_get$/, "查看 GitHub Actions 任务详情"],
-    [/actions_run_trigger$/, "触发 GitHub Actions 编译构建"],
-    [/get_job_logs$/, "获取 Actions 构建日志"]
-  ];
-  const knownGoal = knownGoals.find(([pattern]) => pattern.test(action));
-  if (knownGoal) return knownGoal[1];
+  const argsObj = args && typeof args === "object" ? args : {};
 
-  const request = typeof userText === "string"
-    ? userText.replace(/[\r\n\t]+/g, " ").trim()
-    : "";
-  if (/[\u3400-\u9fff]/.test(request)) {
-    return `根据需求执行工具操作：${request.slice(0, 30)}...`;
+  // 1. 浏览器与自动化交互族 (Playwright / Puppeteer / WebMCP / Browser)
+  const isBrowserRelated = /browser|playwright|puppeteer|webmcp|selenium|page/i.test(action);
+  if (isBrowserRelated) {
+    const subAction = String(argsObj.action || argsObj.method || "").toLowerCase();
+    const targetUrl = argsObj.start_url || argsObj.url || "";
+    const codeSnippet = String(argsObj.code || "").trim();
+
+    if (action.includes("connection_context")) {
+      return "检查当前环境连接上下文与运行范围";
+    }
+
+    if (subAction === "create" || subAction === "launch" || subAction === "new") {
+      if (targetUrl) {
+        try {
+          const u = new URL(targetUrl);
+          return `启动云端浏览器并访问 ${u.hostname}`;
+        } catch {
+          return `启动云端浏览器并访问目标网址 (${String(targetUrl).slice(0, 30)})`;
+        }
+      }
+      return "启动新的云端浏览器实例";
+    }
+
+    if (subAction === "delete" || subAction === "close" || subAction === "destroy") {
+      return "关闭并释放当前云端浏览器会话";
+    }
+
+    if (subAction === "list") {
+      if (action.includes("webmcp") || action.includes("page")) {
+        return "获取网页当前 DOM 结构与可交互元素列表";
+      }
+      return "检查当前浏览器活跃会话与窗口状态";
+    }
+
+    if (subAction === "click") {
+      return "在网页中点击指定的交互元素";
+    }
+
+    if (subAction === "type" || subAction === "input" || subAction === "fill") {
+      const textVal = argsObj.text || argsObj.value || "";
+      return textVal ? `在网页输入框中填写：“${String(textVal).slice(0, 20)}”` : "向网页输入框填写内容";
+    }
+
+    if (codeSnippet) {
+      if (/waitForLoadState|waitForNavigation|waitForTimeout|waitFor\(/i.test(codeSnippet)) {
+        return "等待网页资源加载与页面渲染就绪";
+      }
+      if (/waitForSelector/i.test(codeSnippet)) {
+        return "等待目标页面元素渲染呈现";
+      }
+      if (/goto\(|navigate\(/i.test(codeSnippet)) {
+        const matchUrl = codeSnippet.match(/goto\(\s*['"`]([^'"`]+)['"`]/i);
+        return matchUrl ? `控制浏览器导航至 ${matchUrl[1].slice(0, 35)}` : "控制浏览器跳转至指定网页";
+      }
+      if (/locator\(|querySelector|\$\(|textContent|innerText|getAttribute|evaluate/i.test(codeSnippet)) {
+        if (/search|result|h3|title|item|list/i.test(codeSnippet)) {
+          return "提取网页中的搜索结果与数据信息";
+        }
+        return "定位网页元素并提取页面内容";
+      }
+      if (/click\(/i.test(codeSnippet)) {
+        return "执行 Playwright 模拟用户点击操作";
+      }
+      if (/fill\(|type\(|press\(/i.test(codeSnippet)) {
+        return "执行 Playwright 模拟键盘输入操作";
+      }
+      if (/screenshot\(/i.test(codeSnippet)) {
+        return "截取当前网页屏幕快照";
+      }
+      return "在云端浏览器中执行 Playwright 自动化交互脚本";
+    }
+
+    return "执行浏览器端自动化交互操作";
   }
-  return "根据用户请求执行相关工具操作";
+
+  // 2. GitHub 仓库操作族
+  if (/get_me$/i.test(action)) return "获取当前 GitHub 用户的基本信息";
+  if (/get_file_contents$/i.test(action)) {
+    return argsObj.path ? `读取文件内容: ${argsObj.path}` : "读取指定文件或目录内容";
+  }
+  if (/get_repository_tree$/i.test(action)) return "查看仓库目录与文件结构";
+  if (/list_commits$/i.test(action)) return "查看仓库近期提交记录";
+  if (/get_commit$/i.test(action)) return "查看特定提交的详细变更";
+  if (/search_code$/i.test(action)) {
+    const q = argsObj.query || argsObj.q || "";
+    return q ? `搜索仓库代码: ${String(q).slice(0, 25)}` : "在仓库中精确搜索代码";
+  }
+  if (/search_repositories$/i.test(action)) return "搜索相关 GitHub 仓库";
+  if (/list_pull_requests$/i.test(action)) return "查看拉取请求 (PR) 列表";
+  if (/get_pull_request$/i.test(action)) return "查看拉取请求详情";
+  if (/list_issues$/i.test(action)) return "查看仓库问题 (Issue) 列表";
+  if (/search_issues$/i.test(action)) return "搜索相关问题与讨论";
+  if (/create_or_update_file$/i.test(action)) {
+    return argsObj.path ? `写入/更新文件: ${argsObj.path}` : "创建或更新仓库文件";
+  }
+  if (/github_edit_file$|edit_file$/i.test(action)) {
+    return argsObj.path ? `局部编辑并更新代码: ${argsObj.path}` : "局部编辑修改文件";
+  }
+  if (/actions_list$/i.test(action)) {
+    const m = String(argsObj.method || "").toLowerCase();
+    if (m === "list_workflow_runs") return "查看云端工作流 (Actions) 运行记录";
+    if (m === "list_workflows") return "查看仓库所有工作流列表";
+    return "查看 GitHub Actions 运行记录";
+  }
+  if (/actions_get$/i.test(action)) {
+    return "查看 GitHub Actions 任务详情";
+  }
+  if (/actions_run_trigger$/i.test(action)) {
+    return "手动触发 GitHub Actions 编译构建";
+  }
+  if (/get_job_logs$/i.test(action)) {
+    return "获取 Actions 编译构建错误日志";
+  }
+
+  // 3. Cloudflare 操作族
+  if (/cloudflare/i.test(action) || (toolMeta?.serverName && /cloudflare/i.test(toolMeta.serverName))) {
+    const path = String(argsObj.path || "").toLowerCase();
+    if (path.includes("/workers/scripts")) {
+      return argsObj.method === "PUT" ? "部署/更新 Cloudflare Worker 脚本" : "读取 Cloudflare Worker 脚本代码";
+    }
+    if (path.includes("/kv/namespaces")) return "操作 Cloudflare KV 键值数据";
+    if (path.includes("/d1/database")) return "执行 Cloudflare D1 数据库查询";
+    if (path.includes("/dns_records")) return "查询/管理 Cloudflare DNS 解析记录";
+    return "调用 Cloudflare 接口管理云端资源";
+  }
+
+  // 4. 命令执行与终端操作族
+  if (/bash|exec|terminal|command|shell|run_command/i.test(action)) {
+    const cmd = argsObj.command || argsObj.cmd || "";
+    return cmd ? `在环境中执行命令: ${String(cmd).slice(0, 30)}` : "在环境中执行终端命令";
+  }
+
+  // 5. 文件读写通用模式
+  const pathArg = argsObj.path || argsObj.filePath || argsObj.file || argsObj.filename || "";
+  if (/read|cat|view|get/i.test(action) && pathArg) {
+    return `读取目标文件: ${pathArg}`;
+  }
+  if (/write|create|save|put/i.test(action) && pathArg) {
+    return `写入目标文件: ${pathArg}`;
+  }
+  if (/edit|modify|patch|update/i.test(action) && pathArg) {
+    return `修改目标文件: ${pathArg}`;
+  }
+  if (/delete|remove|rm/i.test(action) && pathArg) {
+    return `删除目标文件: ${pathArg}`;
+  }
+
+  // 6. 搜索与查询通用模式
+  const qArg = argsObj.query || argsObj.q || "";
+  if (/search|find|grep|lookup/i.test(action)) {
+    return qArg ? `检索相关信息: ${String(qArg).slice(0, 25)}` : "检索相关内容与数据";
+  }
+
+  // 7. 从工具自带的 description 中提取核心中文或简短动作
+  const matchedTool = activeTools.find((t) => {
+    const tn = t.function?.name || t.name || "";
+    return tn === rawAction || tn.endsWith(`_${rawAction}`) || rawAction.endsWith(tn);
+  });
+  const desc = matchedTool?.function?.description || toolMeta?.description || "";
+  if (desc) {
+    const cleanDesc = desc.replace(/^\[[^\]]+\]\s*/, "").trim();
+    const cnMatch = cleanDesc.match(/[\u4e00-\u9fa5]{4,25}/);
+    if (cnMatch) {
+      return cnMatch[0];
+    }
+    const firstSentence = cleanDesc.split(/[.\n;]/)[0].trim();
+    if (firstSentence && firstSentence.length <= 40) {
+      return `执行操作: ${firstSentence}`;
+    }
+  }
+
+  // 8. 优雅兜底：根据工具名与动词拆解，严禁复读用户输入长句
+  const subOp = argsObj.action || argsObj.method || argsObj.operation || "";
+  if (subOp) {
+    return `调用工具 ${rawAction} 执行 ${subOp} 操作`;
+  }
+
+  const cleanActionName = rawAction.replace(/^[^_]+_/, "").replace(/_/g, " ");
+  return `调用工具执行 ${cleanActionName} 操作`;
 }
 
-export function formatToolActionCard(toolCall, activeTools, userText = "", hasPendingBuild = false) {
+export function formatToolActionCard(toolCall, activeTools = [], userText = "", hasPendingBuild = false) {
   if (!toolCall) return "";
   const toolName = toolCall.function?.name || toolCall.name || "unknown_tool";
   const toolInfo = mcpToolRegistry.get(toolName) || Array.from(mcpToolRegistry.entries())
@@ -284,8 +449,13 @@ export function formatToolActionCard(toolCall, activeTools, userText = "", hasPe
   const parsedArguments = toolArguments({ function: { arguments: rawArguments } }) || {};
   const safeArguments = redactToolArguments(parsedArguments);
   const explicitGoal = String(toolCall.goal || "").replace(/[\r\n]+/g, " ").trim();
-  let goal = (/[\u3400-\u9fff]/.test(explicitGoal) ? explicitGoal : buildChineseToolGoal(rawAction, userText))
-    .slice(0, 180);
+
+  let goal = "";
+  if (explicitGoal && /[\u3400-\u9fff]/.test(explicitGoal) && !explicitGoal.startsWith("根据需求执行工具操作")) {
+    goal = explicitGoal;
+  } else {
+    goal = buildChineseToolGoal(rawAction, parsedArguments, toolInfo, activeTools);
+  }
 
   const isActions = /actions_(list|get)/i.test(rawAction);
   if (isActions && hasPendingBuild) {
@@ -1250,7 +1420,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
             choices: [
               {
                 index: 0,
-                delta: { content: `\n\n⚠️ [上游接口返回错误 ${upstreamResponse.status}]: ${errText.slice(0, 500)}` },
+                delta: { content: `\n\n⚠️ [上游接口返回错误 ${upstreamResponse.status}]: ${errTxt.slice(0, 500)}` },
                 finish_reason: "stop"
               }
             ]
