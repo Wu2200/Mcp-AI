@@ -954,7 +954,7 @@ export async function passThroughAndTransformGemini(requestBody, clientResponse,
 
 export async function estimatePrimaryBuildWaitSeconds(owner, repo) {
   if (!owner || !repo) {
-    return { waitSec: 70, primaryWorkflowName: "主构建", lastDuration: 60 };
+    return { waitSec: 0, primaryWorkflowName: "主构建", lastDuration: 0 };
   }
   try {
     const res = await callMcpTool("actions_list", {
@@ -964,13 +964,13 @@ export async function estimatePrimaryBuildWaitSeconds(owner, repo) {
       perPage: 15
     });
     if (res.isError || !res.content) {
-      return { waitSec: 70, primaryWorkflowName: "主构建", lastDuration: 60 };
+      return { waitSec: 0, primaryWorkflowName: "主构建", lastDuration: 0 };
     }
     const data = JSON.parse(res.content);
     const runs = Array.isArray(data.workflow_runs) ? data.workflow_runs : [];
     const successRuns = runs.filter((r) => r.status === "completed" && r.conclusion === "success");
     if (successRuns.length === 0) {
-      return { waitSec: 70, primaryWorkflowName: "默认构建", lastDuration: 60 };
+      return { waitSec: 0, primaryWorkflowName: "默认构建", lastDuration: 0 };
     }
 
     const isAuxiliary = (name = "", path = "") => {
@@ -991,7 +991,7 @@ export async function estimatePrimaryBuildWaitSeconds(owner, repo) {
     runsWithDuration.sort((a, b) => b.durSec - a.durSec);
     const primary = runsWithDuration[0];
     if (!primary || !primary.run) {
-      return { waitSec: 70, primaryWorkflowName: "主要构建", lastDuration: 60 };
+      return { waitSec: 0, primaryWorkflowName: "主要构建", lastDuration: 0 };
     }
     const lastDuration = primary.durSec || 60;
     let waitSec = lastDuration + 10;
@@ -1003,7 +1003,7 @@ export async function estimatePrimaryBuildWaitSeconds(owner, repo) {
       lastDuration
     };
   } catch {
-    return { waitSec: 70, primaryWorkflowName: "主构建", lastDuration: 60 };
+    return { waitSec: 0, primaryWorkflowName: "主构建", lastDuration: 0 };
   }
 }
 
@@ -1013,7 +1013,7 @@ export function checkPrimaryBuildStatus(contentStr, primaryWorkflowName = "") {
     const runs = Array.isArray(data.workflow_runs)
       ? data.workflow_runs
       : (Array.isArray(data.jobs) ? data.jobs : (data.status ? [data] : []));
-    if (runs.length === 0) return { completed: true, status: "completed", isFailure: false };
+    if (runs.length === 0) return { completed: false, status: "waiting", isFailure: false };
 
     const isAux = (name = "") => /cleanup|lint|format|stale|dependabot|pages|greeting|notify|label/i.test(name);
     let targetRun = runs.find((r) => primaryWorkflowName && r?.name && r.name.toLowerCase() === primaryWorkflowName.toLowerCase());
@@ -1036,7 +1036,7 @@ export function checkPrimaryBuildStatus(contentStr, primaryWorkflowName = "") {
       runName: targetRun.name || "主要构建"
     };
   } catch {
-    return { completed: true, status: "unknown", isFailure: false };
+    return { completed: false, status: "unknown", isFailure: false };
   }
 }
 
@@ -1079,7 +1079,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
   });
 
   const systemRules = [
-    "【工具调用与构建验证规范】\n1. 单轮最多规划并发调用 3 个最相关的真实工具；若目标较多，先执行优先级最高的 1~3 项，取得结果后再决定下一步，禁止一次性铺开大量调用。\n2. 严禁提前输出总结或草稿：在所有信息收集、操作执行或构建验证全部完成之前，严禁在中间轮次输出结论、答复文本或开场白！\n3. 【代码提交与手动打包的构建闭环规范】\n仅当明确调用 actions_run_trigger 手动触发云端工作流时：\n- 必须紧接着发起 actions_list（method: 'list_workflow_runs'）调用，以跟踪并验证云端构建结果！严禁在触发工作流后直接回复“已触发”就草草交卷！\n- 系统会在底层自动输出等待卡片并倒计时等待云端构建完成（无需担心网络超时）；\n- 若构建成功，向用户汇报构建成功结果；\n- 若构建失败（failure），必须激活自愈闭环：调用 get_job_logs 查看编译错误日志，分析报错原因并使用 github_edit_file 修复代码！\n- 若用户仅是查询历史构建耗时或记录，直接查询即可，无需等待。\n4. 优先使用原生 Tool Calls。仅当上游未发出原生调用时，才允许使用操作卡片作为兼容兜底；每轮最多 3 张，且必须对应真实工具调用。多个卡片之间必须使用双换行（\\n\\n）空行彻底分隔，严禁单行连续粘连：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n5. 核心执行约束：输出上述操作卡片的同时，必须同时发起真实的底层工具调用（Tool Calls），严禁仅在正文中打印卡片文本而不发起工具调用！\n6. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n7. 当所有工具调用完毕、进入最终答复轮次时，直接输出完整最终解答，终局轮次严禁输出操作卡片。"
+    "【工具调用与构建验证规范】\n1. 单轮最多规划并发调用 3 个最相关的真实工具；若目标较多，先执行优先级最高的 1~3 项，取得结果后再决定下一步，禁止一次性铺开大量调用。\n2. 严禁提前输出总结或草稿：在所有信息收集、操作执行或构建验证全部完成之前，严禁在中间轮次输出结论、答复文本或开场白！\n3. 【代码提交与手动打包的构建闭环规范】\n仅当明确调用 actions_run_trigger 手动触发云端工作流时：\n- 必须紧接着发起 actions_list（method: 'list_workflow_runs'）调用，以跟踪并验证云端构建结果！严禁在触发工作流后直接回复“已触发”就草草交卷！\n- 服务端按历史耗时等待后，每 15 秒轮询一次构建状态，最多自动延长等待 20 分钟；构建完成后汇报结果，达到等待上限仍未完成时说明构建仍在运行。\n- 若构建成功，向用户汇报构建成功结果；\n- 若构建失败（failure），必须激活自愈闭环：调用 get_job_logs 查看编译错误日志，分析报错原因并使用 github_edit_file 修复代码！\n- 若用户仅是查询历史构建耗时或记录，直接查询即可，无需等待。\n4. 优先使用原生 Tool Calls。仅当上游未发出原生调用时，才允许使用操作卡片作为兼容兜底；每轮最多 3 张，且必须对应真实工具调用。多个卡片之间必须使用双换行（\\n\\n）空行彻底分隔，严禁单行连续粘连：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n5. 核心执行约束：输出上述操作卡片的同时，必须同时发起真实的底层工具调用（Tool Calls），严禁仅在正文中打印卡片文本而不发起工具调用！\n6. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n7. 当所有工具调用完毕、进入最终答复轮次时，直接输出完整最终解答，终局轮次严禁输出操作卡片。"
   ];
   const hasCloudflare = tools.some((t) => {
     const n = (t?.function?.name || t?.name || "").toLowerCase();
@@ -1384,7 +1384,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
 
                 if (toolRes && !toolRes.isError) {
                   let buildStatus = checkPrimaryBuildStatus(toolRes.content, primaryWorkflowName);
-                  const MAX_EXTENSIONS = 3;
+                  const MAX_EXTENSIONS = 80;
                   let extensionCount = 0;
 
                   while (!buildStatus.completed && extensionCount < MAX_EXTENSIONS) {
@@ -1792,7 +1792,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
               // 3. 若未完成，加等 15 秒，最多 3 次
               if (toolRes && !toolRes.isError) {
                 let buildStatus = checkPrimaryBuildStatus(toolRes.content, primaryWorkflowName);
-                const MAX_EXTENSIONS = 3;
+                const MAX_EXTENSIONS = 80;
                 let extensionCount = 0;
 
                 while (!buildStatus.completed && extensionCount < MAX_EXTENSIONS) {
