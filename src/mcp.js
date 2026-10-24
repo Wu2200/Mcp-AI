@@ -148,6 +148,161 @@ export async function connectToMcpServer({ name, url, token }) {
   return serverInfo;
 }
 
+export async function updateMcpServer({ id, name, url, token }) {
+  const existing = mcpServers.get(id);
+  if (!existing) {
+    throw new Error("未找到要更新的 MCP 服务");
+  }
+
+  const targetName = (name || "").trim() || existing.name;
+  const targetUrl = (url || "").trim() || existing.url;
+  const cleanUrl = targetUrl.replace(/\/+$/, "");
+
+  const hasNewToken = token !== undefined && token !== null && String(token).trim() !== "";
+  const finalToken = hasNewToken ? String(token).trim() : (existing.rawToken || "");
+
+  const headers = {
+    Accept: "application/json, text/event-stream",
+    "Content-Type": "application/json",
+    "User-Agent": "mcp-agent-proxy/1.0.0"
+  };
+
+  if (finalToken) {
+    headers["Authorization"] = finalToken.startsWith("Bearer ") ? finalToken : `Bearer ${finalToken}`;
+  }
+
+  // 1. 初始化握手
+  const initPayload = {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "mcp-agent-proxy", version: "1.0.0" }
+    }
+  };
+
+  try {
+    await fetch(cleanUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(initPayload),
+      signal: AbortSignal.timeout(20000)
+    });
+
+    await fetch(cleanUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "notifications/initialized"
+      }),
+      signal: AbortSignal.timeout(20000)
+    }).catch(() => {});
+  } catch {}
+
+  // 2. 拉取工具列表
+  const listPayload = { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} };
+  const listRes = await fetch(cleanUrl, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(listPayload),
+    signal: AbortSignal.timeout(20000)
+  });
+
+  if (!listRes.ok) {
+    const err = await listRes.text();
+    throw new Error(`MCP 响应错误 (${listRes.status}): ${err.slice(0, 300)}`);
+  }
+
+  const listData = await parseMcpResponse(listRes);
+  if (listData.error) {
+    throw new Error(listData.error.message || JSON.stringify(listData.error));
+  }
+  const rawTools = listData.result?.tools || [];
+
+  if (rawTools.length === 0) {
+    throw new Error("该 MCP 未返回任何工具，请检查 Token 权限或服务地址。");
+  }
+
+  // 3. 记录已存在工具的启用与检测状态
+  const oldToolPref = new Map();
+  if (Array.isArray(existing.tools)) {
+    for (const ot of existing.tools) {
+      if (ot.rawName) {
+        oldToolPref.set(ot.rawName, {
+          enabled: ot.enabled !== false,
+          status: ot.status || "unchecked",
+          statusMessage: ot.statusMessage || ""
+        });
+      }
+    }
+  }
+
+  // 4. 清理旧注册项
+  for (const [key, val] of mcpToolRegistry.entries()) {
+    if (val.serverId === id) {
+      mcpToolRegistry.delete(key);
+    }
+  }
+
+  // 5. 注册新工具并恢复偏好
+  const registeredTools = [];
+  for (const t of rawTools) {
+    const safePrefix = targetName.toLowerCase().replace(/[^a-z0-9_]/g, "_");
+    const sanitizedToolName = t.name.replace(/[^a-zA-Z0-9_-]/g, "_");
+    const toolKey = sanitizedToolName.startsWith(`${safePrefix}_`)
+      ? sanitizedToolName
+      : `${safePrefix}_${sanitizedToolName}`;
+
+    const prev = oldToolPref.get(t.name);
+    const isEnabled = prev ? prev.enabled : true;
+    const status = prev ? prev.status : "unchecked";
+    const statusMessage = prev ? prev.statusMessage : "";
+
+    registeredTools.push({
+      key: toolKey,
+      rawName: t.name,
+      description: t.description || t.name,
+      enabled: isEnabled,
+      status,
+      statusMessage,
+      openAiTool: {
+        type: "function",
+        function: {
+          name: toolKey,
+          description: `[${targetName}] ${t.description || t.name}`,
+          parameters: t.inputSchema || { type: "object", properties: {} }
+        }
+      }
+    });
+
+    if (existing.status !== "disabled" && isEnabled) {
+      mcpToolRegistry.set(toolKey, {
+        serverId: id,
+        serverName: targetName,
+        rawName: t.name,
+        postEndpoint: cleanUrl,
+        headers
+      });
+    }
+  }
+
+  existing.name = targetName;
+  existing.url = cleanUrl;
+  existing.rawToken = finalToken;
+  existing.postEndpoint = cleanUrl;
+  existing.headers = headers;
+  existing.toolCount = registeredTools.length;
+  existing.tools = registeredTools;
+
+  registerVirtualTools(existing);
+  await saveServerToStorage();
+  addDebugLog("TOOL", `成功更新 MCP 服务: ${targetName}`, { serverId: id, url: cleanUrl, toolCount: existing.tools.length });
+  return existing;
+}
+
 export function extractMcpResultContent(data) {
   if (!data) return "{}";
   let contentStr = "";
