@@ -365,6 +365,13 @@ export function extractFileContentAndSha(mcpRes) {
     fileContent = textContent.replace(/^successfully downloaded[^\n]*\r?\n+/, "");
   }
 
+  if (fileContent) {
+    const resourceMatch = fileContent.match(/^Resource Text:\s*([\s\S]*?)(?:\r?\nResource URI:|\r?\nResource MIME Type:|$)/);
+    if (resourceMatch) {
+      fileContent = resourceMatch[1];
+    }
+  }
+
   if (!fileSha && textContent) {
     const firstLine = textContent.split("\n")[0] || "";
     const shaMatch = firstLine.match(/\b([0-9a-f]{40})\b/i);
@@ -376,8 +383,196 @@ export function extractFileContentAndSha(mcpRes) {
   return { fileContent, fileSha, fileBranch };
 }
 
+function getOccurrenceIndices(str, target) {
+  const indices = [];
+  let pos = 0;
+  while ((pos = str.indexOf(target, pos)) !== -1) {
+    indices.push(pos);
+    pos += Math.max(1, target.length);
+  }
+  return indices;
+}
+
+function mapLfIndexToCrlf(crlfStr, lfIndex) {
+  let lfCount = 0;
+  let crlfIndex = 0;
+  while (lfCount < lfIndex && crlfIndex < crlfStr.length) {
+    if (crlfStr[crlfIndex] === "\r" && crlfStr[crlfIndex + 1] === "\n") {
+      crlfIndex += 2;
+      lfCount += 1;
+    } else {
+      crlfIndex += 1;
+      lfCount += 1;
+    }
+  }
+  return crlfIndex;
+}
+
+function findLineBasedMatch(contentLf, oldStrLf, newStrLf, originalContentWithCrlf = null) {
+  const contentLines = contentLf.split("\n");
+  const oldLines = oldStrLf.split("\n");
+  const isCrlf = Boolean(originalContentWithCrlf);
+
+  if (oldLines.length === 0) return null;
+
+  let matchedIndices = [];
+  for (let i = 0; i <= contentLines.length - oldLines.length; i += 1) {
+    let match = true;
+    for (let j = 0; j < oldLines.length; j += 1) {
+      if (contentLines[i + j].trimEnd() !== oldLines[j].trimEnd()) {
+        match = false;
+        break;
+      }
+    }
+    if (match) {
+      matchedIndices.push(i);
+    }
+  }
+
+  let isFullTrim = false;
+  if (matchedIndices.length === 0) {
+    for (let i = 0; i <= contentLines.length - oldLines.length; i += 1) {
+      let match = true;
+      for (let j = 0; j < oldLines.length; j += 1) {
+        if (contentLines[i + j].trim() !== oldLines[j].trim()) {
+          match = false;
+          break;
+        }
+      }
+      if (match) {
+        matchedIndices.push(i);
+      }
+    }
+    isFullTrim = matchedIndices.length > 0;
+  }
+
+  if (matchedIndices.length === 1) {
+    const lineStart = matchedIndices[0];
+    const lineEnd = lineStart + oldLines.length;
+    const charStartLf = contentLines.slice(0, lineStart).join("\n").length + (lineStart > 0 ? 1 : 0);
+    const matchedBlockLf = contentLines.slice(lineStart, lineEnd).join("\n");
+    const charEndLf = charStartLf + matchedBlockLf.length;
+
+    let replacementLf = newStrLf;
+    if (isFullTrim && oldLines.length > 0) {
+      const origFirstIndent = (contentLines[lineStart].match(/^(\s*)/) || ["", ""])[1];
+      const modelFirstIndent = (oldLines[0].match(/^(\s*)/) || ["", ""])[1];
+      if (origFirstIndent !== modelFirstIndent) {
+        const newLines = newStrLf.split("\n");
+        replacementLf = newLines
+          .map((line) => {
+            if (!line.trim()) return line;
+            if (line.startsWith(modelFirstIndent)) {
+              return origFirstIndent + line.slice(modelFirstIndent.length);
+            }
+            return origFirstIndent + line;
+          })
+          .join("\n");
+      }
+    }
+
+    if (isCrlf) {
+      const realStart = mapLfIndexToCrlf(originalContentWithCrlf, charStartLf);
+      const realMatched = matchedBlockLf.replace(/\n/g, "\r\n");
+      const realEnd = realStart + realMatched.length;
+      return {
+        start: realStart,
+        end: realEnd,
+        replacement: replacementLf.replace(/\n/g, "\r\n")
+      };
+    }
+
+    return {
+      start: charStartLf,
+      end: charEndLf,
+      replacement: replacementLf
+    };
+  }
+
+  if (matchedIndices.length > 1) {
+    return { multiple: true, lineNumbers: matchedIndices.map((idx) => idx + 1) };
+  }
+
+  return null;
+}
+
+function findBestSnippetMatch(content, oldStr, newStr, filePath, editIndex, searchOffset = 0) {
+  const isCrlf = content.includes("\r\n");
+
+  let idx = content.indexOf(oldStr, searchOffset);
+  if (idx === -1 && searchOffset > 0) {
+    idx = content.indexOf(oldStr);
+  }
+  if (idx !== -1) {
+    const occurrences = getOccurrenceIndices(content, oldStr);
+    if (occurrences.length === 1) {
+      return { start: idx, end: idx + oldStr.length, replacement: newStr };
+    }
+    const afterOffset = occurrences.filter((o) => o >= searchOffset);
+    if (afterOffset.length === 1) {
+      const chosen = afterOffset[0];
+      return { start: chosen, end: chosen + oldStr.length, replacement: newStr };
+    }
+    const lineNumbers = occurrences.map((o) => content.slice(0, o).split("\n").length);
+    throw new Error(
+      `在文件 ${filePath} 中第 ${editIndex} 处找到多处 (${occurrences.length} 处) 完全相同的待替换片段 (位于第 ${lineNumbers.join(", ")} 行)。为防止误替换，请在 old_str 中包含周围 1~2 行上下文代码以确保唯一性。待查找代码: ${oldStr.slice(0, 100)}`
+    );
+  }
+
+  const contentLf = content.replace(/\r\n/g, "\n");
+  const oldStrLf = oldStr.replace(/\r\n/g, "\n");
+  const newStrLf = newStr.replace(/\r\n/g, "\n");
+
+  let lfIdx = contentLf.indexOf(oldStrLf);
+  if (lfIdx !== -1) {
+    const occurrences = getOccurrenceIndices(contentLf, oldStrLf);
+    if (occurrences.length === 1) {
+      const realStart = isCrlf ? mapLfIndexToCrlf(content, lfIdx) : lfIdx;
+      const matchedText = isCrlf ? oldStrLf.replace(/\n/g, "\r\n") : oldStrLf;
+      return {
+        start: realStart,
+        end: realStart + matchedText.length,
+        replacement: isCrlf ? newStrLf.replace(/\n/g, "\r\n") : newStrLf
+      };
+    }
+    const lineNumbers = occurrences.map((o) => contentLf.slice(0, o).split("\n").length);
+    throw new Error(
+      `在文件 ${filePath} 中第 ${editIndex} 处找到多处 (${occurrences.length} 处) 完全相同的待替换片段 (位于第 ${lineNumbers.join(", ")} 行)。为防止误替换，请在 old_str 中包含周围 1~2 行上下文代码以确保唯一性。待查找代码: ${oldStr.slice(0, 100)}`
+    );
+  }
+
+  const trimmedOld = oldStrLf.trim();
+  if (trimmedOld) {
+    const trimmedOccurrences = getOccurrenceIndices(contentLf, trimmedOld);
+    if (trimmedOccurrences.length === 1) {
+      const tIdx = trimmedOccurrences[0];
+      const realStart = isCrlf ? mapLfIndexToCrlf(content, tIdx) : tIdx;
+      const matchedText = isCrlf ? trimmedOld.replace(/\n/g, "\r\n") : trimmedOld;
+      return {
+        start: realStart,
+        end: realStart + matchedText.length,
+        replacement: isCrlf ? newStr.replace(/\r?\n/g, "\r\n") : newStr.replace(/\r\n/g, "\n")
+      };
+    }
+  }
+
+  const lineMatch = findLineBasedMatch(contentLf, oldStrLf, newStrLf, isCrlf ? content : null);
+  if (lineMatch) {
+    if (lineMatch.multiple) {
+      throw new Error(
+        `在文件 ${filePath} 中第 ${editIndex} 处行级匹配到多处 (${lineMatch.lineNumbers.length} 处) 相似片段 (位于第 ${lineMatch.lineNumbers.join(", ")} 行)。请在 old_str 中包含周围上下文代码以唯一确定修改位置。`
+      );
+    }
+    return lineMatch;
+  }
+
+  return null;
+}
+
 export function applyStringReplacements(content, edits, filePath = "") {
   let updated = content;
+  let lastEnd = 0;
+
   for (let i = 0; i < edits.length; i += 1) {
     const { old_str, new_str } = edits[i];
     if (typeof old_str !== "string" || typeof new_str !== "string") {
@@ -387,54 +582,17 @@ export function applyStringReplacements(content, edits, filePath = "") {
       throw new Error(`第 ${i + 1} 处修改无效：old_str 与 new_str 完全相同`);
     }
 
-    let targetStr = old_str;
-    let idx = updated.indexOf(targetStr);
-
-    if (idx === -1) {
-      if (updated.includes("\r\n") && !targetStr.includes("\r\n")) {
-        const crlfTarget = targetStr.replace(/\n/g, "\r\n");
-        if (updated.includes(crlfTarget)) {
-          targetStr = crlfTarget;
-          idx = updated.indexOf(targetStr);
-        }
-      } else if (!updated.includes("\r\n") && targetStr.includes("\r\n")) {
-        const lfTarget = targetStr.replace(/\r\n/g, "\n");
-        if (updated.includes(lfTarget)) {
-          targetStr = lfTarget;
-          idx = updated.indexOf(targetStr);
-        }
-      }
+    const match = findBestSnippetMatch(updated, old_str, new_str, filePath, i + 1, lastEnd);
+    if (!match) {
+      throw new Error(
+        `在文件 ${filePath} 中未找到第 ${i + 1} 处待替换片段 (old_str)。请核对代码内容、空格缩进及换行是否准确。待查找片段预览:\n${old_str.slice(0, 200)}`
+      );
     }
 
-    if (idx === -1) {
-      const trimmedOld = targetStr.trim();
-      if (trimmedOld && updated.includes(trimmedOld)) {
-        const occurrences = updated.split(trimmedOld).length - 1;
-        if (occurrences === 1) {
-          targetStr = trimmedOld;
-          idx = updated.indexOf(targetStr);
-        }
-      }
-    }
-
-    if (idx === -1) {
-      throw new Error(`在文件 ${filePath} 中未找到指定的待替换片段 (old_str)。请核对代码内容、空格缩进及换行是否准确。待查找片段预览:\n${old_str.slice(0, 200)}`);
-    }
-
-    const count = updated.split(targetStr).length - 1;
-    if (count > 1) {
-      throw new Error(`在文件 ${filePath} 中找到多处 (${count} 处) 完全相同的待替换片段。为防止误替换，请在 old_str 中包含更多上下文代码行以确保唯一性。`);
-    }
-
-    let replacement = new_str;
-    if (targetStr.includes("\r\n") && !replacement.includes("\r\n")) {
-      replacement = replacement.replace(/\n/g, "\r\n");
-    } else if (!targetStr.includes("\r\n") && replacement.includes("\r\n")) {
-      replacement = replacement.replace(/\r\n/g, "\n");
-    }
-
-    updated = updated.slice(0, idx) + replacement + updated.slice(idx + targetStr.length);
+    updated = updated.slice(0, match.start) + match.replacement + updated.slice(match.end);
+    lastEnd = match.start + match.replacement.length;
   }
+
   return updated;
 }
 
