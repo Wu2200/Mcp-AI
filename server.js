@@ -38,6 +38,7 @@ import {
 import {
   loadMcpServersFromStorage,
   connectToMcpServer,
+  updateMcpServer,
   checkAllTools,
   registerVirtualTools
 } from "./src/mcp.js";
@@ -346,6 +347,19 @@ const server = http.createServer(async (request, response) => {
         const body = await readRequestBody(request);
         const serverInfo = await connectToMcpServer(body);
         sendJson(response, 200, { toolCount: serverInfo.toolCount });
+        return;
+      }
+
+      const matchUpdateServer = reqUrl.pathname.match(/^\/api\/mcp\/servers\/([^/]+)\/update$/);
+      if (request.method === "POST" && matchUpdateServer) {
+        const id = decodeURIComponent(matchUpdateServer[1]);
+        const body = await readRequestBody(request);
+        try {
+          const updated = await updateMcpServer({ id, ...body });
+          sendJson(response, 200, { success: true, toolCount: updated.toolCount, name: updated.name });
+        } catch (e) {
+          sendJson(response, 400, { error: e.message });
+        }
         return;
       }
 
