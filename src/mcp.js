@@ -652,7 +652,7 @@ function tokenizeWithPositions(str) {
   return tokens;
 }
 
-// 第 5 层智能 Token-Stream 匹配：完全无视多余换行、空格、缩进与操作符间距
+// 精确语法 Token-Stream 匹配：100% 顺序匹配每个语法符号，仅忽略多余空白、空行与缩进差异
 function findTokenStreamMatch(content, oldStr, newStr, searchOffset = 0) {
   const contentTokens = tokenizeWithPositions(content);
   const oldTokens = tokenizeWithPositions(oldStr);
@@ -734,13 +734,13 @@ function findTokenStreamMatch(content, oldStr, newStr, searchOffset = 0) {
   return { start: startChar, end: endChar, replacement };
 }
 
-// 通配符与省略断片匹配（支持大模型输出 MISMATCH, ..., /* ... */, // ... 等缺省标记）
+// 安全通配断片匹配：仅识别独立行的 MISMATCH 或 // ... 注释（绝不误伤 Swift 的 1...6 闭区间操作符）
 function findWildcardMatch(content, oldStr, newStr, searchOffset = 0) {
-  const wildcardPattern = /\bMISMATCH\b|\.{3,}|…|\/\*[\s\S]*?\*\/|\/\/[^\n\r]*/g;
+  const wildcardPattern = /(?:^\s*MISMATCH\s*$|^\s*\/\/\s*\.{3,}.*$|^\s*\/\*\s*\.{3,}\s*\*\/\s*$)/m;
   if (!wildcardPattern.test(oldStr)) return null;
 
   const rawSegments = oldStr.split(wildcardPattern);
-  const segments = rawSegments.map((s) => s.trim()).filter((s) => s.length >= 3);
+  const segments = rawSegments.map((s) => s.trim()).filter((s) => s.length >= 20);
   if (segments.length < 2) return null;
 
   const headSegment = segments[0];
@@ -756,6 +756,10 @@ function findWildcardMatch(content, oldStr, newStr, searchOffset = 0) {
     findLineBasedMatch(content.replace(/\r\n/g, "\n"), tailSegment.replace(/\r\n/g, "\n"), "");
   if (!tailMatch || tailMatch.multiple || tailMatch.end <= headMatch.start) return null;
 
+  // 限制跨度不超过 60 行，防止跨函数误删代码
+  const spannedLines = content.slice(headMatch.start, tailMatch.end).split("\n").length;
+  if (spannedLines > 60) return null;
+
   return {
     start: headMatch.start,
     end: tailMatch.end,
@@ -763,135 +767,64 @@ function findWildcardMatch(content, oldStr, newStr, searchOffset = 0) {
   };
 }
 
-// 自动高吻合度自愈替换器：当模型记忆有轻微偏差（如少写一个参数或属性），只要全文件仅存在一个唯一高度吻合的片段，直接执行自愈替换
-function findFuzzyAutoHealMatch(content, oldStr, newStr, searchOffset = 0) {
-  const contentTokens = tokenizeWithPositions(content);
-  const oldTokens = tokenizeWithPositions(oldStr);
-  if (oldTokens.length < 5 || contentTokens.length < 5) return null;
-
-  const mLen = oldTokens.length;
-  const sampleStep = Math.max(1, Math.floor(mLen / 12));
-  const sampleTokens = [];
-  for (let s = 0; s < mLen; s += sampleStep) {
-    sampleTokens.push(oldTokens[s].text);
-  }
-  if (!sampleTokens.includes(oldTokens[mLen - 1].text)) {
-    sampleTokens.push(oldTokens[mLen - 1].text);
-  }
-
-  const windowSize = Math.min(contentTokens.length, Math.floor(mLen * 1.4) + 6);
-  const highMatches = [];
-
-  for (let i = 0; i <= contentTokens.length - windowSize; i += Math.max(1, Math.floor(sampleStep / 2))) {
-    const windowSlice = contentTokens.slice(i, i + windowSize);
-    const windowSet = new Set(windowSlice.map((t) => t.text));
-    let score = 0;
-    for (const t of sampleTokens) {
-      if (windowSet.has(t)) score += 1;
-    }
-
-    const similarity = score / sampleTokens.length;
-    if (similarity >= 0.72) {
-      highMatches.push({ startTokenIdx: i, similarity });
-    }
-  }
-
-  if (highMatches.length === 0) return null;
-
-  // 聚合相邻滑动窗口，按空间距离合并为独立的候选代码块
-  const clusters = [];
-  for (const m of highMatches) {
-    const lastC = clusters[clusters.length - 1];
-    if (lastC && m.startTokenIdx - lastC.startTokenIdx < windowSize) {
-      if (m.similarity > lastC.similarity) {
-        lastC.similarity = m.similarity;
-        lastC.startTokenIdx = m.startTokenIdx;
-      }
-    } else {
-      clusters.push({ ...m });
-    }
-  }
-
-  // 必须全文件唯一，杜绝多处误替换
-  if (clusters.length === 1 && clusters[0].similarity >= 0.72) {
-    const chosen = clusters[0];
-    const sToken = contentTokens[chosen.startTokenIdx];
-    const eToken = contentTokens[Math.min(contentTokens.length - 1, chosen.startTokenIdx + mLen - 1)];
-
-    let startChar = sToken.start;
-    let endChar = eToken.end;
-
-    // 行首对齐
-    const lineStart = content.lastIndexOf("\n", startChar - 1) + 1;
-    startChar = lineStart;
-
-    let lineEnd = content.indexOf("\n", endChar);
-    if (lineEnd !== -1) {
-      endChar = lineEnd;
-    }
-
-    let replacement = newStr;
-    if (content.includes("\r\n") && !replacement.includes("\r\n")) {
-      replacement = replacement.replace(/\n/g, "\r\n");
-    }
-
-    return {
-      start: startChar,
-      end: endChar,
-      replacement,
-      similarity: chosen.similarity,
-      lineNum: content.slice(0, startChar).split("\n").length
-    };
-  }
-
-  return null;
-}
-
-// 相似度近邻诊断：提供有价值的报错提示帮助大模型自愈
+// 精准上下文诊断：当匹配失败时，向大模型直接展示文件最接近位置的前后 25 行真实代码（带行号），让模型无需重新调工具即可立即自愈
 function findNearMatchDiagnostic(content, oldStr) {
-  const contentTokens = tokenizeWithPositions(content);
-  const oldTokens = tokenizeWithPositions(oldStr);
-  if (oldTokens.length < 4 || contentTokens.length < 4) return "";
+  const contentLines = content.replace(/\r\n/g, "\n").split("\n");
+  const oldLines = oldStr.replace(/\r\n/g, "\n").split("\n").map((l) => l.trim()).filter((l) => l.length > 4);
+  if (oldLines.length === 0 || contentLines.length === 0) return "";
 
-  const mLen = oldTokens.length;
-  let bestScore = 0;
-  let bestIdx = -1;
-
-  const step = Math.max(1, Math.floor(mLen / 10));
-  const sampleIndices = [];
-  for (let s = 0; s < mLen; s += step) {
-    sampleIndices.push(s);
-  }
-  if (!sampleIndices.includes(mLen - 1)) {
-    sampleIndices.push(mLen - 1);
-  }
-  const sampleTexts = sampleIndices.map((i) => oldTokens[i].text);
-
-  const windowSize = Math.min(contentTokens.length, Math.floor(mLen * 1.5) + 5);
-  for (let i = 0; i <= contentTokens.length - windowSize; i += Math.max(1, Math.floor(step / 2))) {
-    let score = 0;
-    const windowSlice = contentTokens.slice(i, i + windowSize);
-    const windowSet = new Set(windowSlice.map((t) => t.text));
-
-    for (const t of sampleTexts) {
-      if (windowSet.has(t)) score += 1;
-    }
-
-    if (score > bestScore) {
-      bestScore = score;
-      bestIdx = i;
+  // 1. 尝试寻找首行或特征最明显的行在文件中的精确位置
+  let anchorLineIdx = -1;
+  for (const cand of oldLines) {
+    if (/^(?:struct|class|enum|func|private\s+var|var|let)\s+/.test(cand) || cand.length >= 12) {
+      const idx = contentLines.findIndex((cl) => cl.trim() === cand || cl.includes(cand));
+      if (idx !== -1) {
+        anchorLineIdx = idx;
+        break;
+      }
     }
   }
 
-  const similarity = bestScore / sampleTexts.length;
-  if (similarity >= 0.55 && bestIdx >= 0) {
-    const token = contentTokens[bestIdx];
-    const lineNum = content.slice(0, token.start).split("\n").length;
-    const lineStart = content.lastIndexOf("\n", token.start - 1) + 1;
-    const lineEnd = content.indexOf("\n", token.start + 220);
-    const actualSnippet = content.slice(lineStart, lineEnd === -1 ? content.length : lineEnd).trim();
-    return `在第 ${lineNum} 行附近发现了高度相似的代码（特征吻合度约 ${Math.round(similarity * 100)}%）。该位置实际最新代码为: "${actualSnippet}"。`;
+  // 2. 如果未找到单行匹配，使用词法滑窗寻找最接近行
+  if (anchorLineIdx === -1) {
+    const contentTokens = tokenizeWithPositions(content);
+    const oldTokens = tokenizeWithPositions(oldStr);
+    if (oldTokens.length >= 4 && contentTokens.length >= 4) {
+      const mLen = oldTokens.length;
+      let bestScore = 0;
+      let bestIdx = -1;
+      const step = Math.max(1, Math.floor(mLen / 10));
+      const sampleTexts = [];
+      for (let s = 0; s < mLen; s += step) sampleTexts.push(oldTokens[s].text);
+
+      const windowSize = Math.min(contentTokens.length, Math.floor(mLen * 1.4) + 5);
+      for (let i = 0; i <= contentTokens.length - windowSize; i += Math.max(1, Math.floor(step / 2))) {
+        const windowSet = new Set(contentTokens.slice(i, i + windowSize).map((t) => t.text));
+        let score = 0;
+        for (const t of sampleTexts) {
+          if (windowSet.has(t)) score += 1;
+        }
+        if (score > bestScore) {
+          bestScore = score;
+          bestIdx = i;
+        }
+      }
+      if (bestIdx >= 0 && bestScore / sampleTexts.length >= 0.5) {
+        anchorLineIdx = content.slice(0, contentTokens[bestIdx].start).split("\n").length - 1;
+      }
+    }
   }
+
+  if (anchorLineIdx !== -1) {
+    const startLine = Math.max(0, anchorLineIdx - 5);
+    const endLine = Math.min(contentLines.length, anchorLineIdx + 25);
+    const snippetWithLines = contentLines
+      .slice(startLine, endLine)
+      .map((line, idx) => `${startLine + idx + 1}: ${line}`)
+      .join("\n");
+    return `在文件第 ${anchorLineIdx + 1} 行附近定位到相关代码区域，当前文件的真实代码如下（第 ${startLine + 1}~${endLine} 行）：\n\`\`\`\n${snippetWithLines}\n\`\`\`\n请直接复制上述真实代码（不含行号前缀）作为 old_str 重新调用！`;
+  }
+
   return "";
 }
 
@@ -1059,14 +992,14 @@ function findBestSnippetMatch(content, oldStr, newStr, filePath, editIndex, sear
     return lineMatch;
   }
 
-  // 5. 通配符与省略断片匹配（支持 MISMATCH, ..., /* ... */ 等）
+  // 5. 安全通配断片匹配
   const wildcardMatch = findWildcardMatch(content, oldStr, newStr, searchOffset);
   if (wildcardMatch) {
     addDebugLog("TOOL", `[通配自愈] 成功根据省略通配符匹配并完成代码块替换: ${filePath}`);
     return wildcardMatch;
   }
 
-  // 6. 终极 Token-Stream 语法流精确匹配
+  // 6. 精确 Token-Stream 语法流匹配（100% 顺序匹配语法单元，兼容任意空行与缩进差异）
   const tokenMatch = findTokenStreamMatch(content, oldStr, newStr, searchOffset);
   if (tokenMatch) {
     if (tokenMatch.multiple) {
@@ -1077,17 +1010,10 @@ function findBestSnippetMatch(content, oldStr, newStr, filePath, editIndex, sear
     return tokenMatch;
   }
 
-  // 7. 高吻合度智能自愈匹配（当模型参数有微小版本脱节，但全文件唯一对应时直接自愈）
-  const fuzzyMatch = findFuzzyAutoHealMatch(content, oldStr, newStr, searchOffset);
-  if (fuzzyMatch) {
-    addDebugLog("TOOL", `[模糊容错自愈] 未找到 100% 精确字符，已按全文件唯一最高吻合度 (${Math.round(fuzzyMatch.similarity * 100)}%) 成功定位第 ${fuzzyMatch.lineNum} 行并完成替换: ${filePath}`);
-    return fuzzyMatch;
-  }
-
-  // 8. 智能诊断报错
+  // 7. 精准定位诊断（返回实际文件对应位置的 30 行真实代码）
   const diagnostic = findNearMatchDiagnostic(content, oldStr);
   throw new Error(
-    `在文件 ${filePath} 中未找到第 ${editIndex} 处待替换片段 (old_str)。${diagnostic ? `\n【诊断定位】${diagnostic}\n` : ""}请直接复制当前文件的最新实际代码，严禁凭历史 Commit 记忆撰写 old_str。如重构范围较大，建议直接使用 create_or_update_file 全量写入。待查找片段预览:\n${oldStr.slice(0, 200)}`
+    `在文件 ${filePath} 中未找到第 ${editIndex} 处待替换片段 (old_str)。${diagnostic ? `\n【真实代码定位】${diagnostic}\n` : ""}待查找片段预览:\n${oldStr.slice(0, 200)}`
   );
 }
 
@@ -1150,7 +1076,46 @@ export async function executeGithubEditFile(serverInfo, readToolRawName, writeTo
     throw new Error(`未能获取到文件 SHA，请确认文件是否存在: ${filePath}`);
   }
 
-  const updatedContent = applyStringReplacements(fileContent, editList, filePath);
+  // 支持批量渐进式应用：若多处独立修改中前几处成功、个别失败，且成功部分保持括号平衡，则先保存成功部分并仅报告失败项
+  let updatedContent = fileContent;
+  let lastEnd = 0;
+  const appliedIndices = [];
+  const failedErrors = [];
+
+  for (let i = 0; i < editList.length; i += 1) {
+    const { old_str: oStr, new_str: nStr } = editList[i];
+    if (typeof oStr !== "string" || typeof nStr !== "string") {
+      failedErrors.push(`第 ${i + 1} 处修改参数错误：old_str 与 new_str 必须为字符串`);
+      continue;
+    }
+    if (oStr === nStr) {
+      continue;
+    }
+
+    try {
+      const match = findBestSnippetMatch(updatedContent, oStr, nStr, filePath, i + 1, lastEnd);
+      if (match) {
+        // 检查该处独立修改是否破坏大括号平衡
+        const oldBraces = (oStr.match(/\{/g) || []).length - (oStr.match(/\}/g) || []).length;
+        const newBraces = (nStr.match(/\{/g) || []).length - (nStr.match(/\}/g) || []).length;
+        updatedContent = updatedContent.slice(0, match.start) + match.replacement + updatedContent.slice(match.end);
+        lastEnd = match.start + match.replacement.length;
+        appliedIndices.push({ index: i + 1, balanced: oldBraces === newBraces });
+      }
+    } catch (err) {
+      failedErrors.push(err.message);
+    }
+  }
+
+  if (appliedIndices.length === 0) {
+    throw new Error(failedErrors.join("\n\n") || "替换前后文件内容未发生任何改变");
+  }
+
+  // 如果存在部分失败且已应用的部分大括号不平衡（说明多处修改之间有跨块的括号依赖），则安全起见整体报错回滚
+  const allAppliedBalanced = appliedIndices.every((item) => item.balanced);
+  if (failedErrors.length > 0 && !allAppliedBalanced) {
+    throw new Error(failedErrors.join("\n\n"));
+  }
 
   if (updatedContent === fileContent) {
     throw new Error("替换前后文件内容未发生任何改变");
@@ -1192,9 +1157,16 @@ export async function executeGithubEditFile(serverInfo, readToolRawName, writeTo
     throw new Error(`提交更新失败: ${putRes.textContent.slice(0, 300)}`);
   }
 
+  if (failedErrors.length > 0) {
+    return {
+      isError: false,
+      content: `【部分修改已成功提交】已成功应用并提交了 ${appliedIndices.length}/${editList.length} 处修改（第 ${appliedIndices.map((a) => a.index).join(", ")} 处已生效并写入 GitHub，无需重复修改！）。\n但以下 ${failedErrors.length} 处未匹配成功，请仅针对未成功的项根据下方真实代码单独发起一次补充修改：\n\n${failedErrors.join("\n\n")}`
+    };
+  }
+
   return {
     isError: false,
-    content: `局部修改成功并已提交到 GitHub。仓库: ${owner}/${repo}，文件: ${filePath}，分支: ${targetBranch}，修改处数: ${editList.length}，原文件 SHA: ${fileSha}`
+    content: `局部修改成功并已提交到 GitHub。仓库: ${owner}/${repo}，文件: ${filePath}，分支: ${targetBranch}，修改处数: ${appliedIndices.length}，原文件 SHA: ${fileSha}`
   };
 }
 
