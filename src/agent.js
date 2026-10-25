@@ -524,7 +524,8 @@ export function buildChineseToolGoal(rawAction, args = {}, toolMeta = null, acti
 export function formatToolActionCard(toolCall, activeTools = [], userText = "", hasPendingBuild = false) {
   if (!toolCall) return "";
   const toolName = toolCall.function?.name || toolCall.name || "unknown_tool";
-  const toolInfo = findToolInfo(toolName);
+  const toolInfo = mcpToolRegistry.get(toolName) || Array.from(mcpToolRegistry.entries())
+    .find(([key, info]) => key.endsWith(toolName) || (info?.rawName && toolName.endsWith(info.rawName)))?.[1];
   const rawAction = toolInfo?.rawName || toolName;
   const rawArguments = toolCall.function?.arguments ?? toolCall.arguments;
   const parsedArguments = toolArguments({ function: { arguments: rawArguments } }) || {};
@@ -797,6 +798,7 @@ export async function passThrough(requestBody, clientResponse, reqMeta, abortSig
         choice.message.content = fullAccumulatedContent;
       }
       addDebugLog("UPSTREAM", `[直通模式] [${channel.name}] 非流式完成输出 - 结束原因: ${rawReason || "stop"}`);
+      addDebugLog("CONVERSATION", `【直通对话完成】上游响应已全部交付客户端`);
       sendJson(clientResponse, 200, json);
       return;
     }
@@ -892,6 +894,7 @@ export async function passThrough(requestBody, clientResponse, reqMeta, abortSig
     }
 
     addDebugLog("UPSTREAM", `[直通模式] [${channel.name}] 流式完成输出 - 结束原因: ${lastFinishReason || "stop"}`);
+    addDebugLog("CONVERSATION", `【直通对话完成】流式传输结束`);
     break;
   }
 
@@ -1194,6 +1197,7 @@ export async function passThroughAndTransformGemini(requestBody, clientResponse,
       continue;
     }
 
+    addDebugLog("CONVERSATION", `【Gemini 对话完成】响应已交付客户端`);
     break;
   }
 
@@ -1565,6 +1569,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
             finishReason: finalFinishReason,
             contentLength: message?.content?.length || 0
           });
+          addDebugLog("CONVERSATION", `【对话完成】共执行 ${round + 1} 轮 Agent 交互 - 累计调用工具 ${executedToolCount} 次`);
           sendJson(clientResponse, 200, json);
           return;
         }
@@ -1705,16 +1710,14 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
 
               if (cachedContent !== undefined && cachedContent !== null) {
                 toolCallHistory.set(callKey, prevAttempts + 1);
-                if (prevAttempts >= 5) {
-                  resultText = JSON.stringify({ note: "已多次复用该工具的缓存结果，当前信息完整且最新。请直接根据已有信息继续执行或回答用户。" });
-                } else {
-                  resultText = cachedContent;
-                  addDebugLog("TOOL", `MCP 工具 [${resolvedToolKey}] 命中本次对话只读缓存，直接复用 (${cachedContent.length} 字符)`, { arguments: args });
-                }
+                resultText = cachedContent;
+                addDebugLog("TOOL", `MCP 工具 [${resolvedToolKey}] 命中本次对话只读缓存，直接复用 (${cachedContent.length} 字符)`, { arguments: args });
                 isToolError = false;
-              } else if (prevAttempts >= 3) {
-                errorMessage = "重复调用已被系统拦截";
-                resultText = JSON.stringify({ error: "该工具已使用完全相同的参数重复调用多次，系统已拦截重复执行。请勿继续重复调用，请根据当前信息直接回答用户。" });
+              } else if (prevAttempts >= 5) {
+                errorMessage = "该文件或资源连续查询失败";
+                resultText = JSON.stringify({
+                  error: "该文件或资源已连续查询多次均未成功（可能路径不存在或拼写错误）。为防止反复重试浪费调用，请勿继续使用完全相同的路径重试，请先调用 get_repository_tree 查看真实文件目录结构。"
+                });
                 isToolError = true;
               } else {
                 toolCallHistory.set(callKey, prevAttempts + 1);
@@ -1734,6 +1737,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                       if (isTrigger) hasBuildTriggered = true;
                       actionsWaitChecked = false;
                       dialogReadCache.clear();
+                      toolCallHistory.clear();
                       if (isTrigger) {
                         resultText = `${toolRes.content}\n\n【系统指令】工作流已成功触发并在云端开始排队运行！请紧接着调用 actions_list（method: 'list_workflow_runs'）来等待并查看本次构建结果，系统会在底层自动输出卡片并动态等待！严禁在此提前结束答复！`;
                       }
@@ -1962,6 +1966,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
           finishReason: roundFinishReason,
           totalRounds: round + 1
         });
+        addDebugLog("CONVERSATION", `【对话完成】共执行 ${round + 1} 轮 Agent 交互 - 累计调用工具 ${executedToolCount} 次`);
         return;
       }
 
@@ -2156,16 +2161,14 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
             if (cachedContent !== undefined && cachedContent !== null) {
               isCacheHit = true;
               toolCallHistory.set(callKey, prevAttempts + 1);
-              if (prevAttempts >= 5) {
-                resultText = JSON.stringify({ note: "已多次复用该工具的缓存结果，当前信息完整且最新。请直接根据已有信息继续执行或回答用户。" });
-              } else {
-                resultText = cachedContent;
-                addDebugLog("TOOL", `MCP 工具 [${resolvedToolKey}] 命中本次对话只读缓存，直接复用 (${cachedContent.length} 字符)`, { arguments: args });
-              }
+              resultText = cachedContent;
+              addDebugLog("TOOL", `MCP 工具 [${resolvedToolKey}] 命中本次对话只读缓存，直接复用 (${cachedContent.length} 字符)`, { arguments: args });
               isToolError = false;
-            } else if (prevAttempts >= 3) {
-              errorMessage = "重复调用已被系统拦截";
-              resultText = JSON.stringify({ error: "该工具已使用完全相同的参数重复调用多次，系统已拦截重复执行。请勿继续重复调用，请根据当前信息直接回答用户。" });
+            } else if (prevAttempts >= 5) {
+              errorMessage = "该文件或资源连续查询失败";
+              resultText = JSON.stringify({
+                error: "该文件或资源已连续查询多次均未成功（可能路径不存在或拼写错误）。为防止反复重试浪费调用，请勿继续使用完全相同的路径重试，请先调用 get_repository_tree 查看真实文件目录结构。"
+              });
               isToolError = true;
             } else {
               toolCallHistory.set(callKey, prevAttempts + 1);
@@ -2203,6 +2206,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                     if (isTrigger) hasBuildTriggered = true;
                     actionsWaitChecked = false;
                     dialogReadCache.clear();
+                    toolCallHistory.clear();
                     if (isTrigger) {
                       resultText = `${toolRes.content}\n\n【系统指令】工作流已成功触发并在云端开始排队运行！请紧接着调用 actions_list（method: 'list_workflow_runs'）来等待并查看本次构建结果，系统会在底层自动输出卡片并进行动态等待！严禁在此提前结束答复！`;
                     }
@@ -2363,6 +2367,7 @@ export async function handleGeminiGenerateContent(modelName, isStream, geminiBod
               }
             ]
           };
+          addDebugLog("CONVERSATION", `【Gemini 对话完成】响应已交付客户端`);
           sendJson(clientResponse, 200, geminiResp);
         } catch {
           sendJson(clientResponse, 500, { error: { message: "Gemini 响应解析失败" } });
