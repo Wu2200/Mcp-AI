@@ -25,7 +25,7 @@ export function formatCardMarkdown(text) {
     .replace(/([^\n\r])\s*(检索内容[：:])/g, "$1\n$2");
 }
 
-export function parseContentArg(contentArg, paramsSchema = {}) {
+export function parseContentArg(contentArg, paramsSchema = {}, contextText = "") {
   let parsedArgs = {};
   if (!contentArg || typeof contentArg !== "string") return parsedArgs;
   const raw = contentArg.trim();
@@ -35,7 +35,7 @@ export function parseContentArg(contentArg, paramsSchema = {}) {
     try {
       parsedArgs = JSON.parse(raw);
       if (parsedArgs && typeof parsedArgs === "object" && !Array.isArray(parsedArgs)) {
-        return parsedArgs;
+        return coerceArgTypes(parsedArgs, paramsSchema);
       }
     } catch {}
     parsedArgs = {};
@@ -71,6 +71,8 @@ export function parseContentArg(contentArg, paramsSchema = {}) {
     } else if (/^(?:动作|action|method|操作)$/.test(rawKey)) {
       parsedArgs.action = val;
       parsedArgs.method = val;
+    } else if (/^(?:递归|recursive)$/.test(rawKey)) {
+      parsedArgs.recursive = val;
     } else if (/^(?:代码|code|脚本)$/.test(rawKey)) {
       parsedArgs.code = val;
     } else if (/^(?:网址|url|start_url|地址)$/.test(rawKey)) {
@@ -88,11 +90,18 @@ export function parseContentArg(contentArg, paramsSchema = {}) {
   }
 
   // 3. 兜底提取 owner / repo
-  if ((paramsSchema.owner || paramsSchema.repo) && (!parsedArgs.owner || !parsedArgs.repo)) {
-    const repoMatch = raw.match(/\b([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+)\b/);
-    if (repoMatch) {
-      if (!parsedArgs.owner) parsedArgs.owner = repoMatch[1].trim();
-      if (!parsedArgs.repo) parsedArgs.repo = repoMatch[2].trim();
+  const repoMatchInRaw = raw.match(/\b([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+)\b/);
+  if (repoMatchInRaw) {
+    if (!parsedArgs.owner || parsedArgs.owner === "Wu22") parsedArgs.owner = repoMatchInRaw[1].trim();
+    if (!parsedArgs.repo || parsedArgs.repo === "Wu22") parsedArgs.repo = repoMatchInRaw[2].trim();
+  }
+
+  // 若 owner 依然缺失，从上下文 contextText 中寻找诸如 Wu2200/OpenMCP
+  if (paramsSchema.owner && (!parsedArgs.owner || parsedArgs.owner === "Wu22")) {
+    const ctxRepoMatch = contextText.match(/\b([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+)\b/);
+    if (ctxRepoMatch) {
+      parsedArgs.owner = ctxRepoMatch[1].trim();
+      if (!parsedArgs.repo) parsedArgs.repo = ctxRepoMatch[2].trim();
     }
   }
 
@@ -119,6 +128,9 @@ export function parseContentArg(contentArg, paramsSchema = {}) {
   if (paramsSchema.path && parsedArgs.path) result.path = parsedArgs.path;
   if (paramsSchema.branch && parsedArgs.branch) result.branch = parsedArgs.branch;
   if (paramsSchema.ref && parsedArgs.ref) result.ref = parsedArgs.ref;
+  if (paramsSchema.recursive !== undefined && parsedArgs.recursive !== undefined) {
+    result.recursive = parsedArgs.recursive;
+  }
 
   // 6. 如果仍然未得到任何参数，回退到 schema 单一参数
   if (Object.keys(result).length === 0) {
@@ -132,10 +144,36 @@ export function parseContentArg(contentArg, paramsSchema = {}) {
     }
   }
 
-  return result;
+  return coerceArgTypes(result, paramsSchema);
 }
 
-export function parseTextToolCalls(text, activeTools) {
+function coerceArgTypes(args, schema = {}) {
+  const coerced = { ...args };
+  for (const [key, val] of Object.entries(coerced)) {
+    const propSchema = schema[key] || {};
+    const expectedType = propSchema.type;
+
+    if (expectedType === "boolean" || typeof val === "boolean") {
+      if (typeof val === "string") {
+        const lower = val.trim().toLowerCase();
+        coerced[key] = lower === "true" || lower === "1" || lower === "yes";
+      }
+    } else if (expectedType === "number" || expectedType === "integer") {
+      if (typeof val === "string" && /^-?\d+(?:\.\d+)?$/.test(val.trim())) {
+        coerced[key] = Number(val.trim());
+      }
+    } else if (typeof val === "string") {
+      if (val.trim().toLowerCase() === "true" && propSchema.type === "boolean") {
+        coerced[key] = true;
+      } else if (val.trim().toLowerCase() === "false" && propSchema.type === "boolean") {
+        coerced[key] = false;
+      }
+    }
+  }
+  return coerced;
+}
+
+export function parseTextToolCalls(text, activeTools, contextText = "") {
   if (!text || typeof text !== "string" || !Array.isArray(activeTools) || activeTools.length === 0) {
     return [];
   }
@@ -172,7 +210,7 @@ export function parseTextToolCalls(text, activeTools) {
       resolvedInfo?.openAiTool?.function?.parameters?.properties ||
       {};
 
-    const parsedArgs = parseContentArg(contentArg, paramsSchema);
+    const parsedArgs = parseContentArg(contentArg, paramsSchema, contextText || text);
 
     calls.push({
       id: `call_text_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
@@ -244,6 +282,10 @@ export function formatToolCallDetails(args) {
     parts.push(`运行ID: ${args.run_id}`);
   } else if (args.job_id) {
     parts.push(`任务ID: ${args.job_id}`);
+  }
+
+  if (args.recursive !== undefined) {
+    parts.push(`递归: ${args.recursive}`);
   }
 
   if (args.old_str !== undefined && args.new_str !== undefined) {
@@ -1180,9 +1222,9 @@ export async function passThroughAndTransformGemini(requestBody, clientResponse,
       break;
     }
 
-    fullAccumulatedContent += accumulatedContent;
+    fullAccumulatedContent += roundContent;
 
-    if (isTruncatedFinishReason(lastFinishReason) && accumulatedContent && !abortSignal?.aborted && !clientResponse.destroyed) {
+    if (isTruncatedFinishReason(lastFinishReason) && roundContent && !abortSignal?.aborted && !clientResponse.destroyed) {
       continueRound += 1;
       addDebugLog("AGENT", `⚠️ [抗截断触发] 检测到上游返回截断 (${lastFinishReason})！正在自动进行第 ${continueRound} 次无感断点续接...`, {
         round: continueRound,
@@ -1536,7 +1578,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
 
         let usedTextToolCallFallback = false;
         if (mcpCalls.length === 0 && activeTools.length > 0 && message?.content) {
-          const textCalls = parseTextToolCalls(message.content, activeTools);
+          const textCalls = parseTextToolCalls(message.content, activeTools, userText);
           if (textCalls.length > 0) {
             usedTextToolCallFallback = true;
             addDebugLog("AGENT", `[自愈触发] 非流式检测到模型输出了 ${textCalls.length} 个操作卡片，自动转化为真实 MCP 调用`);
@@ -1620,6 +1662,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
           let resultText = "";
           let isToolError = false;
           let errorMessage = "";
+          let isCacheHit = false;
           let isCommitBuildPoll = false;
 
           if (args === null) {
@@ -1709,6 +1752,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
               const cachedContent = !isWrite && !isTrigger ? dialogReadCache.get(callKey) : null;
 
               if (cachedContent !== undefined && cachedContent !== null) {
+                isCacheHit = true;
                 toolCallHistory.set(callKey, prevAttempts + 1);
                 resultText = cachedContent;
                 addDebugLog("TOOL", `MCP 工具 [${resolvedToolKey}] 命中本次对话只读缓存，直接复用 (${cachedContent.length} 字符)`, { arguments: args });
@@ -1739,7 +1783,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                       dialogReadCache.clear();
                       toolCallHistory.clear();
                       if (isTrigger) {
-                        resultText = `${toolRes.content}\n\n【系统指令】工作流已成功触发并在云端开始排队运行！请紧接着调用 actions_list（method: 'list_workflow_runs'）来等待并查看本次构建结果，系统会在底层自动输出卡片并动态等待！严禁在此提前结束答复！`;
+                        resultText = `${toolRes.content}\n\n【系统指令】工作流已成功触发并在云端开始排队运行！请紧接着调用 actions_list（method: 'list_workflow_runs'）来等待并查看本次构建结果，系统会在底层自动输出卡片并进行动态等待！严禁在此提前结束答复！`;
                       }
                     } else {
                       dialogReadCache.set(callKey, resultText);
@@ -1844,7 +1888,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                 assistantContent += delta.content;
 
                 if (!hasToolCalls && activeTools.length > 0) {
-                  const textCalls = parseTextToolCalls(assistantContent, activeTools);
+                  const textCalls = parseTextToolCalls(assistantContent, activeTools, userText);
                   if (textCalls.length >= MAX_TOOL_CALLS_PER_ROUND) {
                     stoppedForTextToolCalls = true;
                     await reader.cancel().catch(() => {});
@@ -1918,7 +1962,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
 
       let usedTextToolCallFallback = false;
       if (mcpCalls.length === 0 && activeTools.length > 0 && assistantContent) {
-        const textCalls = parseTextToolCalls(assistantContent, activeTools);
+        const textCalls = parseTextToolCalls(assistantContent, activeTools, userText);
         if (textCalls.length > 0) {
           usedTextToolCallFallback = true;
           addDebugLog("AGENT", `[自愈触发] 流式检测到模型仅输出了 ${textCalls.length} 个操作卡片而未触发原生 tool_calls，自动转化为真实 MCP 调用`);
@@ -2015,6 +2059,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
         let resultText = "";
         let isToolError = false;
         let errorMessage = "";
+        let isCacheHit = false;
         let isCommitBuildPoll = false;
 
         if (args === null) {
