@@ -429,7 +429,7 @@ export function extractErrorMessage(text) {
     if (typeof text.error === "string") return text.error;
     if (text.error?.message) return text.error.message;
     if (typeof text.message === "string") return text.message;
-    return JSON.stringify(text).slice(0, 200);
+    return JSON.stringify(text).slice(0, 300);
   }
   let str = String(text).trim();
   str = str.replace(/^(?:执行失败\s*[:：]?\s*)+/i, "");
@@ -449,7 +449,7 @@ export function extractErrorMessage(text) {
     } catch {}
   }
   const singleLine = str.replace(/[\r\n\t]+/g, " ").trim();
-  return singleLine.length > 200 ? `${singleLine.slice(0, 200)}...` : singleLine;
+  return singleLine.length > 350 ? `${singleLine.slice(0, 350)}...` : singleLine;
 }
 
 export function parseRateLimitWaitSeconds(errorText) {
@@ -637,6 +637,153 @@ function mapLfIndexToCrlf(crlfStr, lfIndex) {
   return crlfIndex;
 }
 
+// 词法单元提取：将代码分割为独立 token 并记录在原字符串中的起始与结束偏移
+function tokenizeWithPositions(str) {
+  const tokens = [];
+  const regex = /[A-Za-z0-9_\u4e00-\u9fa5]+|[^\s\w]/g;
+  let match;
+  while ((match = regex.exec(str)) !== null) {
+    tokens.push({
+      text: match[0],
+      start: match.index,
+      end: match.index + match[0].length
+    });
+  }
+  return tokens;
+}
+
+// 第 5 层智能 Token-Stream 匹配：完全无视多余换行、空格、缩进与操作符间距
+function findTokenStreamMatch(content, oldStr, newStr, searchOffset = 0) {
+  const contentTokens = tokenizeWithPositions(content);
+  const oldTokens = tokenizeWithPositions(oldStr);
+
+  if (oldTokens.length === 0 || oldTokens.length > contentTokens.length) {
+    return null;
+  }
+
+  const matches = [];
+  const firstText = oldTokens[0].text;
+  const mLen = oldTokens.length;
+
+  for (let i = 0; i <= contentTokens.length - mLen; i += 1) {
+    if (contentTokens[i].text !== firstText) continue;
+
+    let match = true;
+    for (let j = 1; j < mLen; j += 1) {
+      if (contentTokens[i + j].text !== oldTokens[j].text) {
+        match = false;
+        break;
+      }
+    }
+    if (match) {
+      matches.push(i);
+    }
+  }
+
+  if (matches.length === 0) return null;
+
+  let chosenTokenIdx = matches[0];
+  if (matches.length > 1) {
+    const afterOffset = matches.filter((idx) => contentTokens[idx].start >= searchOffset);
+    if (afterOffset.length === 1) {
+      chosenTokenIdx = afterOffset[0];
+    } else if (afterOffset.length > 1) {
+      const lineNumbers = afterOffset.map((idx) => content.slice(0, contentTokens[idx].start).split("\n").length);
+      return { multiple: true, lineNumbers };
+    } else {
+      const lineNumbers = matches.map((idx) => content.slice(0, contentTokens[idx].start).split("\n").length);
+      return { multiple: true, lineNumbers };
+    }
+  }
+
+  const startToken = contentTokens[chosenTokenIdx];
+  const endToken = contentTokens[chosenTokenIdx + mLen - 1];
+
+  let startChar = startToken.start;
+  let endChar = endToken.end;
+
+  // 检查首行缩进对齐：若原文件行首到第一 token 间全为空格，且新代码也包含整行结构，则整行替换
+  const lineStart = content.lastIndexOf("\n", startChar - 1) + 1;
+  const leadingInContent = content.slice(lineStart, startChar);
+
+  let replacement = newStr;
+  if (/^[ \t]+$/.test(leadingInContent)) {
+    const oldLeading = oldStr.match(/^[ \t]+/)?.[0] || "";
+    const newLeading = newStr.match(/^[ \t]+/)?.[0] || "";
+
+    if (newLeading.startsWith(leadingInContent) || oldLeading.startsWith(leadingInContent)) {
+      startChar = lineStart;
+    } else if (newLeading !== leadingInContent) {
+      // 自动对齐缩进：为新代码的每一行补齐原文件该位置特有的基准缩进
+      const newLines = newStr.replace(/\r\n/g, "\n").split("\n");
+      const aligned = newLines.map((line, idx) => {
+        if (!line.trim()) return line;
+        if (idx === 0) return line;
+        if (line.startsWith(newLeading)) {
+          return leadingInContent + line.slice(newLeading.length);
+        }
+        return leadingInContent + line;
+      });
+      replacement = content.includes("\r\n") ? aligned.join("\r\n") : aligned.join("\n");
+    }
+  }
+
+  // 换行符统一
+  if (content.includes("\r\n") && !replacement.includes("\r\n")) {
+    replacement = replacement.replace(/\n/g, "\r\n");
+  }
+
+  return { start: startChar, end: endChar, replacement };
+}
+
+// 相似度近邻诊断：当匹配失败时，向大模型清晰指出文件当前哪一行最接近，实际代码是什么，从而激活自愈
+function findNearMatchDiagnostic(content, oldStr) {
+  const contentTokens = tokenizeWithPositions(content);
+  const oldTokens = tokenizeWithPositions(oldStr);
+  if (oldTokens.length < 4 || contentTokens.length < 4) return "";
+
+  const mLen = oldTokens.length;
+  let bestScore = 0;
+  let bestIdx = -1;
+
+  const step = Math.max(1, Math.floor(mLen / 10));
+  const sampleIndices = [];
+  for (let s = 0; s < mLen; s += step) {
+    sampleIndices.push(s);
+  }
+  if (!sampleIndices.includes(mLen - 1)) {
+    sampleIndices.push(mLen - 1);
+  }
+  const sampleTexts = sampleIndices.map((i) => oldTokens[i].text);
+
+  const windowSize = Math.min(contentTokens.length, Math.floor(mLen * 1.5) + 5);
+  for (let i = 0; i <= contentTokens.length - windowSize; i += Math.max(1, Math.floor(step / 2))) {
+    let score = 0;
+    const windowSlice = contentTokens.slice(i, i + windowSize);
+    const windowSet = new Set(windowSlice.map((t) => t.text));
+
+    for (const t of sampleTexts) {
+      if (windowSet.has(t)) score += 1;
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestIdx = i;
+    }
+  }
+
+  const similarity = bestScore / sampleTexts.length;
+  if (similarity >= 0.55 && bestIdx >= 0) {
+    const token = contentTokens[bestIdx];
+    const lineNum = content.slice(0, token.start).split("\n").length;
+    const lineStart = content.lastIndexOf("\n", token.start - 1) + 1;
+    const lineEnd = content.indexOf("\n", token.start + 180);
+    const actualSnippet = content.slice(lineStart, lineEnd === -1 ? content.length : lineEnd).trim();
+    return `在第 ${lineNum} 行附近发现了高度相似的代码（特征吻合度约 ${Math.round(similarity * 100)}%），但待替换内容与当前文件存在差异。该位置实际最新代码为: "${actualSnippet}"。请核准后重试。`;
+  }
+  return "";
+}
+
 function findLineBasedMatch(contentLf, oldStrLf, newStrLf, originalContentWithCrlf = null) {
   const contentLines = contentLf.split("\n");
   const oldLines = oldStrLf.split("\n");
@@ -644,6 +791,7 @@ function findLineBasedMatch(contentLf, oldStrLf, newStrLf, originalContentWithCr
 
   if (oldLines.length === 0) return null;
 
+  // 1. 去除行尾不可见字符精确匹配
   let matchedIndices = [];
   for (let i = 0; i <= contentLines.length - oldLines.length; i += 1) {
     let match = true;
@@ -658,6 +806,7 @@ function findLineBasedMatch(contentLf, oldStrLf, newStrLf, originalContentWithCr
     }
   }
 
+  // 2. 去除首尾空格匹配
   let isFullTrim = false;
   if (matchedIndices.length === 0) {
     for (let i = 0; i <= contentLines.length - oldLines.length; i += 1) {
@@ -728,6 +877,7 @@ function findLineBasedMatch(contentLf, oldStrLf, newStrLf, originalContentWithCr
 function findBestSnippetMatch(content, oldStr, newStr, filePath, editIndex, searchOffset = 0) {
   const isCrlf = content.includes("\r\n");
 
+  // 1. 原生精确匹配
   let idx = content.indexOf(oldStr, searchOffset);
   if (idx === -1 && searchOffset > 0) {
     idx = content.indexOf(oldStr);
@@ -748,6 +898,7 @@ function findBestSnippetMatch(content, oldStr, newStr, filePath, editIndex, sear
     );
   }
 
+  // 2. 换行符 LF 归一化匹配
   const contentLf = content.replace(/\r\n/g, "\n");
   const oldStrLf = oldStr.replace(/\r\n/g, "\n");
   const newStrLf = newStr.replace(/\r\n/g, "\n");
@@ -770,6 +921,7 @@ function findBestSnippetMatch(content, oldStr, newStr, filePath, editIndex, sear
     );
   }
 
+  // 3. 去除首尾空白后匹配
   const trimmedOld = oldStrLf.trim();
   if (trimmedOld) {
     const trimmedOccurrences = getOccurrenceIndices(contentLf, trimmedOld);
@@ -785,6 +937,7 @@ function findBestSnippetMatch(content, oldStr, newStr, filePath, editIndex, sear
     }
   }
 
+  // 4. 行级修剪容错匹配
   const lineMatch = findLineBasedMatch(contentLf, oldStrLf, newStrLf, isCrlf ? content : null);
   if (lineMatch) {
     if (lineMatch.multiple) {
@@ -795,7 +948,22 @@ function findBestSnippetMatch(content, oldStr, newStr, filePath, editIndex, sear
     return lineMatch;
   }
 
-  return null;
+  // 5. 终极 Token-Stream 匹配：无视空白缩进与空行差异
+  const tokenMatch = findTokenStreamMatch(content, oldStr, newStr, searchOffset);
+  if (tokenMatch) {
+    if (tokenMatch.multiple) {
+      throw new Error(
+        `在文件 ${filePath} 中第 ${editIndex} 处语法匹配到多处 (${tokenMatch.lineNumbers.length} 处) 相似片段 (位于第 ${tokenMatch.lineNumbers.join(", ")} 行)。请在 old_str 中包含更多上下文代码以确保唯一性。`
+      );
+    }
+    return tokenMatch;
+  }
+
+  // 若以上全未命中，调用近邻分析给出有价值的诊断提示
+  const diagnostic = findNearMatchDiagnostic(content, oldStr);
+  throw new Error(
+    `在文件 ${filePath} 中未找到第 ${editIndex} 处待替换片段 (old_str)。${diagnostic ? `\n【智能诊断】${diagnostic}\n` : ""}待查找片段预览:\n${oldStr.slice(0, 200)}`
+  );
 }
 
 export function applyStringReplacements(content, edits, filePath = "") {
