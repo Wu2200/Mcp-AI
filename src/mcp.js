@@ -28,6 +28,80 @@ export async function parseMcpResponse(res) {
   return await res.json();
 }
 
+export function findToolInfo(toolKey) {
+  if (!toolKey || typeof toolKey !== "string") return null;
+  const rawTarget = toolKey.trim();
+
+  // 1. 精确匹配
+  let info = mcpToolRegistry.get(rawTarget);
+  if (info) return info;
+
+  // 2. 忽略大小写匹配
+  const lowerTarget = rawTarget.toLowerCase();
+  for (const [k, v] of mcpToolRegistry.entries()) {
+    if (k.toLowerCase() === lowerTarget) return v;
+  }
+
+  // 3. 归一化名称（去除常见前缀和后缀，去除下划线与中划线差异）
+  const normalize = (name) => {
+    return String(name || "")
+      .toLowerCase()
+      .replace(/^(?:github_|mcp_|copilot_|tool_|default_api_)+/g, "")
+      .replace(/(?:_mcp_github|_mcp|_tool|_server|_github)+$/g, "")
+      .replace(/[^a-z0-9]/g, "");
+  };
+
+  const normTarget = normalize(rawTarget);
+  if (normTarget) {
+    // 3.1 归一化全等匹配
+    for (const [k, v] of mcpToolRegistry.entries()) {
+      if (normalize(k) === normTarget || normalize(v.rawName) === normTarget) {
+        return v;
+      }
+    }
+
+    // 4. 后缀模糊包含匹配
+    for (const [k, v] of mcpToolRegistry.entries()) {
+      const normK = normalize(k);
+      const normRaw = normalize(v.rawName);
+      if (
+        (normRaw && normTarget.endsWith(normRaw)) ||
+        (normK && normTarget.endsWith(normK)) ||
+        (normTarget && normK.endsWith(normTarget)) ||
+        (normTarget && normRaw.endsWith(normTarget))
+      ) {
+        return v;
+      }
+    }
+
+    // 5. 常见标准动作别名映射
+    const aliasMap = {
+      readfile: "get_file_contents",
+      getfile: "get_file_contents",
+      viewfile: "get_file_contents",
+      catfile: "get_file_contents",
+      writefile: "create_or_update_file",
+      createfile: "create_or_update_file",
+      updatefile: "create_or_update_file",
+      editfile: "github_edit_file",
+      modifyfile: "github_edit_file",
+      patchfile: "github_edit_file"
+    };
+
+    const mappedAlias = aliasMap[normTarget];
+    if (mappedAlias) {
+      const normMapped = normalize(mappedAlias);
+      for (const [k, v] of mcpToolRegistry.entries()) {
+        if (normalize(k) === normMapped || normalize(v.rawName) === normMapped) {
+          return v;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
 export async function connectToMcpServer({ name, url, token }) {
   const serverId = crypto.randomUUID();
   const cleanUrl = url.trim().replace(/\/+$/, "");
@@ -940,15 +1014,7 @@ export function registerVirtualTools(serverInfo) {
 }
 
 export async function callMcpTool(toolKey, args, onWaitNotice = null) {
-  let info = mcpToolRegistry.get(toolKey);
-  if (!info) {
-    for (const [k, v] of mcpToolRegistry.entries()) {
-      if (k.endsWith(toolKey) || toolKey.endsWith(v.rawName)) {
-        info = v;
-        break;
-      }
-    }
-  }
+  const info = findToolInfo(toolKey);
   if (!info) throw new Error(`未找到工具：${toolKey}`);
 
   const isCfExecute =
