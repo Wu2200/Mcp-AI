@@ -32,6 +32,41 @@ export function setLoggingEnabled(enabled) {
 }
 export const MAX_LOGS = 1000;
 export const debugLogs = [];
+export let currentConversationId = "";
+
+export function startNewConversationLog(meta = {}) {
+  // 每次新对话开始时，彻底清空上一次对话的全部历史，确保控制台永远只显示本次完整对话
+  debugLogs.length = 0;
+  currentConversationId = `conv_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const now = new Date();
+  const time =
+    now.toLocaleTimeString("zh-CN", { hour12: false }) +
+    "." +
+    String(now.getMilliseconds()).padStart(3, "0");
+
+  const startEntry = {
+    id: `log_${Date.now()}_start`,
+    time,
+    type: "CONVERSATION",
+    summary: `【新对话开始】模型: [${meta.model || "default"}] - 渠道: [${meta.channel || "默认"}]`,
+    detail: JSON.stringify(
+      {
+        conversationId: currentConversationId,
+        startedAt: new Date().toISOString(),
+        model: meta.model,
+        channel: meta.channel,
+        stream: meta.stream,
+        userPrompt: meta.userPrompt || "非文本内容"
+      },
+      null,
+      2
+    )
+  };
+
+  debugLogs.push(startEntry);
+  console.log(`\n==================== [新对话追踪开始: ${currentConversationId}] ====================`);
+  console.log(`[${time}] 模型: ${meta.model || "default"} | 渠道: ${meta.channel || "默认"}`);
+}
 
 export function addDebugLog(type, summary, detail = "") {
   const now = new Date();
@@ -58,6 +93,8 @@ export function addDebugLog(type, summary, detail = "") {
     console.log(`[${time}] [工具] ${summary}`);
   } else if (type === "UPSTREAM" && summary.includes("已切换当前上游渠道")) {
     console.log(`[${time}] [渠道] ${summary}`);
+  } else if (type === "CONVERSATION") {
+    console.log(`[${time}] [对话里程碑] ${summary}`);
   }
 
   if (!loggingEnabled) return;
