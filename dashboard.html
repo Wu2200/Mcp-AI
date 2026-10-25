@@ -462,6 +462,7 @@
       font-weight: 600;
       white-space: nowrap;
     }
+    .tag-conv { background: #2563eb; color: #ffffff; }
     .tag-downstream { background: #0284c7; color: #ffffff; }
     .tag-upstream { background: #d97706; color: #ffffff; }
     .tag-agent { background: #7c3aed; color: #ffffff; }
@@ -599,21 +600,21 @@
     <div class="card">
       <div class="card-title">
         <div class="card-title-left">
-          <span>全链路调试抓包日志</span>
+          <span>全链路调试抓包日志 (单次完整对话)</span>
           <span id="log-status-badge" class="badge badge-green">抓取中</span>
         </div>
         <div class="action-group">
           <button id="btn-toggle-log" class="btn-action btn-stop" onclick="toggleLogging()">关闭日志</button>
-          <button class="btn-action btn-start" onclick="copyAllLogs()">复制全部日志</button>
+          <button class="btn-action btn-start" onclick="copyAllLogs()">复制本次对话日志</button>
           <button class="btn-action btn-del" onclick="clearAllLogs()">清空日志</button>
           <button class="btn-action btn-start" onclick="loadLogs()">刷新</button>
         </div>
       </div>
       <p style="font-size: 12px; color: #64748b; margin-bottom: 10px;">
-        捕获下游客户端请求、上游响应状态、工具执行耗时与截断诊断。点击任意记录可展开完整报文。
+        控制台永远仅展示当前最新一次完整对话（涵盖该次会话的所有 Agent 轮次、工具调用、深度思考及最终响应），发起新对话时自动覆盖旧日志。
       </p>
       <div id="log-panel" class="log-panel-container">
-        <div class="empty-state" style="color: #64748b;">正在加载抓包记录...</div>
+        <div class="empty-state" style="color: #64748b;">暂无抓包记录。在客户端发起对话即可在此实时查看本次完整对话。</div>
       </div>
       <span id="log-msg"></span>
     </div>
@@ -923,6 +924,7 @@
     }
 
     function getTagClass(type) {
+      if (type.startsWith("CONVERSATION")) return "tag-conv";
       if (type.startsWith("DOWNSTREAM")) return "tag-downstream";
       if (type.startsWith("UPSTREAM")) return "tag-upstream";
       if (type.startsWith("AGENT")) return "tag-agent";
@@ -955,7 +957,7 @@
 
         const panel = document.getElementById("log-panel");
         if (cachedLogs.length === 0) {
-          panel.innerHTML = '<div class="empty-state" style="color: #64748b;">暂无抓包记录。在客户端发起对话即可在此实时查看。</div>';
+          panel.innerHTML = '<div class="empty-state" style="color: #64748b;">暂无抓包记录。在客户端发起对话即可在此实时查看本次完整对话。</div>';
           return;
         }
 
@@ -999,7 +1001,7 @@
     }
 
     async function clearAllLogs() {
-      if (!confirm("确认清空所有抓包日志？")) return;
+      if (!confirm("确认清空抓包日志？")) return;
       try {
         const res = await fetch("/api/logs/clear", { method: "POST" });
         if (res.ok) {
@@ -1016,7 +1018,7 @@
       const text = cachedLogs.map(l => `[${l.time}] [${l.type}] ${l.summary}\n${l.detail}\n----------------------------------------`).join("\n\n");
       navigator.clipboard.writeText(text).then(() => {
         const msg = document.getElementById("log-msg");
-        msg.innerText = "已复制全量抓包日志";
+        msg.innerText = "已复制本次对话抓包日志";
         msg.style.color = "#16a34a";
         setTimeout(() => { msg.innerText = ""; }, 3000);
       }).catch(() => {
