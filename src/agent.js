@@ -17,6 +17,113 @@ import {
   extractErrorMessage
 } from "./mcp.js";
 
+export function createCombinedSignal(userSignal, timeoutMs = 180000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(new Error(`Upstream request timed out after ${timeoutMs / 1000}s`));
+  }, timeoutMs);
+
+  const onUserAbort = () => {
+    clearTimeout(timer);
+    controller.abort(userSignal?.reason || new Error("Client aborted"));
+  };
+
+  if (userSignal) {
+    if (userSignal.aborted) {
+      clearTimeout(timer);
+      controller.abort(userSignal.reason);
+      return { signal: controller.signal, cleanup: () => {} };
+    }
+    userSignal.addEventListener("abort", onUserAbort, { once: true });
+  }
+
+  const cleanup = () => {
+    clearTimeout(timer);
+    if (userSignal) {
+      userSignal.removeEventListener("abort", onUserAbort);
+    }
+  };
+
+  return { signal: controller.signal, cleanup };
+}
+
+export function compactContextMessages(messages, maxChars = 200000, activeFileCount = 5) {
+  if (!Array.isArray(messages) || messages.length === 0) return messages;
+
+  const totalChars = messages.reduce((sum, m) => sum + (typeof m?.content === "string" ? m.content.length : 0), 0);
+  if (totalChars <= maxChars) {
+    return messages;
+  }
+
+  // 1. 扫描所有 tool_calls，建立 tool_call_id 到文件路径和工具类型的映射
+  const toolCallMap = new Map();
+  const modifiedFiles = new Set();
+
+  for (const m of messages) {
+    if (Array.isArray(m?.tool_calls)) {
+      for (const tc of m.tool_calls) {
+        if (!tc?.id) continue;
+        const name = (tc.function?.name || tc.name || "").toLowerCase();
+        const args = toolArguments(tc) || {};
+        const filePath = args.path || args.file || args.filePath || "";
+        toolCallMap.set(tc.id, { name, path: filePath, isWrite: isWriteTool(name) });
+        if (filePath && isWriteTool(name)) {
+          modifiedFiles.add(filePath);
+        }
+      }
+    }
+  }
+
+  // 2. 从后往前扫描，确定最近活跃的 N 个文件（绝对保留 100% 完整源码）
+  const activeFiles = new Set(modifiedFiles);
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const m = messages[i];
+    if (m?.role === "tool" && m.tool_call_id) {
+      const meta = toolCallMap.get(m.tool_call_id);
+      if (meta?.path && !activeFiles.has(meta.path)) {
+        activeFiles.add(meta.path);
+        if (activeFiles.size >= activeFileCount + modifiedFiles.size) {
+          break;
+        }
+      }
+    }
+  }
+
+  // 3. 对超出活跃窗口的历史文件与过长非代码消息进行智能收敛
+  let currentTotal = totalChars;
+  for (let i = 0; i < messages.length - 10; i += 1) {
+    if (currentTotal <= maxChars) break;
+    const m = messages[i];
+    if (!m || m.role !== "tool" || typeof m.content !== "string") continue;
+
+    const meta = toolCallMap.get(m.tool_call_id) || {};
+    const filePath = meta.path || "";
+    const isFileContent = m.content.startsWith("successfully downloaded text file") || m.content.startsWith("Resource Text:") || meta.name?.includes("file");
+
+    if (isFileContent) {
+      // 若该文件是最新活跃文件或曾被修改，严禁触碰，保留 100% 完整源码
+      if (filePath && activeFiles.has(filePath)) {
+        continue;
+      }
+      // 仅对非活跃的历史陈旧文件折叠中间实现代码，保留前 2200 字符骨架和后 400 字符闭合
+      if (m.content.length > 5000) {
+        const origLen = m.content.length;
+        const head = m.content.slice(0, 2200);
+        const tail = m.content.slice(-400);
+        m.content = `${head}\n\n// ... [已折叠该历史已读文件的中间实现代码 (原文件共 ${origLen} 字符)。该文件已在早期轮次完成分析。如需对该文件进行精确局部编辑，请直接调用 get_file_contents 重新读取] ...\n\n${tail}`;
+        currentTotal -= (origLen - m.content.length);
+      }
+    } else if (m.content.length > 6000) {
+      // 早期过长非代码输出（如目录树、commit 记录、workflow 列表）温和精简
+      const origLen = m.content.length;
+      m.content = m.content.slice(0, 3000) + "\n\n[早期查询结果已自动精简，核心信息已在历史对话中提取]";
+      currentTotal -= (origLen - m.content.length);
+    }
+  }
+
+  return messages;
+}
+
 export function formatCardMarkdown(text) {
   if (!text || typeof text !== "string") return text;
   return text
@@ -754,32 +861,79 @@ export async function passThrough(requestBody, clientResponse, reqMeta, abortSig
       break;
     }
 
-    let upstreamResponse;
+    let upstreamResponse = null;
+    let fetchAttempts = 0;
+    const MAX_FETCH_ATTEMPTS = 2;
     const roundStartTime = Date.now();
     if (continueRound > 0) {
       addDebugLog("UPSTREAM", `[直通模式] [${channel.name}] 第 ${continueRound + 1} 轮断点续接上游请求 - 消息量: ${currentMessages.length}`);
     }
 
-    try {
-      upstreamResponse = await fetch(targetUrl, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${channel.apiKey}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          ...requestBody,
-          messages: currentMessages
-        }),
-        signal: abortSignal
-      });
-    } catch (err) {
-      if (abortSignal?.aborted || err.name === "AbortError") {
-        addDebugLog("DOWNSTREAM", `[直通模式] 客户端已断开，上游请求已中止`);
-        return;
+    while (fetchAttempts < MAX_FETCH_ATTEMPTS) {
+      if (abortSignal?.aborted || clientResponse.destroyed) break;
+      fetchAttempts += 1;
+
+      const { signal: combinedSignal, cleanup } = createCombinedSignal(abortSignal, 180000);
+      try {
+        upstreamResponse = await fetch(targetUrl, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${channel.apiKey}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            ...requestBody,
+            messages: currentMessages
+          }),
+          signal: combinedSignal
+        });
+        cleanup();
+        break;
+      } catch (err) {
+        cleanup();
+        if (abortSignal?.aborted || (err.name === "AbortError" && abortSignal?.aborted)) {
+          addDebugLog("DOWNSTREAM", `[直通模式] 客户端已断开，上游请求已中止`);
+          return;
+        }
+
+        const isNetworkOrTimeout =
+          err.name === "AbortError" ||
+          err.message?.includes("fetch failed") ||
+          err.message?.includes("timeout") ||
+          err.code === "ECONNRESET" ||
+          err.code === "ETIMEDOUT";
+
+        if (isNetworkOrTimeout && fetchAttempts < MAX_FETCH_ATTEMPTS && !clientResponse.destroyed) {
+          addDebugLog("UPSTREAM", `⚠️ [直通模式] [${channel.name}] 上游网络波动 (${err.message})，正在尝试第 ${fetchAttempts} 次自动重试...`);
+          await new Promise((r) => setTimeout(r, 2000));
+          continue;
+        }
+
+        addDebugLog("ERROR", `[直通模式] [${channel.name}] 上游请求彻底失败: ${err.message}`, err.stack || err);
+        if (isStream && hasInitiatedStream && !clientResponse.destroyed) {
+          const errorChunk = {
+            id: `chatcmpl-${Date.now()}`,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: requestBody.model || "default",
+            choices: [
+              {
+                index: 0,
+                delta: { content: `\n\n⚠️ [直通模式网络连接中断]: ${err.message}` },
+                finish_reason: "stop"
+              }
+            ]
+          };
+          clientResponse.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
+          clientResponse.write("data: [DONE]\n\n");
+          clientResponse.end();
+          return;
+        }
+        throw err;
       }
-      throw err;
     }
+
+    if (!upstreamResponse) return;
 
     const duration = Date.now() - roundStartTime;
     addDebugLog("UPSTREAM", `[直通模式] [${channel.name}] 上游响应状态: ${upstreamResponse.status} - 耗时 ${duration}ms`, {
@@ -1096,27 +1250,55 @@ export async function passThroughAndTransformGemini(requestBody, clientResponse,
       break;
     }
 
-    let upstreamResponse;
-    try {
-      upstreamResponse = await fetch(targetUrl, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${channel.apiKey}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          ...requestBody,
-          messages: currentMessages
-        }),
-        signal: abortSignal
-      });
-    } catch (err) {
-      if (abortSignal?.aborted || err.name === "AbortError") {
-        addDebugLog("DOWNSTREAM", `[Gemini 直通模式] 客户端已中止请求`);
-        return;
+    let upstreamResponse = null;
+    let fetchAttempts = 0;
+    const MAX_FETCH_ATTEMPTS = 2;
+
+    while (fetchAttempts < MAX_FETCH_ATTEMPTS) {
+      if (abortSignal?.aborted || clientResponse.destroyed) break;
+      fetchAttempts += 1;
+
+      const { signal: combinedSignal, cleanup } = createCombinedSignal(abortSignal, 180000);
+      try {
+        upstreamResponse = await fetch(targetUrl, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${channel.apiKey}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            ...requestBody,
+            messages: currentMessages
+          }),
+          signal: combinedSignal
+        });
+        cleanup();
+        break;
+      } catch (err) {
+        cleanup();
+        if (abortSignal?.aborted || (err.name === "AbortError" && abortSignal?.aborted)) {
+          addDebugLog("DOWNSTREAM", `[Gemini 直通模式] 客户端已中止请求`);
+          return;
+        }
+
+        const isNetworkOrTimeout =
+          err.name === "AbortError" ||
+          err.message?.includes("fetch failed") ||
+          err.message?.includes("timeout") ||
+          err.code === "ECONNRESET" ||
+          err.code === "ETIMEDOUT";
+
+        if (isNetworkOrTimeout && fetchAttempts < MAX_FETCH_ATTEMPTS && !clientResponse.destroyed) {
+          addDebugLog("UPSTREAM", `⚠️ [Gemini 直通模式] [${channel.name}] 上游网络波动 (${err.message})，正在尝试第 ${fetchAttempts} 次自动重试...`);
+          await new Promise((r) => setTimeout(r, 2000));
+          continue;
+        }
+
+        throw err;
       }
-      throw err;
     }
+
+    if (!upstreamResponse) return;
 
     const duration = Date.now() - startTime;
     addDebugLog("UPSTREAM", `[Gemini 直通模式] [${channel.name}] 上游响应状态: ${upstreamResponse.status} - 耗时 ${duration}ms`, {
@@ -1406,7 +1588,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
   });
 
   const systemRules = [
-    "【工具调用与构建验证规范】\n1. 单轮最多规划并发调用 3 个最相关的真实工具；若目标较多，先执行优先级最高的 1~3 项，取得结果后再决定下一步，禁止一次性铺开大量调用。\n2. 严禁提前输出总结或草稿：在所有信息收集、操作执行或构建验证全部完成之前，严禁在中间轮次输出结论、答复文本或开场白！\n3. 【排查与修改代码纪律】\n- 严禁盲目翻阅历史 Commit：排查 Bug 或理解逻辑时，严禁连续翻看历史 Commit！必须直接使用 get_file_contents 查看文件当前在 main 分支的最新真实代码！切勿拿以前对话的旧记忆或历史 Commit 代码当成当前文件。\n- 局部编辑 old_str 规范：必须直接从本次对话中 get_file_contents 获取到的最新代码中原样复制。对同一个文件的多处修改请合并在同一个 github_edit_file 调用的 edits 数组中，禁止在同一轮对同一个文件发起两次独立的 github_edit_file 调用！\n4. 【代码修改与云端构建闭环规范】\n- 当任务涉及多个文件或多步修改时，先连续执行所有文件的修改与提交，切勿在中间阶段等待构建！\n- 仅当所有代码与文件均已全部修改完毕（项目最终就绪）后：\n  - 若该仓库配置了云端 CI/CD 构建（例如 iOS 打包、自动化测试、Docker 编译等），必须发起一次 actions_list（method: 'list_workflow_runs'）来等待并验证最终修改触发的云端构建结果！\n  - 严禁在修改完全部代码后直接向用户回复“已修改完成”而未确认最终构建是否成功！\n  - 服务端会在底层自动精准匹配最后一次代码提交所触发的构建任务，并进行动态轮询等待（无需担心超时）。\n- 若云端构建成功，向用户汇报修改详情与构建成功结果；\n- 若云端构建失败（failure），必须激活自愈闭环：调用 get_job_logs 查看编译错误日志，分析报错原因并修复代码，修复后再次等待最终构建通过！\n- 若用户仅是查询历史构建耗时或记录，直接查询即可，无需等待。\n5. 优先使用原生 Tool Calls。仅当上游未发出原生调用时，才允许使用操作卡片作为兼容兜底；每轮最多 3 张，且必须对应真实工具调用。多个卡片之间必须使用双换行（\\n\\n）空行彻底分隔，严禁单行连续粘连：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n6. 核心执行约束：输出上述操作卡片的同时，必须同时发起真实的底层工具调用（Tool Calls），严禁仅在正文中打印卡片文本而不发起工具调用！\n7. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n8. 当所有工具调用完毕、进入最终答复轮次时，直接输出完整最终解答，终局轮次严禁输出操作卡片。"
+    "【工具调用与构建验证规范】\n1. 单轮最多规划并发调用 3 个最相关的真实工具；若目标较多，先执行优先级最高的 1~3 项，取得结果后再决定下一步，禁止一次性铺开大量调用。\n2. 严禁提前输出总结或草稿：在所有信息收集、操作执行或构建验证全部完成之前，严禁在中间轮次输出结论、答复文本或开场白！\n3. 【排查与修改代码纪律】\n- 严禁盲目翻阅历史 Commit：排查 Bug 或理解逻辑时，严禁连续翻看历史 Commit！必须直接使用 get_file_contents 查看文件当前在 main 分支的最新真实代码！切勿拿以前对话的旧记忆或历史 Commit 代码当成当前文件。\n- 局部编辑 old_str 规范：必须直接从本次对话中 get_file_contents 获取到的最新完整代码中原样复制。若某文件在较早轮次读取且被折叠，严禁使用带折叠标记的代码作为 old_str，必须先调用一次 get_file_contents 重新获取最新完整代码后再进行局部替换！对同一个文件的多处修改请合并在同一个 github_edit_file 调用的 edits 数组中，禁止在同一轮对同一个文件发起两次独立的 github_edit_file 调用！\n4. 【大范围排查与阅读规范】\n- 当用户要求全面排查、检查全项目或寻找无用代码时，请先通过 get_repository_tree 宏观梳理工程架构与核心模块，有针对性地逐步深入，切勿在单轮内一次性盲目读取所有数十个源码文件导致上下文过度膨胀；每轮重点分析 1~3 个核心文件并提取关键发现。\n5. 【代码修改与云端构建闭环规范】\n- 当任务涉及多个文件或多步修改时，先连续执行所有文件的修改与提交，切勿在中间阶段等待构建！\n- 仅当所有代码与文件均已全部修改完毕（项目最终就绪）后：\n  - 若该仓库配置了云端 CI/CD 构建（例如 iOS 打包、自动化测试、Docker 编译等），必须发起一次 actions_list（method: 'list_workflow_runs'）来等待并验证最终修改触发的云端构建结果！\n  - 严禁在修改完全部代码后直接向用户回复“已修改完成”而未确认最终构建是否成功！\n  - 服务端会在底层自动精准匹配最后一次代码提交所触发的构建任务，并进行动态轮询等待（无需担心超时）。\n- 若云端构建成功，向用户汇报修改详情与构建成功结果；\n- 若云端构建失败（failure），必须激活自愈闭环：调用 get_job_logs 查看编译错误日志，分析报错原因并修复代码，修复后再次等待最终构建通过！\n- 若用户仅是查询历史构建耗时或记录，直接查询即可，无需等待。\n6. 优先使用原生 Tool Calls。仅当上游未发出原生调用时，才允许使用操作卡片作为兼容兜底；每轮最多 3 张，且必须对应真实工具调用。多个卡片之间必须使用双换行（\\n\\n）空行彻底分隔，严禁单行连续粘连：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n7. 核心执行约束：输出上述操作卡片的同时，必须同时发起真实的底层工具调用（Tool Calls），严禁仅在正文中打印卡片文本而不发起工具调用！\n8. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n9. 当所有工具调用完毕、进入最终答复轮次时，直接输出完整最终解答，终局轮次严禁输出操作卡片。"
   ];
   const hasCloudflare = tools.some((t) => {
     const n = (t?.function?.name || t?.name || "").toLowerCase();
@@ -1480,18 +1662,8 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
         break;
       }
 
-      // 仅当总上下文字符数超过 650,000（约 18 万 Token）时，才对最早的非源码类庞大输出（如历史 commit patch）进行温和裁剪，严禁在普通轮次中截断已读取的文件源码！
-      const totalContextChars = messages.reduce((sum, m) => sum + (typeof m?.content === "string" ? m.content.length : 0), 0);
-      if (totalContextChars > 650000 && messages.length > 25) {
-        for (let i = 0; i < messages.length - 20; i += 1) {
-          const m = messages[i];
-          if (m && m.role === "tool" && typeof m.content === "string" && m.content.length > 35000) {
-            if (!m.content.startsWith("successfully downloaded text file")) {
-              m.content = m.content.slice(0, 8000) + "\n\n[超长历史记录已精简]";
-            }
-          }
-        }
-      }
+      // 上下文安全滑动窗口：保证最近读取的 5 个文件 100% 完整无损，仅当总字符超限（>200,000）时智能折叠非活跃历史陈旧文件
+      compactContextMessages(messages, 200000, 5);
 
       let roundMessages = [...messages];
       if (consecutiveFailures >= 2 && roundMessages.length > 0 && roundMessages[0].role === "system") {
@@ -1524,24 +1696,70 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
         messagesCount: roundMessages.length
       });
 
-      let upstreamResponse;
-      try {
-        upstreamResponse = await fetch(targetUrl, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${channel.apiKey}`,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify(payload),
-          signal: abortSignal
-        });
-      } catch (err) {
-        if (abortSignal?.aborted || err.name === "AbortError") {
-          addDebugLog("DOWNSTREAM", `第 ${round + 1} 轮上游请求被客户端中止`);
-          return;
+      let upstreamResponse = null;
+      let fetchAttempts = 0;
+      const MAX_FETCH_ATTEMPTS = 2;
+
+      while (fetchAttempts < MAX_FETCH_ATTEMPTS) {
+        if (abortSignal?.aborted || clientResponse.destroyed) break;
+        fetchAttempts += 1;
+
+        const { signal: combinedSignal, cleanup } = createCombinedSignal(abortSignal, 180000);
+        try {
+          upstreamResponse = await fetch(targetUrl, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${channel.apiKey}`,
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify(payload),
+            signal: combinedSignal
+          });
+          cleanup();
+          break;
+        } catch (err) {
+          cleanup();
+          if (abortSignal?.aborted || (err.name === "AbortError" && abortSignal?.aborted)) {
+            addDebugLog("DOWNSTREAM", `第 ${round + 1} 轮上游请求被客户端中止`);
+            return;
+          }
+
+          const isNetworkOrTimeout =
+            err.name === "AbortError" ||
+            err.message?.includes("fetch failed") ||
+            err.message?.includes("timeout") ||
+            err.code === "ECONNRESET" ||
+            err.code === "ETIMEDOUT";
+
+          if (isNetworkOrTimeout && fetchAttempts < MAX_FETCH_ATTEMPTS && !clientResponse.destroyed) {
+            addDebugLog("UPSTREAM", `⚠️ [${channel.name}] 第 ${round + 1} 轮上游请求网络异常 (${err.message})，正在尝试第 ${fetchAttempts} 次自动重试...`);
+            if (isStream && !clientResponse.destroyed) {
+              sendReasoningChunk(
+                clientResponse,
+                `\n> ⚠️ 上游网络连接波动/排队超时 (${err.message})，正在尝试重新连接...\n`,
+                requestBody.model
+              );
+            }
+            // 触发更低阈值的紧急收敛后再重试
+            compactContextMessages(roundMessages, 120000, 3);
+            payload.messages = roundMessages;
+            await new Promise((r) => setTimeout(r, 2000));
+            continue;
+          }
+
+          addDebugLog("ERROR", `[${channel.name}] 第 ${round + 1} 轮上游调用彻底失败: ${err.message}`, err.stack || err);
+          if (isStream && !clientResponse.destroyed) {
+            const errorMsg = `\n\n⚠️ 【上游接口连接失败】：向上游渠道 [${channel.name}] 发起请求失败 (${err.message})。可能由于网络连接重置或上游服务拥堵导致。已为您保留当前全部记录。`;
+            sendSSEChunk(clientResponse, { content: errorMsg }, requestBody.model);
+            clientResponse.write("data: [DONE]\n\n");
+            clientResponse.end();
+            return;
+          }
+          throw err;
         }
-        throw err;
       }
+
+      if (!upstreamResponse) return;
 
       const roundDuration = Date.now() - roundStartTime;
       if (abortSignal?.aborted || clientResponse.destroyed) return;
@@ -1559,7 +1777,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
             choices: [
               {
                 index: 0,
-                delta: { content: `\n\n⚠️ [上游接口返回错误 ${upstreamResponse.status}]: ${errTxt.slice(0, 500)}` },
+                delta: { content: `\n\n⚠️ [上游接口返回错误 ${upstreamResponse.status}]: ${errText.slice(0, 500)}` },
                 finish_reason: "stop"
               }
             ]
