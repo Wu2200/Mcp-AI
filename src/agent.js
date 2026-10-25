@@ -10,6 +10,7 @@ import {
 } from "./store.js";
 import {
   callMcpTool,
+  findToolInfo,
   getAllTools,
   selectRelevantTools,
   isWriteTool,
@@ -22,6 +23,116 @@ export function formatCardMarkdown(text) {
     .replace(/([^\n\r])\s*(目标说明[：:])/g, "$1\n\n$2")
     .replace(/([^\n\r])\s*(调用工具[：:])/g, "$1\n$2")
     .replace(/([^\n\r])\s*(检索内容[：:])/g, "$1\n$2");
+}
+
+export function parseContentArg(contentArg, paramsSchema = {}) {
+  let parsedArgs = {};
+  if (!contentArg || typeof contentArg !== "string") return parsedArgs;
+  const raw = contentArg.trim();
+
+  // 1. JSON 格式解析
+  if (raw.startsWith("{") && raw.endsWith("}")) {
+    try {
+      parsedArgs = JSON.parse(raw);
+      if (parsedArgs && typeof parsedArgs === "object" && !Array.isArray(parsedArgs)) {
+        return parsedArgs;
+      }
+    } catch {}
+    parsedArgs = {};
+  }
+
+  // 2. 键值对提取（支持中英文键名与全角半角冒号）
+  const kvRegex = /([\w\u4e00-\u9fa5]+)\s*[:：]\s*([^,\n\r;]+)/g;
+  let match;
+  while ((match = kvRegex.exec(raw)) !== null) {
+    const rawKey = match[1].trim().toLowerCase();
+    const val = match[2].trim().replace(/^`+|`+$/g, "");
+
+    if (/^(?:仓库|repo|repository|项目)$/.test(rawKey)) {
+      if (val.includes("/")) {
+        const slashIdx = val.indexOf("/");
+        parsedArgs.owner = val.slice(0, slashIdx).trim();
+        parsedArgs.repo = val.slice(slashIdx + 1).trim();
+      } else {
+        parsedArgs.repo = val;
+      }
+    } else if (/^(?:所有者|owner|user|用户|组织|org)$/.test(rawKey)) {
+      parsedArgs.owner = val;
+    } else if (/^(?:路径|path|文件|file|filepath|filename)$/.test(rawKey)) {
+      parsedArgs.path = val;
+    } else if (/^(?:分支|branch|ref|引用)$/.test(rawKey)) {
+      parsedArgs.branch = val;
+      parsedArgs.ref = val;
+    } else if (/^(?:说明|message|commit|msg)$/.test(rawKey)) {
+      parsedArgs.message = val;
+    } else if (/^(?:查询|query|q|检索)$/.test(rawKey)) {
+      parsedArgs.query = val;
+      parsedArgs.q = val;
+    } else if (/^(?:动作|action|method|操作)$/.test(rawKey)) {
+      parsedArgs.action = val;
+      parsedArgs.method = val;
+    } else if (/^(?:代码|code|脚本)$/.test(rawKey)) {
+      parsedArgs.code = val;
+    } else if (/^(?:网址|url|start_url|地址)$/.test(rawKey)) {
+      parsedArgs.url = val;
+      parsedArgs.start_url = val;
+    } else if (/^(?:会话|session|session_id)$/.test(rawKey)) {
+      parsedArgs.session_id = val;
+    } else if (/^(?:old_str|待替换代码|原始代码)$/.test(rawKey)) {
+      parsedArgs.old_str = val;
+    } else if (/^(?:new_str|新代码|替换后代码)$/.test(rawKey)) {
+      parsedArgs.new_str = val;
+    } else {
+      parsedArgs[rawKey] = val;
+    }
+  }
+
+  // 3. 兜底提取 owner / repo
+  if ((paramsSchema.owner || paramsSchema.repo) && (!parsedArgs.owner || !parsedArgs.repo)) {
+    const repoMatch = raw.match(/\b([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+)\b/);
+    if (repoMatch) {
+      if (!parsedArgs.owner) parsedArgs.owner = repoMatch[1].trim();
+      if (!parsedArgs.repo) parsedArgs.repo = repoMatch[2].trim();
+    }
+  }
+
+  // 4. 兜底提取 path
+  if (paramsSchema.path && !parsedArgs.path) {
+    const pathMatch =
+      raw.match(/(?:路径|path|文件|file)[:：\s]*([^\s,;，；]+(?:\.[a-zA-Z0-9_]+|\/[^\s,;，；]+))/i) ||
+      raw.match(/\b([a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)+\.[a-zA-Z0-9_]+)\b/);
+    if (pathMatch) {
+      parsedArgs.path = pathMatch[1].trim();
+    }
+  }
+
+  // 5. 过滤清洗
+  const result = {};
+  for (const [k, v] of Object.entries(parsedArgs)) {
+    if (paramsSchema[k]) {
+      result[k] = v;
+    }
+  }
+
+  if (paramsSchema.owner && parsedArgs.owner) result.owner = parsedArgs.owner;
+  if (paramsSchema.repo && parsedArgs.repo) result.repo = parsedArgs.repo;
+  if (paramsSchema.path && parsedArgs.path) result.path = parsedArgs.path;
+  if (paramsSchema.branch && parsedArgs.branch) result.branch = parsedArgs.branch;
+  if (paramsSchema.ref && parsedArgs.ref) result.ref = parsedArgs.ref;
+
+  // 6. 如果仍然未得到任何参数，回退到 schema 单一参数
+  if (Object.keys(result).length === 0) {
+    if (paramsSchema.query) result.query = raw;
+    else if (paramsSchema.q) result.q = raw;
+    else if (paramsSchema.path) result.path = raw;
+    else if (paramsSchema.files) result.files = [raw];
+    else {
+      const properties = Object.keys(paramsSchema);
+      if (properties.length === 1) result[properties[0]] = raw;
+    }
+  }
+
+  return result;
 }
 
 export function parseTextToolCalls(text, activeTools) {
@@ -37,10 +148,14 @@ export function parseTextToolCalls(text, activeTools) {
     const rawToolName = match[2].trim();
     let contentArg = match[3].trim().replace(/^`+|`+$/g, "").trim();
 
+    const resolvedInfo = findToolInfo(rawToolName);
     const matchedTool = activeTools.find((t) => {
       if (!t) return false;
       const toolName = t.function?.name || t.name || "";
       if (!toolName) return false;
+      if (resolvedInfo && (toolName === resolvedInfo.key || toolName === resolvedInfo.rawName)) {
+        return true;
+      }
       return (
         toolName === rawToolName ||
         toolName.endsWith(`_${rawToolName}`) ||
@@ -49,48 +164,15 @@ export function parseTextToolCalls(text, activeTools) {
       );
     });
 
-    if (!matchedTool) continue;
-    const finalToolName = matchedTool.function?.name || matchedTool.name || rawToolName;
-    const paramsSchema = matchedTool.function?.parameters?.properties || matchedTool.parameters?.properties || {};
+    if (!matchedTool && !resolvedInfo) continue;
+    const finalToolName = resolvedInfo?.key || matchedTool?.function?.name || matchedTool?.name || rawToolName;
+    const paramsSchema =
+      matchedTool?.function?.parameters?.properties ||
+      matchedTool?.parameters?.properties ||
+      resolvedInfo?.openAiTool?.function?.parameters?.properties ||
+      {};
 
-    let parsedArgs = {};
-    if (contentArg.startsWith("{") && contentArg.endsWith("}")) {
-      try {
-        parsedArgs = JSON.parse(contentArg);
-      } catch {}
-    }
-
-    if (Object.keys(parsedArgs).length === 0 && paramsSchema.owner && paramsSchema.repo) {
-      const repoPathMatch = contentArg.match(/^([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+)(?::(.*))?$/);
-      if (repoPathMatch) {
-        parsedArgs.owner = repoPathMatch[1].trim();
-        parsedArgs.repo = repoPathMatch[2].trim();
-        const filePath = (repoPathMatch[3] || "").trim().replace(/^[:/\\s]+/, "").replace(/^`|`$/g, "");
-        if (paramsSchema.path && filePath) parsedArgs.path = filePath;
-      }
-    }
-
-    if (Object.keys(parsedArgs).length === 0 && contentArg.includes(":")) {
-      const kvMatches = contentArg.matchAll(/([a-zA-Z0-9_]+)\s*[:：]\s*([^,\n]+)/g);
-      for (const m of kvMatches) {
-        const k = m[1].trim();
-        const v = m[2].trim();
-        if (paramsSchema[k]) {
-          parsedArgs[k] = v;
-        }
-      }
-    }
-
-    if (Object.keys(parsedArgs).length === 0) {
-      if (paramsSchema.query) parsedArgs.query = contentArg;
-      else if (paramsSchema.q) parsedArgs.q = contentArg;
-      else if (paramsSchema.path) parsedArgs.path = contentArg;
-      else if (paramsSchema.files) parsedArgs.files = [contentArg];
-      else {
-        const properties = Object.keys(paramsSchema);
-        if (properties.length === 1) parsedArgs[properties[0]] = contentArg;
-      }
-    }
+    const parsedArgs = parseContentArg(contentArg, paramsSchema);
 
     calls.push({
       id: `call_text_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
@@ -442,8 +524,7 @@ export function buildChineseToolGoal(rawAction, args = {}, toolMeta = null, acti
 export function formatToolActionCard(toolCall, activeTools = [], userText = "", hasPendingBuild = false) {
   if (!toolCall) return "";
   const toolName = toolCall.function?.name || toolCall.name || "unknown_tool";
-  const toolInfo = mcpToolRegistry.get(toolName) || Array.from(mcpToolRegistry.entries())
-    .find(([key, info]) => key.endsWith(toolName) || (info?.rawName && toolName.endsWith(info.rawName)))?.[1];
+  const toolInfo = findToolInfo(toolName);
   const rawAction = toolInfo?.rawName || toolName;
   const rawArguments = toolCall.function?.arguments ?? toolCall.arguments;
   const parsedArguments = toolArguments({ function: { arguments: rawArguments } }) || {};
@@ -1446,11 +1527,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
         let mcpCalls = toolCalls.filter((tc) => {
           const name = tc?.function?.name || tc?.name;
           if (!name) return false;
-          if (mcpToolRegistry.has(name)) return true;
-          for (const [k, v] of mcpToolRegistry.entries()) {
-            if (k.endsWith(name) || (v?.rawName && name.endsWith(v.rawName))) return true;
-          }
-          return false;
+          return Boolean(findToolInfo(name));
         });
 
         let usedTextToolCallFallback = false;
@@ -1523,15 +1600,9 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
           }
 
           const toolCallName = tc.function?.name || tc.name || "";
-          let toolInfo = mcpToolRegistry.get(toolCallName);
-          if (!toolInfo && toolCallName) {
-            for (const [k, v] of mcpToolRegistry.entries()) {
-              if (k.endsWith(toolCallName) || (v?.rawName && toolCallName.endsWith(v.rawName))) {
-                toolInfo = v;
-                break;
-              }
-            }
-          }
+          const toolInfo = findToolInfo(toolCallName);
+          const resolvedToolKey = toolInfo?.key || toolCallName;
+          const displayName = toolInfo?.serverName || "MCP";
           const rawAction = toolInfo?.rawName || toolCallName;
           const isWrite = isWriteTool(rawAction);
           const isActions = /actions_(list|get)/i.test(rawAction);
@@ -1551,7 +1622,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
             resultText = JSON.stringify({ error: errorMessage });
             isToolError = true;
           } else {
-            const callKey = generateToolCallKey(toolCallName, args);
+            const callKey = generateToolCallKey(resolvedToolKey, args);
             const prevAttempts = toolCallHistory.get(callKey) || 0;
             isCommitBuildPoll = (hasBuildTriggered || hasPendingBuildVerification) && isActions && (args.method === "list_workflow_runs" || !args.method);
 
@@ -1576,7 +1647,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                 }
                 let toolRes = null;
                 try {
-                  toolRes = await callMcpTool(toolCallName, args);
+                  toolRes = await callMcpTool(resolvedToolKey, args);
                 } catch (err) {
                   const msg = err instanceof Error ? err.message : "获取构建状态失败";
                   errorMessage = extractErrorMessage(msg);
@@ -1603,7 +1674,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                     }
                     if (abortSignal?.aborted || clientResponse.destroyed) break;
                     try {
-                      toolRes = await callMcpTool(toolCallName, args);
+                      toolRes = await callMcpTool(resolvedToolKey, args);
                       buildStatus = checkPrimaryBuildStatus(toolRes.content, primaryWorkflowName, lastWriteTimestamp);
                     } catch {
                       break;
@@ -1638,7 +1709,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                   resultText = JSON.stringify({ note: "已多次复用该工具的缓存结果，当前信息完整且最新。请直接根据已有信息继续执行或回答用户。" });
                 } else {
                   resultText = cachedContent;
-                  addDebugLog("TOOL", `MCP 工具 [${toolCallName}] 命中本次对话只读缓存，直接复用 (${cachedContent.length} 字符)`, { arguments: args });
+                  addDebugLog("TOOL", `MCP 工具 [${resolvedToolKey}] 命中本次对话只读缓存，直接复用 (${cachedContent.length} 字符)`, { arguments: args });
                 }
                 isToolError = false;
               } else if (prevAttempts >= 3) {
@@ -1648,7 +1719,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
               } else {
                 toolCallHistory.set(callKey, prevAttempts + 1);
                 try {
-                  const toolRes = await callMcpTool(toolCallName, args);
+                  const toolRes = await callMcpTool(resolvedToolKey, args);
                   resultText = toolRes.content;
                   isToolError = toolRes.isError;
                   if (isToolError && !errorMessage) {
@@ -1838,11 +1909,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
       let mcpCalls = accumulatedToolCalls.filter((tc) => {
         const name = tc?.function?.name || tc?.name;
         if (!name) return false;
-        if (mcpToolRegistry.has(name)) return true;
-        for (const [k, v] of mcpToolRegistry.entries()) {
-          if (k.endsWith(name) || (v?.rawName && name.endsWith(v.rawName))) return true;
-        }
-        return false;
+        return Boolean(findToolInfo(name));
       });
 
       let usedTextToolCallFallback = false;
@@ -1928,16 +1995,8 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
         }
 
         const toolCallName = tc.function?.name || tc.name || "";
-        let toolInfo = mcpToolRegistry.get(toolCallName);
-        if (!toolInfo && toolCallName) {
-          for (const [k, v] of mcpToolRegistry.entries()) {
-            if (k.endsWith(toolCallName) || (v?.rawName && toolCallName.endsWith(v.rawName))) {
-              toolInfo = v;
-              break;
-            }
-          }
-        }
-
+        const toolInfo = findToolInfo(toolCallName);
+        const resolvedToolKey = toolInfo?.key || toolCallName;
         const displayName = toolInfo?.serverName || "MCP";
         const rawAction = toolInfo?.rawName || toolCallName;
         const isWrite = isWriteTool(rawAction);
@@ -1959,7 +2018,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
           resultText = JSON.stringify({ error: errorMessage });
           isToolError = true;
         } else {
-          const callKey = generateToolCallKey(toolCallName, args);
+          const callKey = generateToolCallKey(resolvedToolKey, args);
           const prevAttempts = toolCallHistory.get(callKey) || 0;
           isCommitBuildPoll = (hasBuildTriggered || hasPendingBuildVerification) && isActions && (args.method === "list_workflow_runs" || !args.method);
 
@@ -2005,7 +2064,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
               // 2. 首次查询构建状态
               let toolRes = null;
               try {
-                toolRes = await callMcpTool(toolCallName, args);
+                toolRes = await callMcpTool(resolvedToolKey, args);
               } catch (err) {
                 const msg = err instanceof Error ? err.message : "获取构建状态失败";
                 errorMessage = extractErrorMessage(msg);
@@ -2043,7 +2102,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                   if (abortSignal?.aborted || clientResponse.destroyed) break;
 
                   try {
-                    toolRes = await callMcpTool(toolCallName, args, null);
+                    toolRes = await callMcpTool(resolvedToolKey, args, null);
                     buildStatus = checkPrimaryBuildStatus(toolRes.content, primaryWorkflowName, lastWriteTimestamp);
                   } catch {
                     break;
@@ -2101,7 +2160,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                 resultText = JSON.stringify({ note: "已多次复用该工具的缓存结果，当前信息完整且最新。请直接根据已有信息继续执行或回答用户。" });
               } else {
                 resultText = cachedContent;
-                addDebugLog("TOOL", `MCP 工具 [${toolCallName}] 命中本次对话只读缓存，直接复用 (${cachedContent.length} 字符)`, { arguments: args });
+                addDebugLog("TOOL", `MCP 工具 [${resolvedToolKey}] 命中本次对话只读缓存，直接复用 (${cachedContent.length} 字符)`, { arguments: args });
               }
               isToolError = false;
             } else if (prevAttempts >= 3) {
@@ -2129,7 +2188,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                     );
                   }
                 };
-                const toolRes = await callMcpTool(toolCallName, args, onWaitNotice);
+                const toolRes = await callMcpTool(resolvedToolKey, args, onWaitNotice);
                 resultText = toolRes.content;
                 isToolError = toolRes.isError;
                 if (isToolError && !errorMessage) {
