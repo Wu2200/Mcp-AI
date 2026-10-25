@@ -96,12 +96,12 @@ export function parseContentArg(contentArg, paramsSchema = {}, contextText = "")
     if (!parsedArgs.repo || parsedArgs.repo === "Wu22") parsedArgs.repo = repoMatchInRaw[2].trim();
   }
 
-  // 若 owner 依然缺失，从上下文 contextText 中寻找诸如 Wu2200/OpenMCP
-  if (paramsSchema.owner && (!parsedArgs.owner || parsedArgs.owner === "Wu22")) {
+  // 若 owner 或 repo 依然缺失，从上下文 contextText 中寻找诸如 Wu2200/OpenMCP
+  if ((paramsSchema.owner || paramsSchema.repo) && (!parsedArgs.owner || !parsedArgs.repo || parsedArgs.owner === "Wu22")) {
     const ctxRepoMatch = contextText.match(/\b([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+)\b/);
     if (ctxRepoMatch) {
-      parsedArgs.owner = ctxRepoMatch[1].trim();
-      if (!parsedArgs.repo) parsedArgs.repo = ctxRepoMatch[2].trim();
+      if (!parsedArgs.owner || parsedArgs.owner === "Wu22") parsedArgs.owner = ctxRepoMatch[1].trim();
+      if (!parsedArgs.repo || parsedArgs.repo === "Wu22") parsedArgs.repo = ctxRepoMatch[2].trim();
     }
   }
 
@@ -173,16 +173,24 @@ function coerceArgTypes(args, schema = {}) {
   return coerced;
 }
 
-export function parseTextToolCalls(text, activeTools, contextText = "") {
+export function parseTextToolCalls(text, activeTools, contextText = "", requireTrailingNewlineOnLast = false) {
   if (!text || typeof text !== "string" || !Array.isArray(activeTools) || activeTools.length === 0) {
     return [];
   }
   const cleanText = formatCardMarkdown(text);
-  const regex = /目标说明[：:]\s*([^\n\r]*)\r?\n+调用工具[：:]\s*`?([a-zA-Z0-9_\-]+)`?\r?\n+检索内容[：:]\s*`?([\s\S]*?)`?(?=(?:\r?\n\s*目标说明[：:]|\r?\n\s*调用工具[：:]|$))/g;
+  const regex = /目标说明[：:]\s*([^\n\r]*)\r?\n+调用工具[：:]\s*`?([a-zA-Z0-9_\-]+)`?\r?\n+检索内容[：:]\s*`?([^\n\r`]+)`?(?=(?:\r?\n|$))/g;
   const calls = [];
   let match;
 
   while ((match = regex.exec(cleanText)) !== null) {
+    // 若在流式实时检测阶段要求最后一张卡片必须已经输出完换行符，则检查匹配末尾是否已有换行
+    if (requireTrailingNewlineOnLast) {
+      const afterMatch = cleanText.slice(match.index + match[0].length);
+      if (!/^\r?\n/.test(afterMatch)) {
+        continue;
+      }
+    }
+
     const rawToolName = match[2].trim();
     let contentArg = match[3].trim().replace(/^`+|`+$/g, "").trim();
 
@@ -1222,9 +1230,9 @@ export async function passThroughAndTransformGemini(requestBody, clientResponse,
       break;
     }
 
-    fullAccumulatedContent += roundContent;
+    fullAccumulatedContent += accumulatedContent;
 
-    if (isTruncatedFinishReason(lastFinishReason) && roundContent && !abortSignal?.aborted && !clientResponse.destroyed) {
+    if (isTruncatedFinishReason(lastFinishReason) && accumulatedContent && !abortSignal?.aborted && !clientResponse.destroyed) {
       continueRound += 1;
       addDebugLog("AGENT", `⚠️ [抗截断触发] 检测到上游返回截断 (${lastFinishReason})！正在自动进行第 ${continueRound} 次无感断点续接...`, {
         round: continueRound,
@@ -1398,7 +1406,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
   });
 
   const systemRules = [
-    "【工具调用与构建验证规范】\n1. 单轮最多规划并发调用 3 个最相关的真实工具；若目标较多，先执行优先级最高的 1~3 项，取得结果后再决定下一步，禁止一次性铺开大量调用。\n2. 严禁提前输出总结或草稿：在所有信息收集、操作执行或构建验证全部完成之前，严禁在中间轮次输出结论、答复文本或开场白！\n3. 【排查与修改代码纪律】\n- 严禁盲目翻阅历史 Commit：排查 Bug 或理解逻辑时，严禁连续翻看十几个历史 Commit！必须直接使用 get_file_contents 查看文件当前在 main 分支的最新真实代码！历史 Commit 仅供追溯特定提交使用，切勿拿旧 Commit 代码当成当前文件，否则会导致修改失败。\n- 局部编辑 old_str 规范：必须直接从 get_file_contents 获取到的最新代码中复制。系统已支持语法容错与省略通配符（如 MISMATCH 或 ...），但请勿编造不存在的函数！如涉及大面积重写，可直接使用 create_or_update_file 覆盖写入完整文件。\n4. 【代码修改与云端构建闭环规范】\n- 当任务涉及多个文件或多步修改时，先连续执行所有文件的修改与提交，切勿在中间阶段等待构建！\n- 仅当所有代码与文件均已全部修改完毕（项目最终就绪）后：\n  - 若该仓库配置了云端 CI/CD 构建（例如 iOS 打包、自动化测试、Docker 编译等），必须发起一次 actions_list（method: 'list_workflow_runs'）来等待并验证最终修改触发的云端构建结果！\n  - 严禁在修改完全部代码后直接向用户回复“已修改完成”而未确认最终构建是否成功！\n  - 服务端会在底层自动精准匹配最后一次代码提交所触发的构建任务，并进行动态轮询等待（无需担心超时）。\n- 若云端构建成功，向用户汇报修改详情与构建成功结果；\n- 若云端构建失败（failure），必须激活自愈闭环：调用 get_job_logs 查看编译错误日志，分析报错原因并修复代码，修复后再次等待最终构建通过！\n- 若用户仅是查询历史构建耗时或记录，直接查询即可，无需等待。\n5. 优先使用原生 Tool Calls。仅当上游未发出原生调用时，才允许使用操作卡片作为兼容兜底；每轮最多 3 张，且必须对应真实工具调用。多个卡片之间必须使用双换行（\\n\\n）空行彻底分隔，严禁单行连续粘连：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n6. 核心执行约束：输出上述操作卡片的同时，必须同时发起真实的底层工具调用（Tool Calls），严禁仅在正文中打印卡片文本而不发起工具调用！\n7. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n8. 当所有工具调用完毕、进入最终答复轮次时，直接输出完整最终解答，终局轮次严禁输出操作卡片。"
+    "【工具调用与构建验证规范】\n1. 单轮最多规划并发调用 3 个最相关的真实工具；若目标较多，先执行优先级最高的 1~3 项，取得结果后再决定下一步，禁止一次性铺开大量调用。\n2. 严禁提前输出总结或草稿：在所有信息收集、操作执行或构建验证全部完成之前，严禁在中间轮次输出结论、答复文本或开场白！\n3. 【排查与修改代码纪律】\n- 严禁盲目翻阅历史 Commit：排查 Bug 或理解逻辑时，严禁连续翻看历史 Commit！必须直接使用 get_file_contents 查看文件当前在 main 分支的最新真实代码！切勿拿以前对话的旧记忆或历史 Commit 代码当成当前文件。\n- 局部编辑 old_str 规范：必须直接从本次对话中 get_file_contents 获取到的最新代码中原样复制。对同一个文件的多处修改请合并在同一个 github_edit_file 调用的 edits 数组中，禁止在同一轮对同一个文件发起两次独立的 github_edit_file 调用！\n4. 【代码修改与云端构建闭环规范】\n- 当任务涉及多个文件或多步修改时，先连续执行所有文件的修改与提交，切勿在中间阶段等待构建！\n- 仅当所有代码与文件均已全部修改完毕（项目最终就绪）后：\n  - 若该仓库配置了云端 CI/CD 构建（例如 iOS 打包、自动化测试、Docker 编译等），必须发起一次 actions_list（method: 'list_workflow_runs'）来等待并验证最终修改触发的云端构建结果！\n  - 严禁在修改完全部代码后直接向用户回复“已修改完成”而未确认最终构建是否成功！\n  - 服务端会在底层自动精准匹配最后一次代码提交所触发的构建任务，并进行动态轮询等待（无需担心超时）。\n- 若云端构建成功，向用户汇报修改详情与构建成功结果；\n- 若云端构建失败（failure），必须激活自愈闭环：调用 get_job_logs 查看编译错误日志，分析报错原因并修复代码，修复后再次等待最终构建通过！\n- 若用户仅是查询历史构建耗时或记录，直接查询即可，无需等待。\n5. 优先使用原生 Tool Calls。仅当上游未发出原生调用时，才允许使用操作卡片作为兼容兜底；每轮最多 3 张，且必须对应真实工具调用。多个卡片之间必须使用双换行（\\n\\n）空行彻底分隔，严禁单行连续粘连：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n6. 核心执行约束：输出上述操作卡片的同时，必须同时发起真实的底层工具调用（Tool Calls），严禁仅在正文中打印卡片文本而不发起工具调用！\n7. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n8. 当所有工具调用完毕、进入最终答复轮次时，直接输出完整最终解答，终局轮次严禁输出操作卡片。"
   ];
   const hasCloudflare = tools.some((t) => {
     const n = (t?.function?.name || t?.name || "").toLowerCase();
@@ -1472,11 +1480,15 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
         break;
       }
 
-      if (messages.length > 30) {
-        for (let i = 0; i < messages.length - 15; i += 1) {
+      // 仅当总上下文字符数超过 650,000（约 18 万 Token）时，才对最早的非源码类庞大输出（如历史 commit patch）进行温和裁剪，严禁在普通轮次中截断已读取的文件源码！
+      const totalContextChars = messages.reduce((sum, m) => sum + (typeof m?.content === "string" ? m.content.length : 0), 0);
+      if (totalContextChars > 650000 && messages.length > 25) {
+        for (let i = 0; i < messages.length - 20; i += 1) {
           const m = messages[i];
-          if (m && m.role === "tool" && typeof m.content === "string" && m.content.length > 2000) {
-            m.content = m.content.slice(0, 1000) + "\n\n[历史输出已精简]";
+          if (m && m.role === "tool" && typeof m.content === "string" && m.content.length > 35000) {
+            if (!m.content.startsWith("successfully downloaded text file")) {
+              m.content = m.content.slice(0, 8000) + "\n\n[超长历史记录已精简]";
+            }
           }
         }
       }
@@ -1578,7 +1590,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
 
         let usedTextToolCallFallback = false;
         if (mcpCalls.length === 0 && activeTools.length > 0 && message?.content) {
-          const textCalls = parseTextToolCalls(message.content, activeTools, userText);
+          const textCalls = parseTextToolCalls(message.content, activeTools, userText, false);
           if (textCalls.length > 0) {
             usedTextToolCallFallback = true;
             addDebugLog("AGENT", `[自愈触发] 非流式检测到模型输出了 ${textCalls.length} 个操作卡片，自动转化为真实 MCP 调用`);
@@ -1633,7 +1645,13 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
         }
 
         let roundHasFailure = false;
-        const CONCURRENCY_LIMIT = 4;
+        // 如果本轮包含写操作工具，强制使用串行（concurrency = 1），防止并发修改同一文件引发 SHA 冲突
+        const hasWriteInRound = mcpCalls.some((tc) => {
+          const n = tc.function?.name || tc.name || "";
+          const info = findToolInfo(n);
+          return isWriteTool(info?.rawName || n);
+        });
+        const CONCURRENCY_LIMIT = hasWriteInRound ? 1 : 4;
         const callResults = await executeConcurrentPool(mcpCalls, CONCURRENCY_LIMIT, async (tc, index) => {
           if (abortSignal?.aborted || clientResponse.destroyed) {
             return {
@@ -1642,7 +1660,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
               isToolError: true
             };
           }
-          if (index > 0 && mcpCalls.length > 1) {
+          if (index > 0 && mcpCalls.length > 1 && CONCURRENCY_LIMIT > 1) {
             await new Promise((resolve) => setTimeout(resolve, Math.min(index * 60, 300)));
           }
 
@@ -1887,8 +1905,9 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
               if (delta?.content) {
                 assistantContent += delta.content;
 
+                // 流式实时检测操作卡片：必须要求第 3 张卡片末尾已经完整输出了换行符（requireTrailingNewlineOnLast = true），严禁在半句话时提前截断流！
                 if (!hasToolCalls && activeTools.length > 0) {
-                  const textCalls = parseTextToolCalls(assistantContent, activeTools, userText);
+                  const textCalls = parseTextToolCalls(assistantContent, activeTools, userText, true);
                   if (textCalls.length >= MAX_TOOL_CALLS_PER_ROUND) {
                     stoppedForTextToolCalls = true;
                     await reader.cancel().catch(() => {});
@@ -1962,7 +1981,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
 
       let usedTextToolCallFallback = false;
       if (mcpCalls.length === 0 && activeTools.length > 0 && assistantContent) {
-        const textCalls = parseTextToolCalls(assistantContent, activeTools, userText);
+        const textCalls = parseTextToolCalls(assistantContent, activeTools, userText, false);
         if (textCalls.length > 0) {
           usedTextToolCallFallback = true;
           addDebugLog("AGENT", `[自愈触发] 流式检测到模型仅输出了 ${textCalls.length} 个操作卡片而未触发原生 tool_calls，自动转化为真实 MCP 调用`);
@@ -2030,7 +2049,13 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
       });
 
       let roundHasFailure = false;
-      const CONCURRENCY_LIMIT = 4;
+      // 如果本轮包含写操作工具，强制使用串行（concurrency = 1），防止同一轮并发修改同一文件引发 SHA 冲突
+      const hasWriteInRound = mcpCalls.some((tc) => {
+        const n = tc.function?.name || tc.name || "";
+        const info = findToolInfo(n);
+        return isWriteTool(info?.rawName || n);
+      });
+      const CONCURRENCY_LIMIT = hasWriteInRound ? 1 : 4;
       const callResults = await executeConcurrentPool(mcpCalls, CONCURRENCY_LIMIT, async (tc, index) => {
         if (abortSignal?.aborted || clientResponse.destroyed) {
           return {
@@ -2039,7 +2064,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
             isToolError: true
           };
         }
-        if (index > 0 && mcpCalls.length > 1) {
+        if (index > 0 && mcpCalls.length > 1 && CONCURRENCY_LIMIT > 1) {
           await new Promise((resolve) => setTimeout(resolve, Math.min(index * 60, 300)));
         }
 
