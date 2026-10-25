@@ -33,7 +33,8 @@ import {
   sendJson,
   sendOpenAIError,
   readRequestBody,
-  addDebugLog
+  addDebugLog,
+  startNewConversationLog
 } from "./src/store.js";
 import {
   loadMcpServersFromStorage,
@@ -538,6 +539,21 @@ const server = http.createServer(async (request, response) => {
         return;
       }
 
+      const lastContent = Array.isArray(body?.contents) ? body.contents[body.contents.length - 1] : null;
+      let geminiPromptText = "";
+      if (Array.isArray(lastContent?.parts)) {
+        geminiPromptText = lastContent.parts.map((p) => p.text || "").join(" ");
+      }
+      const isTitleReq = isTitleGenerationRequest(geminiPromptText);
+      if (!isTitleReq) {
+        startNewConversationLog({
+          model: modelName,
+          channel: getActiveChannel()?.name || "默认",
+          userPrompt: geminiPromptText ? geminiPromptText.slice(0, 500) : "非文本内容",
+          stream: isStream
+        });
+      }
+
       const abortController = new AbortController();
       let clientDisconnectedLogged = false;
       const onClientClose = () => {
@@ -626,7 +642,17 @@ const server = http.createServer(async (request, response) => {
         const lastMsgText = typeof lastMsg?.content === "string"
           ? lastMsg.content
           : (Array.isArray(lastMsg?.content) ? lastMsg.content.map((c) => c.text || "").join(" ") : "");
-        const mcpEnabled = isModelEnabledForMcp(body.model) && mcpToolRegistry.size > 0 && !isTitleGenerationRequest(lastMsgText);
+        const isTitleReq = isTitleGenerationRequest(lastMsgText);
+        const mcpEnabled = isModelEnabledForMcp(body.model) && mcpToolRegistry.size > 0 && !isTitleReq;
+
+        if (!isTitleReq) {
+          startNewConversationLog({
+            model: body.model || "default",
+            channel: channel.name,
+            userPrompt: lastMsgText ? lastMsgText.slice(0, 500) : "非文本内容",
+            stream: body.stream === true
+          });
+        }
 
         addDebugLog("DOWNSTREAM", `收到客户端请求 [${body.model || "default"}] -> 渠道 [${channel.name}] - stream=${body.stream === true}`, {
           channel: channel.name,
