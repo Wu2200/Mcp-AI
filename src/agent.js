@@ -1588,7 +1588,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
   });
 
   const systemRules = [
-    "【工具调用与构建验证规范】\n1. 单轮最多规划并发调用 3 个最相关的真实工具；若目标较多，先执行优先级最高的 1~3 项，取得结果后再决定下一步，禁止一次性铺开大量调用。\n2. 严禁提前输出总结或草稿：在所有信息收集、操作执行或构建验证全部完成之前，严禁在中间轮次输出结论、答复文本或开场白！\n3. 【排查与修改代码纪律】\n- 严禁盲目翻阅历史 Commit：排查 Bug 或理解逻辑时，严禁连续翻看历史 Commit！必须直接使用 get_file_contents 查看文件当前在 main 分支的最新真实代码！切勿拿以前对话的旧记忆或历史 Commit 代码当成当前文件。\n- 局部编辑 old_str 规范：必须直接从本次对话中 get_file_contents 获取到的最新完整代码中原样复制。若某文件在较早轮次读取且被折叠，严禁使用带折叠标记的代码作为 old_str，必须先调用一次 get_file_contents 重新获取最新完整代码后再进行局部替换！对同一个文件的多处修改请合并在同一个 github_edit_file 调用的 edits 数组中，禁止在同一轮对同一个文件发起两次独立的 github_edit_file 调用！\n4. 【大范围排查与阅读规范】\n- 当用户要求全面排查、检查全项目或寻找无用代码时，请先通过 get_repository_tree 宏观梳理工程架构与核心模块，有针对性地逐步深入，切勿在单轮内一次性盲目读取所有数十个源码文件导致上下文过度膨胀；每轮重点分析 1~3 个核心文件并提取关键发现。\n5. 【代码修改与云端构建闭环规范】\n- 当任务涉及多个文件或多步修改时，先连续执行所有文件的修改与提交，切勿在中间阶段等待构建！\n- 仅当所有代码与文件均已全部修改完毕（项目最终就绪）后：\n  - 若该仓库配置了云端 CI/CD 构建（例如 iOS 打包、自动化测试、Docker 编译等），必须发起一次 actions_list（method: 'list_workflow_runs'）来等待并验证最终修改触发的云端构建结果！\n  - 严禁在修改完全部代码后直接向用户回复“已修改完成”而未确认最终构建是否成功！\n  - 服务端会在底层自动精准匹配最后一次代码提交所触发的构建任务，并进行动态轮询等待（无需担心超时）。\n- 若云端构建成功，向用户汇报修改详情与构建成功结果；\n- 若云端构建失败（failure），必须激活自愈闭环：调用 get_job_logs 查看编译错误日志，分析报错原因并修复代码，修复后再次等待最终构建通过！\n- 若用户仅是查询历史构建耗时或记录，直接查询即可，无需等待。\n6. 优先使用原生 Tool Calls。仅当上游未发出原生调用时，才允许使用操作卡片作为兼容兜底；每轮最多 3 张，且必须对应真实工具调用。多个卡片之间必须使用双换行（\\n\\n）空行彻底分隔，严禁单行连续粘连：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n7. 核心执行约束：输出上述操作卡片的同时，必须同时发起真实的底层工具调用（Tool Calls），严禁仅在正文中打印卡片文本而不发起工具调用！\n8. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n9. 当所有工具调用完毕、进入最终答复轮次时，直接输出完整最终解答，终局轮次严禁输出操作卡片。"
+    "【工具调用与构建验证规范】\n1. 单轮最多规划并发调用 5 个最相关的真实工具；若目标较多，先执行优先级最高的工具，取得结果后再决定下一步，禁止一次性铺开大量无效调用。\n2. 严禁提前输出总结或草稿：在所有信息收集、操作执行或构建验证全部完成之前，严禁在中间轮次输出结论、答复文本或开场白！\n3. 【修改前完整推演，严禁边改边补】\n- 修改代码前必须先通过阅读与搜索，将涉及该问题的全链路逻辑（如外层手势拦截、点击冲突、父子组件结构、事件传递、协议与配套实现）彻底排查清楚并一次性规划好全部改动点。严禁在未理清全链路前草率先改一个文件，导致中途反复修改修补！\n- 严禁盲目翻阅历史 Commit：排查 Bug 或理解逻辑时，严禁连续翻看历史 Commit！必须直接使用 get_file_contents 查看文件当前在 main 分支的最新真实代码！切勿拿以前对话的旧记忆或历史 Commit 代码当成当前文件。\n- 局部编辑 old_str 规范：必须直接从本次对话中 get_file_contents 获取到的最新完整代码中原样复制。若某文件在较早轮次读取且被折叠，严禁使用带折叠标记的代码作为 old_str，必须先调用一次 get_file_contents 重新获取最新完整代码后再进行局部替换！对同一个文件的多处修改必须合并在同一个 github_edit_file 调用的 edits 数组中，严禁在同一轮对同一个文件发起两次独立的 github_edit_file 调用！\n4. 【大范围排查与阅读规范】\n- 当用户要求全面排查、检查全项目或寻找无用代码时，请先通过 get_repository_tree 宏观梳理工程架构与核心模块，有针对性地逐步深入，切勿在单轮内一次性盲目读取所有数十个源码文件导致上下文过度膨胀；每轮重点分析 1~3 个核心文件并提取关键发现。\n5. 【一次性集中修改与终局构建验证规范】\n- 当任务涉及多个文件或多步修改时，先连续集中完成所有文件的修改与提交，切勿在中间阶段等待构建！\n- 严禁在同一轮中一边读取文件/搜索代码、一边调用 actions_list！如果本轮还在审查或修改代码，说明任务尚未收敛，严禁调用 actions_list！\n- 仅当所有代码与文件均已全部修改完毕、且本轮不再调用任何读取、搜索或写工具时（项目彻底就绪）：\n  - 若该仓库配置了云端 CI/CD 构建（例如 iOS 打包、自动化测试、Docker 编译等），在独立终局轮次发起一次 actions_list（method: 'list_workflow_runs'）来等待并验证最终修改触发的云端构建结果！\n  - 服务端会在底层自动精准匹配最后一次代码提交所触发的构建任务，并进行动态轮询等待（无需担心超时）。\n- 若云端构建成功，向用户汇报修改详情与构建成功结果；\n- 若云端构建失败（failure），必须激活自愈闭环：调用 get_job_logs 查看编译错误日志，分析报错原因并修复代码，修复后再次等待最终构建通过！\n- 若用户仅是查询历史构建耗时或记录，直接查询即可，无需等待。\n6. 优先使用原生 Tool Calls。仅当上游未发出原生调用时，才允许使用操作卡片作为兼容兜底；每轮最多 5 张，且必须对应真实工具调用。多个卡片之间必须使用双换行（\\n\\n）空行彻底分隔，严禁单行连续粘连：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n7. 核心执行约束：输出上述操作卡片的同时，必须同时发起真实的底层工具调用（Tool Calls），严禁仅在正文中打印卡片文本而不发起工具调用！\n8. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n9. 当所有工具调用完毕、进入最终答复轮次时，直接输出完整最终解答，终局轮次严禁输出操作卡片。"
   ];
   const hasCloudflare = tools.some((t) => {
     const n = (t?.function?.name || t?.name || "").toLowerCase();
@@ -1648,12 +1648,13 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
   let hasWriteSuccess = false;
   let lastWriteTimestamp = 0;
   let hasPendingBuildVerification = false;
+  let hasEverCompletedBuildSuccess = false;
   const toolCallHistory = new Map();
   const dialogReadCache = new Map();
   let consecutiveFailures = 0;
   const displayedActionCards = [];
   const MAX_AGENT_ROUNDS = 35;
-  const MAX_TOOL_CALLS_PER_ROUND = 3;
+  const MAX_TOOL_CALLS_PER_ROUND = 5;
 
   try {
     for (let round = 0; round < MAX_AGENT_ROUNDS; round += 1) {
@@ -1869,6 +1870,15 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
           const info = findToolInfo(n);
           return isWriteTool(info?.rawName || n);
         });
+
+        // 检查本轮是否混杂了除 Actions 之外的其他工作（例如代码读取、搜索、修改）
+        const hasOtherWorkInRound = mcpCalls.some((tc) => {
+          const n = (tc.function?.name || tc.name || "").toLowerCase();
+          const info = findToolInfo(n);
+          const raw = (info?.rawName || n).toLowerCase();
+          return !raw.startsWith("actions_");
+        });
+
         const CONCURRENCY_LIMIT = hasWriteInRound ? 1 : 4;
         const callResults = await executeConcurrentPool(mcpCalls, CONCURRENCY_LIMIT, async (tc, index) => {
           if (abortSignal?.aborted || clientResponse.destroyed) {
@@ -1889,6 +1899,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
           const rawAction = toolInfo?.rawName || toolCallName;
           const isWrite = isWriteTool(rawAction);
           const isActions = /actions_(list|get)/i.test(rawAction);
+          const isActionsListMethod = isActions && (args.method === "list_workflow_runs" || !args.method);
           const isTrigger = /actions_run_trigger/i.test(rawAction);
           const rawArgs = tc.function?.arguments ?? tc.arguments;
           const args = toolArguments({ function: { arguments: rawArgs } });
@@ -1908,7 +1919,9 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
           } else {
             const callKey = generateToolCallKey(resolvedToolKey, args);
             const prevAttempts = toolCallHistory.get(callKey) || 0;
-            isCommitBuildPoll = (hasBuildTriggered || hasPendingBuildVerification) && isActions && (args.method === "list_workflow_runs" || !args.method);
+
+            // 仅当：修改已就绪、本轮未混杂任何其他代码读写、且（此前未成功验证过或上次失败了）时，才启动 130 秒云端构建阻塞等待！
+            isCommitBuildPoll = (hasBuildTriggered || hasPendingBuildVerification) && isActionsListMethod && !hasOtherWorkInRound && (!hasEverCompletedBuildSuccess || actionsWaitChecked === false);
 
             if (isCommitBuildPoll) {
               if (actionsWaitChecked) {
@@ -1970,14 +1983,17 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                     actionsWaitChecked = false;
                     hasPendingBuildVerification = false;
                     hasBuildTriggered = false;
+                    hasEverCompletedBuildSuccess = false;
                     resultText = `${toolRes.content}\n\n【构建失败自愈提示】检测到主要构建 [${primaryWorkflowName}] 失败 (${buildStatus.conclusion || "failure"})。请立即调用 get_job_logs 获取编译错误日志，分析报错原因并使用 github_edit_file 修复代码！`;
                   } else if (buildStatus.completed) {
                     hasPendingBuildVerification = false;
                     hasBuildTriggered = false;
+                    hasEverCompletedBuildSuccess = true;
                     resultText = `${toolRes.content}\n\n【构建成功提示】主要工作流 [${primaryWorkflowName}] 构建成功！耗时约 ${totalWaited} 秒。项目所有修改与云端验证已全部完成，请立即向用户交付最终汇报。`;
                   } else {
                     hasPendingBuildVerification = false;
                     hasBuildTriggered = false;
+                    hasEverCompletedBuildSuccess = true;
                     resultText = `${toolRes.content}\n\n【构建进行中提示】主要工作流 [${primaryWorkflowName}] 已在后台正常编译中（已等待 ${totalWaited} 秒）。无需继续原地空转死等，请立即向用户汇报修改详情并告知构建已在后台触发。`;
                   }
                   isToolError = toolRes.isError;
@@ -2031,6 +2047,11 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                   resultText = JSON.stringify({ error: msg });
                   isToolError = true;
                 }
+              }
+
+              // 若本轮混杂了读写工具导致 actions_list 跳过了等待，给模型明确反馈
+              if (isActionsListMethod && (hasBuildTriggered || hasPendingBuildVerification) && hasOtherWorkInRound && !isToolError) {
+                resultText = `${resultText}\n\n【系统提示】检测到本轮同时在进行代码查看/修改，系统已跳过长耗时构建等待（0 秒响应）。请集中完成所有文件的修改。待全部修改完成后，在独立终局轮次单独调用 actions_list 验证云端构建结果。`;
               }
             }
           }
@@ -2123,7 +2144,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
               if (delta?.content) {
                 assistantContent += delta.content;
 
-                // 流式实时检测操作卡片：必须要求第 3 张卡片末尾已经完整输出了换行符（requireTrailingNewlineOnLast = true），严禁在半句话时提前截断流！
+                // 流式实时检测操作卡片：必须要求最后一张卡片末尾已经完整输出了换行符（requireTrailingNewlineOnLast = true），严禁在半句话时提前截断流！
                 if (!hasToolCalls && activeTools.length > 0) {
                   const textCalls = parseTextToolCalls(assistantContent, activeTools, userText, true);
                   if (textCalls.length >= MAX_TOOL_CALLS_PER_ROUND) {
@@ -2273,6 +2294,15 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
         const info = findToolInfo(n);
         return isWriteTool(info?.rawName || n);
       });
+
+      // 检查本轮是否混杂了除 Actions 之外的其他工作（例如代码读取、搜索、修改）
+      const hasOtherWorkInRound = mcpCalls.some((tc) => {
+        const n = (tc.function?.name || tc.name || "").toLowerCase();
+        const info = findToolInfo(n);
+        const raw = (info?.rawName || n).toLowerCase();
+        return !raw.startsWith("actions_");
+      });
+
       const CONCURRENCY_LIMIT = hasWriteInRound ? 1 : 4;
       const callResults = await executeConcurrentPool(mcpCalls, CONCURRENCY_LIMIT, async (tc, index) => {
         if (abortSignal?.aborted || clientResponse.destroyed) {
@@ -2293,6 +2323,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
         const rawAction = toolInfo?.rawName || toolCallName;
         const isWrite = isWriteTool(rawAction);
         const isActions = /actions_(list|get)/i.test(rawAction);
+        const isActionsListMethod = isActions && (args?.method === "list_workflow_runs" || !args?.method);
         const isTrigger = /actions_run_trigger/i.test(rawAction);
         const rawArgs = tc.function?.arguments ?? tc.arguments;
         const args = toolArguments({ function: { arguments: rawArgs } });
@@ -2312,7 +2343,9 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
         } else {
           const callKey = generateToolCallKey(resolvedToolKey, args);
           const prevAttempts = toolCallHistory.get(callKey) || 0;
-          isCommitBuildPoll = (hasBuildTriggered || hasPendingBuildVerification) && isActions && (args.method === "list_workflow_runs" || !args.method);
+
+          // 仅当：修改已就绪、本轮未混杂任何其他代码读写、且（此前未成功验证过或上次失败了）时，才启动 130 秒云端构建阻塞等待！
+          isCommitBuildPoll = (hasBuildTriggered || hasPendingBuildVerification) && isActionsListMethod && !hasOtherWorkInRound && (!hasEverCompletedBuildSuccess || actionsWaitChecked === false);
 
           if (isCommitBuildPoll) {
             if (actionsWaitChecked) {
@@ -2407,6 +2440,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                   actionsWaitChecked = false;
                   hasPendingBuildVerification = false;
                   hasBuildTriggered = false;
+                  hasEverCompletedBuildSuccess = false;
                   resultText = `${toolRes.content}\n\n【构建失败自愈提示】检测到主要构建 [${primaryWorkflowName}] 失败 (${buildStatus.conclusion || "failure"})。请立即调用 get_job_logs 获取编译错误日志，分析报错原因并使用 github_edit_file 修复代码！`;
                   if (!abortSignal?.aborted && !clientResponse.destroyed) {
                     sendReasoningChunk(
@@ -2418,6 +2452,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                 } else if (buildStatus.completed) {
                   hasPendingBuildVerification = false;
                   hasBuildTriggered = false;
+                  hasEverCompletedBuildSuccess = true;
                   resultText = `${toolRes.content}\n\n【构建成功提示】主要工作流 [${primaryWorkflowName}] 构建成功！耗时约 ${totalWaited} 秒。项目所有修改与云端验证已全部完成，请立即向用户交付最终汇报。`;
                   if (!abortSignal?.aborted && !clientResponse.destroyed) {
                     sendReasoningChunk(
@@ -2429,6 +2464,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                 } else {
                   hasPendingBuildVerification = false;
                   hasBuildTriggered = false;
+                  hasEverCompletedBuildSuccess = true;
                   resultText = `${toolRes.content}\n\n【构建进行中提示】主要工作流 [${primaryWorkflowName}] 已在后台正常编译中（已等待 ${totalWaited} 秒）。无需继续原地空转死等，请立即向用户汇报修改详情并告知构建已在后台触发。`;
                   if (!abortSignal?.aborted && !clientResponse.destroyed) {
                     sendReasoningChunk(
@@ -2506,6 +2542,11 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                 errorMessage = extractErrorMessage(msg);
                 resultText = JSON.stringify({ error: msg });
                 isToolError = true;
+              }
+
+              // 若本轮混杂了读写工具导致 actions_list 跳过了等待，给模型明确反馈
+              if (isActionsListMethod && (hasBuildTriggered || hasPendingBuildVerification) && hasOtherWorkInRound && !isToolError) {
+                resultText = `${resultText}\n\n【系统提示】检测到当前轮次中包含文件读取/搜索/修改工作，系统已跳过云端构建长等待（0 秒响应）。请集中完成所有文件的修改。待全部修改完成后，在独立终局轮次单独调用 actions_list 验证云端构建结果。`;
               }
             }
           }
