@@ -1649,6 +1649,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
   let lastWriteTimestamp = 0;
   let hasPendingBuildVerification = false;
   let hasEverCompletedBuildSuccess = false;
+  let commitQueryCount = 0;
   const toolCallHistory = new Map();
   const dialogReadCache = new Map();
   let consecutiveFailures = 0;
@@ -1899,10 +1900,10 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
           const rawAction = toolInfo?.rawName || toolCallName;
           const isWrite = isWriteTool(rawAction);
           const isActions = /actions_(list|get)/i.test(rawAction);
-          const isActionsListMethod = isActions && (args.method === "list_workflow_runs" || !args.method);
           const isTrigger = /actions_run_trigger/i.test(rawAction);
           const rawArgs = tc.function?.arguments ?? tc.arguments;
           const args = toolArguments({ function: { arguments: rawArgs } });
+          const isActionsListMethod = isActions && (args?.method === "list_workflow_runs" || !args?.method);
           const actionDetails = formatToolCallDetails(args);
           const detailSuffix = actionDetails ? ` | ${actionDetails}` : "";
 
@@ -1920,138 +1921,151 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
             const callKey = generateToolCallKey(resolvedToolKey, args);
             const prevAttempts = toolCallHistory.get(callKey) || 0;
 
-            // 仅当：修改已就绪、本轮未混杂任何其他代码读写、且（此前未成功验证过或上次失败了）时，才启动 130 秒云端构建阻塞等待！
-            isCommitBuildPoll = (hasBuildTriggered || hasPendingBuildVerification) && isActionsListMethod && !hasOtherWorkInRound && (!hasEverCompletedBuildSuccess || actionsWaitChecked === false);
-
-            if (isCommitBuildPoll) {
-              if (actionsWaitChecked) {
+            // 拦截频繁翻阅 Git Commit 历史（超过 3 次强制熔断，督促直接查看 main 最新代码）
+            if (/list_commits|get_commit/i.test(rawAction)) {
+              commitQueryCount += 1;
+              if (commitQueryCount > 3) {
                 resultText = JSON.stringify({
-                  status: "already_checked",
-                  note: "已完成本次提交的构建状态检查。规则限制只查看一次构建状态，严禁重复查询！请立即向用户交付最终汇报与修改详情。"
-                });
-                isToolError = false;
-              } else {
-                actionsWaitChecked = true;
-                const { waitSec, primaryWorkflowName, lastDuration } = await estimatePrimaryBuildWaitSeconds(args.owner, args.repo);
-                const elapsedSinceWrite = lastWriteTimestamp > 0 ? (Date.now() - lastWriteTimestamp) : 999999;
-                const minSecNeeded = Math.max(10, waitSec);
-                const remainingWait = Math.max(0, minSecNeeded - Math.floor(elapsedSinceWrite / 1000));
-
-                addDebugLog("TOOL", `[Actions 动态等待] 提交后确认构建，主要工作流 [${primaryWorkflowName}] 上次耗时 ${lastDuration}s，初始等待 ${remainingWait}s`);
-                for (let s = 0; s < remainingWait; s += 1) {
-                  if (abortSignal?.aborted || clientResponse.destroyed) break;
-                  await new Promise((r) => setTimeout(r, 1000));
-                }
-                let toolRes = null;
-                try {
-                  toolRes = await callMcpTool(resolvedToolKey, args);
-                } catch (err) {
-                  const msg = err instanceof Error ? err.message : "获取构建状态失败";
-                  errorMessage = extractErrorMessage(msg);
-                  resultText = JSON.stringify({ error: msg });
-                  isToolError = true;
-                }
-
-                if (toolRes && !toolRes.isError) {
-                  let buildStatus = checkPrimaryBuildStatus(toolRes.content, primaryWorkflowName, lastWriteTimestamp);
-                  const MAX_EXTENSIONS = 80;
-                  let extensionCount = 0;
-
-                  while (!buildStatus.completed && extensionCount < MAX_EXTENSIONS) {
-                    if (abortSignal?.aborted || clientResponse.destroyed) break;
-                    extensionCount += 1;
-                    const waitPrompt = buildStatus.isWaitingForNewRun
-                      ? `正在等待 GitHub Actions 云端调度新任务（第 ${extensionCount}/${MAX_EXTENSIONS} 次）...`
-                      : `构建仍在打包中 [${buildStatus.status || "运行中"}]，自动延长等待 15 秒（第 ${extensionCount}/${MAX_EXTENSIONS} 次）...`;
-
-                    addDebugLog("TOOL", `[Actions 加等] 主要构建 [${primaryWorkflowName}] ${waitPrompt}`);
-                    for (let s = 0; s < 15; s += 1) {
-                      if (abortSignal?.aborted || clientResponse.destroyed) break;
-                      await new Promise((r) => setTimeout(r, 1000));
-                    }
-                    if (abortSignal?.aborted || clientResponse.destroyed) break;
-                    try {
-                      toolRes = await callMcpTool(resolvedToolKey, args);
-                      buildStatus = checkPrimaryBuildStatus(toolRes.content, primaryWorkflowName, lastWriteTimestamp);
-                    } catch {
-                      break;
-                    }
-                  }
-
-                  const totalWaited = remainingWait + (extensionCount * 15);
-                  if (buildStatus.isFailure) {
-                    actionsWaitChecked = false;
-                    hasPendingBuildVerification = false;
-                    hasBuildTriggered = false;
-                    hasEverCompletedBuildSuccess = false;
-                    resultText = `${toolRes.content}\n\n【构建失败自愈提示】检测到主要构建 [${primaryWorkflowName}] 失败 (${buildStatus.conclusion || "failure"})。请立即调用 get_job_logs 获取编译错误日志，分析报错原因并使用 github_edit_file 修复代码！`;
-                  } else if (buildStatus.completed) {
-                    hasPendingBuildVerification = false;
-                    hasBuildTriggered = false;
-                    hasEverCompletedBuildSuccess = true;
-                    resultText = `${toolRes.content}\n\n【构建成功提示】主要工作流 [${primaryWorkflowName}] 构建成功！耗时约 ${totalWaited} 秒。项目所有修改与云端验证已全部完成，请立即向用户交付最终汇报。`;
-                  } else {
-                    hasPendingBuildVerification = false;
-                    hasBuildTriggered = false;
-                    hasEverCompletedBuildSuccess = true;
-                    resultText = `${toolRes.content}\n\n【构建进行中提示】主要工作流 [${primaryWorkflowName}] 已在后台正常编译中（已等待 ${totalWaited} 秒）。无需继续原地空转死等，请立即向用户汇报修改详情并告知构建已在后台触发。`;
-                  }
-                  isToolError = toolRes.isError;
-                  if (!isToolError) executedToolCount += 1;
-                }
-              }
-            } else {
-              const cachedContent = !isWrite && !isTrigger ? dialogReadCache.get(callKey) : null;
-
-              if (cachedContent !== undefined && cachedContent !== null) {
-                isCacheHit = true;
-                toolCallHistory.set(callKey, prevAttempts + 1);
-                resultText = cachedContent;
-                addDebugLog("TOOL", `MCP 工具 [${resolvedToolKey}] 命中本次对话只读缓存，直接复用 (${cachedContent.length} 字符)`, { arguments: args });
-                isToolError = false;
-              } else if (prevAttempts >= 5) {
-                errorMessage = "该文件或资源连续查询失败";
-                resultText = JSON.stringify({
-                  error: "该文件或资源已连续查询多次均未成功（可能路径不存在或拼写错误）。为防止反复重试浪费调用，请勿继续使用完全相同的路径重试，请先调用 get_repository_tree 查看真实文件目录结构。"
+                  warning: "【系统拦截】您已多次翻阅历史提交记录。规则严禁反复查阅历史 Commit！请直接使用 get_file_contents 查看文件当前在 main 分支的最新真实代码，并基于当前代码直接完成分析与修改！"
                 });
                 isToolError = true;
-              } else {
-                toolCallHistory.set(callKey, prevAttempts + 1);
-                try {
-                  const toolRes = await callMcpTool(resolvedToolKey, args);
-                  resultText = toolRes.content;
-                  isToolError = toolRes.isError;
-                  if (isToolError && !errorMessage) {
-                    errorMessage = extractErrorMessage(resultText);
-                  }
-                  if (!isToolError) {
-                    executedToolCount += 1;
-                    if (isWrite || isTrigger) {
-                      hasWriteSuccess = true;
-                      hasPendingBuildVerification = true;
-                      lastWriteTimestamp = Date.now();
-                      if (isTrigger) hasBuildTriggered = true;
-                      actionsWaitChecked = false;
-                      dialogReadCache.clear();
-                      toolCallHistory.clear();
-                      if (isTrigger) {
-                        resultText = `${toolRes.content}\n\n【系统指令】工作流已成功触发并在云端开始排队运行！请紧接着调用 actions_list（method: 'list_workflow_runs'）来等待并查看本次构建结果，系统会在底层自动输出卡片并进行动态等待！严禁在此提前结束答复！`;
-                      }
-                    } else {
-                      dialogReadCache.set(callKey, resultText);
-                    }
-                  }
-                } catch (err) {
-                  const msg = err instanceof Error ? err.message : "Tool execution failed";
-                  errorMessage = extractErrorMessage(msg);
-                  resultText = JSON.stringify({ error: msg });
-                  isToolError = true;
-                }
               }
+            }
 
-              // 若本轮混杂了读写工具导致 actions_list 跳过了等待，给模型明确反馈
-              if (isActionsListMethod && (hasBuildTriggered || hasPendingBuildVerification) && hasOtherWorkInRound && !isToolError) {
-                resultText = `${resultText}\n\n【系统提示】检测到本轮同时在进行代码查看/修改，系统已跳过长耗时构建等待（0 秒响应）。请集中完成所有文件的修改。待全部修改完成后，在独立终局轮次单独调用 actions_list 验证云端构建结果。`;
+            if (!isToolError) {
+              // 仅当：修改已就绪、本轮未混杂任何其他代码读写、且（此前未成功验证过或上次失败了）时，才启动 130 秒云端构建阻塞等待！
+              isCommitBuildPoll = (hasBuildTriggered || hasPendingBuildVerification) && isActionsListMethod && !hasOtherWorkInRound && (!hasEverCompletedBuildSuccess || actionsWaitChecked === false);
+
+              if (isCommitBuildPoll) {
+                if (actionsWaitChecked) {
+                  resultText = JSON.stringify({
+                    status: "already_checked",
+                    note: "已完成本次提交的构建状态检查。规则限制只查看一次构建状态，严禁重复查询！请立即向用户交付最终汇报与修改详情。"
+                  });
+                  isToolError = false;
+                } else {
+                  actionsWaitChecked = true;
+                  const { waitSec, primaryWorkflowName, lastDuration } = await estimatePrimaryBuildWaitSeconds(args.owner, args.repo);
+                  const elapsedSinceWrite = lastWriteTimestamp > 0 ? (Date.now() - lastWriteTimestamp) : 999999;
+                  const minSecNeeded = Math.max(10, waitSec);
+                  const remainingWait = Math.max(0, minSecNeeded - Math.floor(elapsedSinceWrite / 1000));
+
+                  addDebugLog("TOOL", `[Actions 动态等待] 提交后确认构建，主要工作流 [${primaryWorkflowName}] 上次耗时 ${lastDuration}s，初始等待 ${remainingWait}s`);
+                  for (let s = 0; s < remainingWait; s += 1) {
+                    if (abortSignal?.aborted || clientResponse.destroyed) break;
+                    await new Promise((r) => setTimeout(r, 1000));
+                  }
+                  let toolRes = null;
+                  try {
+                    toolRes = await callMcpTool(resolvedToolKey, args);
+                  } catch (err) {
+                    const msg = err instanceof Error ? err.message : "获取构建状态失败";
+                    errorMessage = extractErrorMessage(msg);
+                    resultText = JSON.stringify({ error: msg });
+                    isToolError = true;
+                  }
+
+                  if (toolRes && !toolRes.isError) {
+                    let buildStatus = checkPrimaryBuildStatus(toolRes.content, primaryWorkflowName, lastWriteTimestamp);
+                    const MAX_EXTENSIONS = 80;
+                    let extensionCount = 0;
+
+                    while (!buildStatus.completed && extensionCount < MAX_EXTENSIONS) {
+                      if (abortSignal?.aborted || clientResponse.destroyed) break;
+                      extensionCount += 1;
+                      const waitPrompt = buildStatus.isWaitingForNewRun
+                        ? `正在等待 GitHub Actions 云端调度新任务（第 ${extensionCount}/${MAX_EXTENSIONS} 次）...`
+                        : `构建仍在打包中 [${buildStatus.status || "运行中"}]，自动延长等待 15 秒（第 ${extensionCount}/${MAX_EXTENSIONS} 次）...`;
+
+                      addDebugLog("TOOL", `[Actions 加等] 主要构建 [${primaryWorkflowName}] ${waitPrompt}`);
+                      for (let s = 0; s < 15; s += 1) {
+                        if (abortSignal?.aborted || clientResponse.destroyed) break;
+                        await new Promise((r) => setTimeout(r, 1000));
+                      }
+                      if (abortSignal?.aborted || clientResponse.destroyed) break;
+                      try {
+                        toolRes = await callMcpTool(resolvedToolKey, args);
+                        buildStatus = checkPrimaryBuildStatus(toolRes.content, primaryWorkflowName, lastWriteTimestamp);
+                      } catch {
+                        break;
+                      }
+                    }
+
+                    const totalWaited = remainingWait + (extensionCount * 15);
+                    if (buildStatus.isFailure) {
+                      actionsWaitChecked = false;
+                      hasPendingBuildVerification = false;
+                      hasBuildTriggered = false;
+                      hasEverCompletedBuildSuccess = false;
+                      resultText = `${toolRes.content}\n\n【构建失败自愈提示】检测到主要构建 [${primaryWorkflowName}] 失败 (${buildStatus.conclusion || "failure"})。请立即调用 get_job_logs 获取编译错误日志，分析报错原因并使用 github_edit_file 修复代码！`;
+                    } else if (buildStatus.completed) {
+                      hasPendingBuildVerification = false;
+                      hasBuildTriggered = false;
+                      hasEverCompletedBuildSuccess = true;
+                      resultText = `${toolRes.content}\n\n【构建成功提示】主要工作流 [${primaryWorkflowName}] 构建成功！耗时约 ${totalWaited} 秒。项目所有修改与云端验证已全部完成，请立即向用户交付最终汇报。`;
+                    } else {
+                      hasPendingBuildVerification = false;
+                      hasBuildTriggered = false;
+                      hasEverCompletedBuildSuccess = true;
+                      resultText = `${toolRes.content}\n\n【构建进行中提示】主要工作流 [${primaryWorkflowName}] 已在后台正常编译中（已等待 ${totalWaited} 秒）。无需继续原地空转死等，请立即向用户汇报修改详情并告知构建已在后台触发。`;
+                    }
+                    isToolError = toolRes.isError;
+                    if (!isToolError) executedToolCount += 1;
+                  }
+                }
+              } else {
+                const cachedContent = !isWrite && !isTrigger ? dialogReadCache.get(callKey) : null;
+
+                if (cachedContent !== undefined && cachedContent !== null) {
+                  isCacheHit = true;
+                  toolCallHistory.set(callKey, prevAttempts + 1);
+                  resultText = cachedContent;
+                  addDebugLog("TOOL", `MCP 工具 [${resolvedToolKey}] 命中本次对话只读缓存，直接复用 (${cachedContent.length} 字符)`, { arguments: args });
+                  isToolError = false;
+                } else if (prevAttempts >= 5) {
+                  errorMessage = "该文件或资源连续查询失败";
+                  resultText = JSON.stringify({
+                    error: "该文件或资源已连续查询多次均未成功（可能路径不存在或拼写错误）。为防止反复重试浪费调用，请勿继续使用完全相同的路径重试，请先调用 get_repository_tree 查看真实文件目录结构。"
+                  });
+                  isToolError = true;
+                } else {
+                  toolCallHistory.set(callKey, prevAttempts + 1);
+                  try {
+                    const toolRes = await callMcpTool(resolvedToolKey, args);
+                    resultText = toolRes.content;
+                    isToolError = toolRes.isError;
+                    if (isToolError && !errorMessage) {
+                      errorMessage = extractErrorMessage(resultText);
+                    }
+                    if (!isToolError) {
+                      executedToolCount += 1;
+                      if (isWrite || isTrigger) {
+                        hasWriteSuccess = true;
+                        hasPendingBuildVerification = true;
+                        lastWriteTimestamp = Date.now();
+                        if (isTrigger) hasBuildTriggered = true;
+                        actionsWaitChecked = false;
+                        dialogReadCache.clear();
+                        toolCallHistory.clear();
+                        if (isTrigger) {
+                          resultText = `${toolRes.content}\n\n【系统指令】工作流已成功触发并在云端开始排队运行！请紧接着调用 actions_list（method: 'list_workflow_runs'）来等待并查看本次构建结果，系统会在底层自动输出卡片并进行动态等待！严禁在此提前结束答复！`;
+                        }
+                      } else {
+                        dialogReadCache.set(callKey, resultText);
+                      }
+                    }
+                  } catch (err) {
+                    const msg = err instanceof Error ? err.message : "Tool execution failed";
+                    errorMessage = extractErrorMessage(msg);
+                    resultText = JSON.stringify({ error: msg });
+                    isToolError = true;
+                  }
+                }
+
+                // 若本轮混杂了读写工具导致 actions_list 跳过了等待，给模型明确反馈
+                if (isActionsListMethod && (hasBuildTriggered || hasPendingBuildVerification) && hasOtherWorkInRound && !isToolError) {
+                  resultText = `${resultText}\n\n【系统提示】检测到本轮同时在进行代码查看/修改，系统已跳过长耗时构建等待（0 秒响应）。请集中完成所有文件的修改。待全部修改完成后，在独立终局轮次单独调用 actions_list 验证云端构建结果。`;
+                }
               }
             }
           }
@@ -2323,10 +2337,10 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
         const rawAction = toolInfo?.rawName || toolCallName;
         const isWrite = isWriteTool(rawAction);
         const isActions = /actions_(list|get)/i.test(rawAction);
-        const isActionsListMethod = isActions && (args?.method === "list_workflow_runs" || !args?.method);
         const isTrigger = /actions_run_trigger/i.test(rawAction);
         const rawArgs = tc.function?.arguments ?? tc.arguments;
         const args = toolArguments({ function: { arguments: rawArgs } });
+        const isActionsListMethod = isActions && (args?.method === "list_workflow_runs" || !args?.method);
         const actionDetails = formatToolCallDetails(args);
         const detailSuffix = actionDetails ? ` | ${actionDetails}` : "";
 
@@ -2344,204 +2358,217 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
           const callKey = generateToolCallKey(resolvedToolKey, args);
           const prevAttempts = toolCallHistory.get(callKey) || 0;
 
-          // 仅当：修改已就绪、本轮未混杂任何其他代码读写、且（此前未成功验证过或上次失败了）时，才启动 130 秒云端构建阻塞等待！
-          isCommitBuildPoll = (hasBuildTriggered || hasPendingBuildVerification) && isActionsListMethod && !hasOtherWorkInRound && (!hasEverCompletedBuildSuccess || actionsWaitChecked === false);
-
-          if (isCommitBuildPoll) {
-            if (actionsWaitChecked) {
-              errorMessage = "重复检查已被拦截";
+          // 拦截频繁翻阅 Git Commit 历史（超过 3 次强制熔断，督促直接查看 main 最新代码）
+          if (/list_commits|get_commit/i.test(rawAction)) {
+            commitQueryCount += 1;
+            if (commitQueryCount > 3) {
               resultText = JSON.stringify({
-                status: "already_checked",
-                note: "已完成本次提交的构建状态检查。规则限制只查看一次构建状态，严禁重复查询！请立即向用户交付最终汇报与修改详情。"
+                warning: "【系统拦截】您已多次翻阅历史提交记录。规则严禁反复查阅历史 Commit！请直接使用 get_file_contents 查看文件当前在 main 分支的最新真实代码，并基于当前代码直接完成分析与修改！"
               });
-              isToolError = false;
-            } else {
-              actionsWaitChecked = true;
-              const { waitSec, primaryWorkflowName, lastDuration } = await estimatePrimaryBuildWaitSeconds(args.owner, args.repo);
-              const elapsedSinceWrite = lastWriteTimestamp > 0 ? (Date.now() - lastWriteTimestamp) : 999999;
-              const minSecNeeded = Math.max(10, waitSec);
-              const remainingWait = Math.max(0, minSecNeeded - Math.floor(elapsedSinceWrite / 1000));
+              isToolError = true;
+            }
+          }
 
-              addDebugLog("TOOL", `[Actions 动态等待] 提交后确认构建，主要工作流 [${primaryWorkflowName}] 上次耗时 ${lastDuration}s，初始等待 ${remainingWait}s`);
+          if (!isToolError) {
+            // 仅当：修改已就绪、本轮未混杂任何其他代码读写、且（此前未成功验证过或上次失败了）时，才启动 130 秒云端构建阻塞等待！
+            isCommitBuildPoll = (hasBuildTriggered || hasPendingBuildVerification) && isActionsListMethod && !hasOtherWorkInRound && (!hasEverCompletedBuildSuccess || actionsWaitChecked === false);
 
-              if (!abortSignal?.aborted && !clientResponse.destroyed) {
-                sendReasoningChunk(
-                  clientResponse,
-                  `\n> ⏳ 正在等待 GitHub Actions [${primaryWorkflowName}] 云端构建运行（预计等待 ${remainingWait} 秒后拉取结果）...\n`,
-                  requestBody.model
-                );
-              }
+            if (isCommitBuildPoll) {
+              if (actionsWaitChecked) {
+                errorMessage = "重复检查已被拦截";
+                resultText = JSON.stringify({
+                  status: "already_checked",
+                  note: "已完成本次提交的构建状态检查。规则限制只查看一次构建状态，严禁重复查询！请立即向用户交付最终汇报与修改详情。"
+                });
+                isToolError = false;
+              } else {
+                actionsWaitChecked = true;
+                const { waitSec, primaryWorkflowName, lastDuration } = await estimatePrimaryBuildWaitSeconds(args.owner, args.repo);
+                const elapsedSinceWrite = lastWriteTimestamp > 0 ? (Date.now() - lastWriteTimestamp) : 999999;
+                const minSecNeeded = Math.max(10, waitSec);
+                const remainingWait = Math.max(0, minSecNeeded - Math.floor(elapsedSinceWrite / 1000));
 
-              // 1. 初始等待 (上次耗时 + 10s，每 30 秒简明同步一次)
-              const TOTAL_WAIT_SEC = remainingWait;
-              for (let sec = 1; sec <= TOTAL_WAIT_SEC; sec += 1) {
-                if (abortSignal?.aborted || clientResponse.destroyed) break;
-                await new Promise((r) => setTimeout(r, 1000));
-                if (sec % 30 === 0 && sec < TOTAL_WAIT_SEC && !abortSignal?.aborted && !clientResponse.destroyed) {
+                addDebugLog("TOOL", `[Actions 动态等待] 提交后确认构建，主要工作流 [${primaryWorkflowName}] 上次耗时 ${lastDuration}s，初始等待 ${remainingWait}s`);
+
+                if (!abortSignal?.aborted && !clientResponse.destroyed) {
                   sendReasoningChunk(
                     clientResponse,
-                    `\n> ⏳ 云端构建进行中（已等待 ${sec}s / ${TOTAL_WAIT_SEC}s）...\n`,
+                    `\n> ⏳ 正在等待 GitHub Actions [${primaryWorkflowName}] 云端构建运行（预计等待 ${remainingWait} 秒后拉取结果）...\n`,
                     requestBody.model
                   );
                 }
-              }
 
-              // 2. 首次查询构建状态
-              let toolRes = null;
-              try {
-                toolRes = await callMcpTool(resolvedToolKey, args);
-              } catch (err) {
-                const msg = err instanceof Error ? err.message : "获取构建状态失败";
-                errorMessage = extractErrorMessage(msg);
-                resultText = JSON.stringify({ error: msg });
-                isToolError = true;
-              }
-
-              // 3. 若未完成，加等 15 秒，最多 80 次
-              if (toolRes && !toolRes.isError) {
-                let buildStatus = checkPrimaryBuildStatus(toolRes.content, primaryWorkflowName, lastWriteTimestamp);
-                const MAX_EXTENSIONS = 80;
-                let extensionCount = 0;
-
-                while (!buildStatus.completed && extensionCount < MAX_EXTENSIONS) {
+                // 1. 初始等待 (上次耗时 + 10s，每 30 秒简明同步一次)
+                const TOTAL_WAIT_SEC = remainingWait;
+                for (let sec = 1; sec <= TOTAL_WAIT_SEC; sec += 1) {
                   if (abortSignal?.aborted || clientResponse.destroyed) break;
-                  extensionCount += 1;
-                  const waitPrompt = buildStatus.isWaitingForNewRun
-                    ? `正在等待 GitHub Actions 云端调度新任务（第 ${extensionCount}/${MAX_EXTENSIONS} 次）...`
-                    : `构建仍在打包中 [${buildStatus.status || "运行中"}]，自动延长等待 15 秒（第 ${extensionCount}/${MAX_EXTENSIONS} 次）...`;
-
-                  addDebugLog("TOOL", `[Actions 加等] 主要构建 [${primaryWorkflowName}] ${waitPrompt}`);
-
-                  if (!abortSignal?.aborted && !clientResponse.destroyed) {
+                  await new Promise((r) => setTimeout(r, 1000));
+                  if (sec % 30 === 0 && sec < TOTAL_WAIT_SEC && !abortSignal?.aborted && !clientResponse.destroyed) {
                     sendReasoningChunk(
                       clientResponse,
-                      `\n> ⏳ ${waitPrompt}\n`,
+                      `\n> ⏳ 云端构建进行中（已等待 ${sec}s / ${TOTAL_WAIT_SEC}s）...\n`,
                       requestBody.model
                     );
                   }
+                }
 
-                  for (let s = 0; s < 15; s += 1) {
+                // 2. 首次查询构建状态
+                let toolRes = null;
+                try {
+                  toolRes = await callMcpTool(resolvedToolKey, args);
+                } catch (err) {
+                  const msg = err instanceof Error ? err.message : "获取构建状态失败";
+                  errorMessage = extractErrorMessage(msg);
+                  resultText = JSON.stringify({ error: msg });
+                  isToolError = true;
+                }
+
+                // 3. 若未完成，加等 15 秒，最多 80 次
+                if (toolRes && !toolRes.isError) {
+                  let buildStatus = checkPrimaryBuildStatus(toolRes.content, primaryWorkflowName, lastWriteTimestamp);
+                  const MAX_EXTENSIONS = 80;
+                  let extensionCount = 0;
+
+                  while (!buildStatus.completed && extensionCount < MAX_EXTENSIONS) {
                     if (abortSignal?.aborted || clientResponse.destroyed) break;
-                    await new Promise((r) => setTimeout(r, 1000));
-                  }
-                  if (abortSignal?.aborted || clientResponse.destroyed) break;
+                    extensionCount += 1;
+                    const waitPrompt = buildStatus.isWaitingForNewRun
+                      ? `正在等待 GitHub Actions 云端调度新任务（第 ${extensionCount}/${MAX_EXTENSIONS} 次）...`
+                      : `构建仍在打包中 [${buildStatus.status || "运行中"}]，自动延长等待 15 秒（第 ${extensionCount}/${MAX_EXTENSIONS} 次）...`;
 
-                  try {
-                    toolRes = await callMcpTool(resolvedToolKey, args, null);
-                    buildStatus = checkPrimaryBuildStatus(toolRes.content, primaryWorkflowName, lastWriteTimestamp);
-                  } catch {
-                    break;
-                  }
-                }
+                    addDebugLog("TOOL", `[Actions 加等] 主要构建 [${primaryWorkflowName}] ${waitPrompt}`);
 
-                const totalWaited = remainingWait + (extensionCount * 15);
-                if (buildStatus.isFailure) {
-                  // 构建失败：解锁并引导模型调 get_job_logs 自动修复
-                  actionsWaitChecked = false;
-                  hasPendingBuildVerification = false;
-                  hasBuildTriggered = false;
-                  hasEverCompletedBuildSuccess = false;
-                  resultText = `${toolRes.content}\n\n【构建失败自愈提示】检测到主要构建 [${primaryWorkflowName}] 失败 (${buildStatus.conclusion || "failure"})。请立即调用 get_job_logs 获取编译错误日志，分析报错原因并使用 github_edit_file 修复代码！`;
-                  if (!abortSignal?.aborted && !clientResponse.destroyed) {
-                    sendReasoningChunk(
-                      clientResponse,
-                      `\n> ❌ 主要构建 [${primaryWorkflowName}] 失败，正在调取日志排查修复...\n`,
-                      requestBody.model
-                    );
-                  }
-                } else if (buildStatus.completed) {
-                  hasPendingBuildVerification = false;
-                  hasBuildTriggered = false;
-                  hasEverCompletedBuildSuccess = true;
-                  resultText = `${toolRes.content}\n\n【构建成功提示】主要工作流 [${primaryWorkflowName}] 构建成功！耗时约 ${totalWaited} 秒。项目所有修改与云端验证已全部完成，请立即向用户交付最终汇报。`;
-                  if (!abortSignal?.aborted && !clientResponse.destroyed) {
-                    sendReasoningChunk(
-                      clientResponse,
-                      `\n> ✅ 主要构建 [${primaryWorkflowName}] 构建成功！正在生成最终汇报...\n`,
-                      requestBody.model
-                    );
-                  }
-                } else {
-                  hasPendingBuildVerification = false;
-                  hasBuildTriggered = false;
-                  hasEverCompletedBuildSuccess = true;
-                  resultText = `${toolRes.content}\n\n【构建进行中提示】主要工作流 [${primaryWorkflowName}] 已在后台正常编译中（已等待 ${totalWaited} 秒）。无需继续原地空转死等，请立即向用户汇报修改详情并告知构建已在后台触发。`;
-                  if (!abortSignal?.aborted && !clientResponse.destroyed) {
-                    sendReasoningChunk(
-                      clientResponse,
-                      `\n> ⏱️ 主要构建 [${primaryWorkflowName}] 仍在后台编译打包中，准备交付答复...\n`,
-                      requestBody.model
-                    );
-                  }
-                }
-                isToolError = toolRes.isError;
-                if (!isToolError) executedToolCount += 1;
-              }
-            }
-          } else {
-            const cachedContent = !isWrite && !isTrigger ? dialogReadCache.get(callKey) : null;
+                    if (!abortSignal?.aborted && !clientResponse.destroyed) {
+                      sendReasoningChunk(
+                        clientResponse,
+                        `\n> ⏳ ${waitPrompt}\n`,
+                        requestBody.model
+                      );
+                    }
 
-            if (cachedContent !== undefined && cachedContent !== null) {
-              isCacheHit = true;
-              toolCallHistory.set(callKey, prevAttempts + 1);
-              resultText = cachedContent;
-              addDebugLog("TOOL", `MCP 工具 [${resolvedToolKey}] 命中本次对话只读缓存，直接复用 (${cachedContent.length} 字符)`, { arguments: args });
-              isToolError = false;
-            } else if (prevAttempts >= 5) {
-              errorMessage = "该文件或资源连续查询失败";
-              resultText = JSON.stringify({
-                error: "该文件或资源已连续查询多次均未成功（可能路径不存在或拼写错误）。为防止反复重试浪费调用，请勿继续使用完全相同的路径重试，请先调用 get_repository_tree 查看真实文件目录结构。"
-              });
-              isToolError = true;
-            } else {
-              toolCallHistory.set(callKey, prevAttempts + 1);
+                    for (let s = 0; s < 15; s += 1) {
+                      if (abortSignal?.aborted || clientResponse.destroyed) break;
+                      await new Promise((r) => setTimeout(r, 1000));
+                    }
+                    if (abortSignal?.aborted || clientResponse.destroyed) break;
 
-              if (!abortSignal?.aborted && !clientResponse.destroyed) {
-                sendReasoningChunk(
-                  clientResponse,
-                  `\n> ⏳ 正在调用 [${displayName}] 执行操作: \`${rawAction}\`${detailSuffix}...\n`,
-                  requestBody.model
-                );
-              }
-
-              try {
-                const onWaitNotice = (waitSec) => {
-                  if (!abortSignal?.aborted && !clientResponse.destroyed) {
-                    sendReasoningChunk(
-                      clientResponse,
-                      `\n> ⏳ 触发访问频控，正在等待 ${waitSec + 1} 秒后自动重试...\n`,
-                      requestBody.model
-                    );
+                    try {
+                      toolRes = await callMcpTool(resolvedToolKey, args, null);
+                      buildStatus = checkPrimaryBuildStatus(toolRes.content, primaryWorkflowName, lastWriteTimestamp);
+                    } catch {
+                      break;
+                    }
                   }
-                };
-                const toolRes = await callMcpTool(resolvedToolKey, args, onWaitNotice);
-                resultText = toolRes.content;
-                isToolError = toolRes.isError;
-                if (isToolError && !errorMessage) {
-                  errorMessage = extractErrorMessage(resultText);
-                }
-                if (!isToolError) {
-                  executedToolCount += 1;
-                  if (isWrite || isTrigger) {
-                    hasWriteSuccess = true;
-                    hasPendingBuildVerification = true;
-                    lastWriteTimestamp = Date.now();
-                    if (isTrigger) hasBuildTriggered = true;
+
+                  const totalWaited = remainingWait + (extensionCount * 15);
+                  if (buildStatus.isFailure) {
+                    // 构建失败：解锁并引导模型调 get_job_logs 自动修复
                     actionsWaitChecked = false;
-                    dialogReadCache.clear();
-                    toolCallHistory.clear();
-                    if (isTrigger) {
-                      resultText = `${toolRes.content}\n\n【系统指令】工作流已成功触发并在云端开始排队运行！请紧接着调用 actions_list（method: 'list_workflow_runs'）来等待并查看本次构建结果，系统会在底层自动输出卡片并进行动态等待！严禁在此提前结束答复！`;
+                    hasPendingBuildVerification = false;
+                    hasBuildTriggered = false;
+                    hasEverCompletedBuildSuccess = false;
+                    resultText = `${toolRes.content}\n\n【构建失败自愈提示】检测到主要构建 [${primaryWorkflowName}] 失败 (${buildStatus.conclusion || "failure"})。请立即调用 get_job_logs 获取编译错误日志，分析报错原因并使用 github_edit_file 修复代码！`;
+                    if (!abortSignal?.aborted && !clientResponse.destroyed) {
+                      sendReasoningChunk(
+                        clientResponse,
+                        `\n> ❌ 主要构建 [${primaryWorkflowName}] 失败，正在调取日志排查修复...\n`,
+                        requestBody.model
+                      );
+                    }
+                  } else if (buildStatus.completed) {
+                    hasPendingBuildVerification = false;
+                    hasBuildTriggered = false;
+                    hasEverCompletedBuildSuccess = true;
+                    resultText = `${toolRes.content}\n\n【构建成功提示】主要工作流 [${primaryWorkflowName}] 构建成功！耗时约 ${totalWaited} 秒。项目所有修改与云端验证已全部完成，请立即向用户交付最终汇报。`;
+                    if (!abortSignal?.aborted && !clientResponse.destroyed) {
+                      sendReasoningChunk(
+                        clientResponse,
+                        `\n> ✅ 主要构建 [${primaryWorkflowName}] 构建成功！正在生成最终汇报...\n`,
+                        requestBody.model
+                      );
                     }
                   } else {
-                    dialogReadCache.set(callKey, resultText);
+                    hasPendingBuildVerification = false;
+                    hasBuildTriggered = false;
+                    hasEverCompletedBuildSuccess = true;
+                    resultText = `${toolRes.content}\n\n【构建进行中提示】主要工作流 [${primaryWorkflowName}] 已在后台正常编译中（已等待 ${totalWaited} 秒）。无需继续原地空转死等，请立即向用户汇报修改详情并告知构建已在后台触发。`;
+                    if (!abortSignal?.aborted && !clientResponse.destroyed) {
+                      sendReasoningChunk(
+                        clientResponse,
+                        `\n> ⏱️ 主要构建 [${primaryWorkflowName}] 仍在后台编译打包中，准备交付答复...\n`,
+                        requestBody.model
+                      );
+                    }
                   }
+                  isToolError = toolRes.isError;
+                  if (!isToolError) executedToolCount += 1;
                 }
-              } catch (err) {
-                const msg = err instanceof Error ? err.message : "Tool execution failed";
-                errorMessage = extractErrorMessage(msg);
-                resultText = JSON.stringify({ error: msg });
+              }
+            } else {
+              const cachedContent = !isWrite && !isTrigger ? dialogReadCache.get(callKey) : null;
+
+              if (cachedContent !== undefined && cachedContent !== null) {
+                isCacheHit = true;
+                toolCallHistory.set(callKey, prevAttempts + 1);
+                resultText = cachedContent;
+                addDebugLog("TOOL", `MCP 工具 [${resolvedToolKey}] 命中本次对话只读缓存，直接复用 (${cachedContent.length} 字符)`, { arguments: args });
+                isToolError = false;
+              } else if (prevAttempts >= 5) {
+                errorMessage = "该文件或资源连续查询失败";
+                resultText = JSON.stringify({
+                  error: "该文件或资源已连续查询多次均未成功（可能路径不存在或拼写错误）。为防止反复重试浪费调用，请勿继续使用完全相同的路径重试，请先调用 get_repository_tree 查看真实文件目录结构。"
+                });
                 isToolError = true;
+              } else {
+                toolCallHistory.set(callKey, prevAttempts + 1);
+
+                if (!abortSignal?.aborted && !clientResponse.destroyed) {
+                  sendReasoningChunk(
+                    clientResponse,
+                    `\n> ⏳ 正在调用 [${displayName}] 执行操作: \`${rawAction}\`${detailSuffix}...\n`,
+                    requestBody.model
+                  );
+                }
+
+                try {
+                  const onWaitNotice = (waitSec) => {
+                    if (!abortSignal?.aborted && !clientResponse.destroyed) {
+                      sendReasoningChunk(
+                        clientResponse,
+                        `\n> ⏳ 触发访问频控，正在等待 ${waitSec + 1} 秒后自动重试...\n`,
+                        requestBody.model
+                      );
+                    }
+                  };
+                  const toolRes = await callMcpTool(resolvedToolKey, args, onWaitNotice);
+                  resultText = toolRes.content;
+                  isToolError = toolRes.isError;
+                  if (isToolError && !errorMessage) {
+                    errorMessage = extractErrorMessage(resultText);
+                  }
+                  if (!isToolError) {
+                    executedToolCount += 1;
+                    if (isWrite || isTrigger) {
+                      hasWriteSuccess = true;
+                      hasPendingBuildVerification = true;
+                      lastWriteTimestamp = Date.now();
+                      if (isTrigger) hasBuildTriggered = true;
+                      actionsWaitChecked = false;
+                      dialogReadCache.clear();
+                      toolCallHistory.clear();
+                      if (isTrigger) {
+                        resultText = `${toolRes.content}\n\n【系统指令】工作流已成功触发并在云端开始排队运行！请紧接着调用 actions_list（method: 'list_workflow_runs'）来等待并查看本次构建结果，系统会在底层自动输出卡片并进行动态等待！严禁在此提前结束答复！`;
+                      }
+                    } else {
+                      dialogReadCache.set(callKey, resultText);
+                    }
+                  }
+                } catch (err) {
+                  const msg = err instanceof Error ? err.message : "Tool execution failed";
+                  errorMessage = extractErrorMessage(msg);
+                  resultText = JSON.stringify({ error: msg });
+                  isToolError = true;
+                }
               }
 
               // 若本轮混杂了读写工具导致 actions_list 跳过了等待，给模型明确反馈
