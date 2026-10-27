@@ -1252,7 +1252,11 @@ export function registerVirtualTools(serverInfo) {
                 description: "目标分支名称 (可选，默认使用仓库默认分支)"
               }
             },
-            required: ["owner", "repo", "path", "message"]
+            required: ["owner", "repo", "path", "message"],
+            anyOf: [
+              { required: ["old_str", "new_str"] },
+              { required: ["edits"] }
+            ]
           }
         }
       }
