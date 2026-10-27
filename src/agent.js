@@ -1412,9 +1412,9 @@ export async function passThroughAndTransformGemini(requestBody, clientResponse,
       break;
     }
 
-    fullAccumulatedContent += accumulatedContent;
+    fullAccumulatedContent += roundContent;
 
-    if (isTruncatedFinishReason(lastFinishReason) && accumulatedContent && !abortSignal?.aborted && !clientResponse.destroyed) {
+    if (isTruncatedFinishReason(lastFinishReason) && roundContent && !abortSignal?.aborted && !clientResponse.destroyed) {
       continueRound += 1;
       addDebugLog("AGENT", `⚠️ [抗截断触发] 检测到上游返回截断 (${lastFinishReason})！正在自动进行第 ${continueRound} 次无感断点续接...`, {
         round: continueRound,
@@ -1588,7 +1588,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
   });
 
   const systemRules = [
-    "【工具调用与构建验证规范】\n1. 单轮最多规划并发调用 5 个最相关的真实工具；若目标较多，先执行优先级最高的工具，取得结果后再决定下一步，禁止一次性铺开大量无效调用。\n2. 严禁提前输出总结或草稿：在所有信息收集、操作执行或构建验证全部完成之前，严禁在中间轮次输出结论、答复文本或开场白！\n3. 【多问题集中推演与一次性闭环】\n- 当用户同时提出多个 Bug 或多处体验问题时（如按钮样式、误触发动画、图层层叠与手势冲突），必须在第一轮推演时把所有问题涉及的根因彻底梳理清楚，一次性在对应文件中完整解决，严禁改完一个测一个、反复来回修改！\n- 局部编辑 old_str 规范：必须直接从本次对话中 get_file_contents 获取到的最新完整代码中原样复制。若某文件在较早轮次读取且被折叠，严禁使用带折叠标记的代码作为 old_str，必须先调用一次 get_file_contents 重新获取最新完整代码后再进行局部替换！对同一个文件的多处修改必须合并在同一个 github_edit_file 调用的 edits 数组中，严禁在同一轮对同一个文件发起两次独立的 github_edit_file 调用！\n4. 【大范围排查与阅读规范】\n- 当用户要求全面排查、检查全项目或寻找无用代码时，请先通过 get_repository_tree 宏观梳理工程架构与核心模块，有针对性地逐步深入，切勿在单轮内一次性盲目读取所有数十个源码文件导致上下文过度膨胀；每轮重点分析 1~3 个核心文件并提取关键发现。\n5. 【一次性集中修改与终局构建验证规范】\n- 当任务涉及多个文件或多步修改时，先连续集中完成所有文件的修改与提交，切勿在中间阶段等待构建！\n- 严禁在同一轮中一边读取文件/搜索代码、一边调用 actions_list！如果本轮还在审查或修改代码，说明任务尚未收敛，严禁调用 actions_list！\n- 仅当所有代码与文件均已全部修改完毕、且本轮不再调用任何读取、搜索或写工具时（项目彻底就绪）：\n  - 若该仓库配置了云端 CI/CD 构建（例如 iOS 打包、自动化测试、Docker 编译等），在独立终局轮次发起一次 actions_list（method: 'list_workflow_runs'）来等待并验证最终修改触发的云端构建结果！\n  - 服务端会在底层自动精准匹配最后一次代码提交所触发的构建任务，并在全场对话中至多进行一次构建等待。\n- 若云端构建成功，向用户汇报修改详情与构建成功结果；\n- 若云端构建失败（failure），必须激活自愈闭环：调用 get_job_logs 查看编译错误日志，分析报错原因并修复代码，修复后再次等待最终构建通过！\n- 若用户仅是查询历史构建耗时或记录，直接查询即可，无需等待。\n6. 优先使用原生 Tool Calls。仅当上游未发出原生调用时，才允许使用操作卡片作为兼容兜底；每轮最多 5 张，且必须对应真实工具调用。多个卡片之间必须使用双换行（\\n\\n）空行彻底分隔，严禁单行连续粘连：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n7. 核心执行约束：输出上述操作卡片的同时，必须同时发起真实的底层工具调用（Tool Calls），严禁仅在正文中打印卡片文本而不发起工具调用！\n8. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n9. 当所有工具调用完毕、进入最终答复轮次时，直接输出完整最终解答，终局轮次严禁输出操作卡片。"
+    "【工具调用与构建验证规范】\n1. 单轮最多规划并发调用 5 个最相关的真实工具；若目标较多，先执行优先级最高的工具，取得结果后再决定下一步，禁止一次性铺开大量无效调用。\n2. 严禁提前输出总结或草稿：在所有信息收集、操作执行或构建验证全部完成之前，严禁在中间轮次输出结论、答复文本或开场白！\n3. 【修改前完整推演，严禁边改边补】\n- 修改代码前必须先通过阅读与搜索，将涉及该问题的全链路逻辑（如外层手势拦截、点击冲突、父子组件结构、事件传递、协议与配套实现）彻底排查清楚并一次性规划好全部改动点。严禁在未理清全链路前草率先改一个文件，导致中途反复修改修补！\n- 局部编辑 old_str 规范：必须直接从本次对话中 get_file_contents 获取到的最新完整代码中原样复制。若某文件在较早轮次读取且被折叠，严禁使用带折叠标记的代码作为 old_str，必须先调用一次 get_file_contents 重新获取最新完整代码后再进行局部替换！对同一个文件的多处修改必须合并在同一个 github_edit_file 调用的 edits 数组中，严禁在同一轮对同一个文件发起两次独立的 github_edit_file 调用！\n4. 【大范围排查与阅读规范】\n- 当用户要求全面排查、检查全项目或寻找无用代码时，请先通过 get_repository_tree 宏观梳理工程架构与核心模块，有针对性地逐步深入，切勿在单轮内一次性盲目读取所有数十个源码文件导致上下文过度膨胀；每轮重点分析 1~3 个核心文件并提取关键发现。\n5. 【一次性集中修改与终局构建验证规范】\n- 当任务涉及多个文件或多步修改时，先连续集中完成所有文件的修改与提交，切勿在中间阶段等待构建！\n- 严禁在同一轮中一边读取文件/搜索代码、一边调用 actions_list！如果本轮还在审查或修改代码，说明任务尚未收敛，严禁调用 actions_list！\n- 仅当所有代码与文件均已全部修改完毕、且本轮不再调用任何读取、搜索或写工具时（项目彻底就绪）：\n  - 若该仓库配置了云端 CI/CD 构建（例如 iOS 打包、自动化测试、Docker 编译等），在独立终局轮次发起一次 actions_list（method: 'list_workflow_runs'）来等待并验证最终修改触发的云端构建结果！\n  - 服务端会在底层自动精准匹配最后一次代码提交所触发的构建任务，并在全场对话中至多进行一次构建等待。\n- 若云端构建成功，向用户汇报修改详情与构建成功结果；\n- 若云端构建失败（failure），必须激活自愈闭环：调用 get_job_logs 查看编译错误日志，分析报错原因并修复代码，修复后再次等待最终构建通过！\n- 若用户仅是查询历史构建耗时或记录，直接查询即可，无需等待。\n6. 优先使用原生 Tool Calls。仅当上游未发出原生调用时，才允许使用操作卡片作为兼容兜底；每轮最多 5 张，且必须对应真实工具调用。多个卡片之间必须使用双换行（\\n\\n）空行彻底分隔，严禁单行连续粘连：\n目标说明：[简明扼要说明本次操作目的与背景]\n调用工具：`[工具名称]`\n检索内容：`[核心参数，如仓库名、文件路径或检索语句]`\n\n7. 核心执行约束：输出上述操作卡片的同时，必须同时发起真实的底层工具调用（Tool Calls），严禁仅在正文中打印卡片文本而不发起工具调用！\n8. 深入的代码分析、逻辑推演等复杂思维过程，必须在深度思考（Thinking / Reasoning）中进行。\n9. 当所有工具调用完毕、进入最终答复轮次时，直接输出完整最终解答，终局轮次严禁输出操作卡片。"
   ];
   const hasCloudflare = tools.some((t) => {
     const n = (t?.function?.name || t?.name || "").toLowerCase();
@@ -1596,7 +1596,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
   });
   if (hasCloudflare) {
     systemRules.push(
-      "【Cloudflare 工具执行规范】\n1. 沙箱内已预置带有鉴权的全局客户端 `cloudflare.request({ method, path, body, contentType, rawBody })` 与全局变量 `accountId`。严禁自行拼接 BaseURL 或使用原生 fetch()，必须直接使用 `cloudflare.request`。\n2. 读取 Worker 脚本: `cloudflare.request({ method: 'GET', path: `/accounts/${accountId}/workers/scripts/${name}` })`。\n3. 更新单文件 Worker 脚本: `cloudflare.request({ method: 'PUT', path: `/accounts/${accountId}/workers/scripts/${name}`, body: codeString, contentType: 'application/javascript', rawBody: true })`（若为模块 Worker 则按 multipart/form-data 格式）。切勿盲目遍历搜索庞大的 OpenAPI 规范。\n4. 若操作对象是 Cloudflare 资源，切勿跨平台在 GitHub 相关工具上搜索无关个人或仓库。"
+      "【Cloudflare 工具执行规范】\n1. 沙箱内已预置带有鉴权的全局客户端 `cloudflare.request({ method, path, body, contentType, rawBody })` 与全局变量 `accountId`。严禁自行拼接 BaseURL 或使用原生 fetch()，必须直接使用 `cloudflare.request`。\n2. 读取 Worker 脚本: `cloudflare.request({ method: 'GET', path: `/accounts/${accountId}/workers/scripts/${name}` })`。\n3. 更新单文件 Worker 脚本: `cloudflare.request({ method: 'PUT', path: `/accounts/${accountId}/workers/scripts/${name}`, body: codeString, contentType: 'application/javascript', rawBody: true })`（若为模块 Worker 则按 multipart/form-data格式）。切勿盲目遍历搜索庞大的 OpenAPI 规范。\n4. 若操作对象是 Cloudflare 资源，切勿跨平台在 GitHub 相关工具上搜索无关个人或仓库。"
     );
   }
   if (isWrite) {
@@ -1935,8 +1935,8 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                 const { waitSec, primaryWorkflowName, lastDuration } = await estimatePrimaryBuildWaitSeconds(args.owner, args.repo);
                 const elapsedSinceWrite = lastWriteTimestamp > 0 ? (Date.now() - lastWriteTimestamp) : 999999;
                 const minSecNeeded = Math.max(10, waitSec);
-                // 初始等待上限限制为 30 秒，绝不在盲等阶段一次性冻结数分钟，通过 15s 轮询动态上报进度更敏捷
-                const remainingWait = Math.min(30, Math.max(0, minSecNeeded - Math.floor(elapsedSinceWrite / 1000)));
+                // 初始等待限制为 15 秒，绝不在盲等阶段死等，快速发起第一次真实状态检查
+                const remainingWait = Math.min(15, Math.max(0, minSecNeeded - Math.floor(elapsedSinceWrite / 1000)));
 
                 addDebugLog("TOOL", `[Actions 动态等待] 提交后确认构建，主要工作流 [${primaryWorkflowName}] 上次耗时 ${lastDuration}s，初始等待 ${remainingWait}s`);
                 for (let s = 0; s < remainingWait; s += 1) {
@@ -1955,14 +1955,25 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
 
                 if (toolRes && !toolRes.isError) {
                   let buildStatus = checkPrimaryBuildStatus(toolRes.content, primaryWorkflowName, lastWriteTimestamp);
-                  const MAX_EXTENSIONS = 80;
+                  const MAX_EXTENSIONS = 20;
                   let extensionCount = 0;
+                  let queueWaitCount = 0;
 
                   while (!buildStatus.completed && extensionCount < MAX_EXTENSIONS) {
                     if (abortSignal?.aborted || clientResponse.destroyed) break;
+
+                    if (buildStatus.isWaitingForNewRun) {
+                      queueWaitCount += 1;
+                      // 如果等待新排队超过 2 次（即初始 15s + 30s = 45s），说明 GitHub 没有自动触发构建，坚决退出等待，绝不空转！
+                      if (queueWaitCount > 2) {
+                        addDebugLog("TOOL", `[Actions 退出等待] 云端未检测到新提交排队或触发的构建任务（已等待约 45 秒），自动退出等待`);
+                        break;
+                      }
+                    }
+
                     extensionCount += 1;
                     const waitPrompt = buildStatus.isWaitingForNewRun
-                      ? `正在等待 GitHub Actions 云端调度新任务（第 ${extensionCount}/${MAX_EXTENSIONS} 次）...`
+                      ? `正在检测 GitHub Actions 云端调度状态（第 ${queueWaitCount}/2 次）...`
                       : `构建仍在打包中 [${buildStatus.status || "运行中"}]，自动延长等待 15 秒（第 ${extensionCount}/${MAX_EXTENSIONS} 次）...`;
 
                     addDebugLog("TOOL", `[Actions 加等] 主要构建 [${primaryWorkflowName}] ${waitPrompt}`);
@@ -1992,6 +2003,11 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                     hasBuildTriggered = false;
                     hasEverCompletedBuildSuccess = true;
                     resultText = `${toolRes.content}\n\n【构建成功提示】主要工作流 [${primaryWorkflowName}] 构建成功！耗时约 ${totalWaited} 秒。项目所有修改与云端验证已全部完成，请立即向用户交付最终汇报。`;
+                  } else if (buildStatus.isWaitingForNewRun) {
+                    hasPendingBuildVerification = false;
+                    hasBuildTriggered = false;
+                    hasEverCompletedBuildSuccess = true;
+                    resultText = `${toolRes.content}\n\n【未检测到云端自动构建任务】本次代码提交已成功推送到仓库，但在提交后 45 秒内未检测到 GitHub Actions 触发或排队新的构建任务（可能该代码变更未满足工作流触发条件或 GitHub 自动调度未响应）。项目代码已全部修改完成，无需继续等待，请直接向用户汇报修改详情。`;
                   } else {
                     hasPendingBuildVerification = false;
                     hasBuildTriggered = false;
@@ -2051,12 +2067,12 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                 }
               }
 
-              // 若已完成过一次构建验证（或混杂了读写工具）导致跳过了长耗时等待，给模型明确反馈
+              // 若本轮混杂了读写工具导致 actions_list 跳过了等待，给模型明确反馈
               if (isActionsListMethod && (hasBuildTriggered || hasPendingBuildVerification) && !isToolError) {
                 if (hasEverCompletedBuildSuccess) {
                   resultText = `${resultText}\n\n【系统提示】本次对话已完成过云端构建验证，系统已跳过数分钟的耗时阻塞等待（0秒极速响应）。当前最新构建已在后台打包，请直接向用户交付最终汇报。`;
                 } else if (hasOtherWorkInRound) {
-                  resultText = `${resultText}\n\n【系统提示】检测到本轮同时在进行代码查看/修改，系统已跳过长耗时构建等待（0 秒响应）。请集中完成所有文件的修改。待全部修改完成后，在独立终局轮次单独调用 actions_list 验证云端构建结果。`;
+                  resultText = `${resultText}\n\n【系统提示】检测到当前轮次中包含文件读取/搜索/修改工作，系统已跳过云端构建长等待（0 秒响应）。请集中完成所有文件的修改。待全部修改完成后，在独立终局轮次单独调用 actions_list 验证云端构建结果。`;
                 }
               }
             }
@@ -2366,8 +2382,8 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
               const { waitSec, primaryWorkflowName, lastDuration } = await estimatePrimaryBuildWaitSeconds(args.owner, args.repo);
               const elapsedSinceWrite = lastWriteTimestamp > 0 ? (Date.now() - lastWriteTimestamp) : 999999;
               const minSecNeeded = Math.max(10, waitSec);
-              // 初始等待上限限制为 30 秒，绝不在盲等阶段一次性冻结数分钟，通过 15s 轮询动态上报进度更敏捷
-              const remainingWait = Math.min(30, Math.max(0, minSecNeeded - Math.floor(elapsedSinceWrite / 1000)));
+              // 初始等待限制为 15 秒，绝不在盲等阶段死等，快速发起第一次真实状态检查
+              const remainingWait = Math.min(15, Math.max(0, minSecNeeded - Math.floor(elapsedSinceWrite / 1000)));
 
               addDebugLog("TOOL", `[Actions 动态等待] 提交后确认构建，主要工作流 [${primaryWorkflowName}] 上次耗时 ${lastDuration}s，初始等待 ${remainingWait}s`);
 
@@ -2379,7 +2395,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                 );
               }
 
-              // 1. 初始等待 (上限 30s)
+              // 1. 初始等待 (上限 15s)
               const TOTAL_WAIT_SEC = remainingWait;
               for (let sec = 1; sec <= TOTAL_WAIT_SEC; sec += 1) {
                 if (abortSignal?.aborted || clientResponse.destroyed) break;
@@ -2404,17 +2420,28 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                 isToolError = true;
               }
 
-              // 3. 若未完成，加等 15 秒，最多 80 次
+              // 3. 若未完成，加等 15 秒，最多 20 次（约 5 分钟）
               if (toolRes && !toolRes.isError) {
                 let buildStatus = checkPrimaryBuildStatus(toolRes.content, primaryWorkflowName, lastWriteTimestamp);
-                const MAX_EXTENSIONS = 80;
+                const MAX_EXTENSIONS = 20;
                 let extensionCount = 0;
+                let queueWaitCount = 0;
 
                 while (!buildStatus.completed && extensionCount < MAX_EXTENSIONS) {
                   if (abortSignal?.aborted || clientResponse.destroyed) break;
+
+                  if (buildStatus.isWaitingForNewRun) {
+                    queueWaitCount += 1;
+                    // 如果等待新排队超过 2 次（即初始 15s + 30s = 45s），说明 GitHub 没有自动触发构建，坚决退出等待，绝不空转！
+                    if (queueWaitCount > 2) {
+                      addDebugLog("TOOL", `[Actions 退出等待] 云端未检测到新提交排队或触发的构建任务（已等待约 45 秒），自动退出等待`);
+                      break;
+                    }
+                  }
+
                   extensionCount += 1;
                   const waitPrompt = buildStatus.isWaitingForNewRun
-                    ? `正在等待 GitHub Actions 云端调度新任务（第 ${extensionCount}/${MAX_EXTENSIONS} 次）...`
+                    ? `正在检测 GitHub Actions 云端调度状态（第 ${queueWaitCount}/2 次）...`
                     : `构建仍在打包中 [${buildStatus.status || "运行中"}]，自动延长等待 15 秒（第 ${extensionCount}/${MAX_EXTENSIONS} 次）...`;
 
                   addDebugLog("TOOL", `[Actions 加等] 主要构建 [${primaryWorkflowName}] ${waitPrompt}`);
@@ -2465,6 +2492,18 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                     sendReasoningChunk(
                       clientResponse,
                       `\n> ✅ 主要构建 [${primaryWorkflowName}] 构建成功！正在生成最终汇报...\n`,
+                      requestBody.model
+                    );
+                  }
+                } else if (buildStatus.isWaitingForNewRun) {
+                  hasPendingBuildVerification = false;
+                  hasBuildTriggered = false;
+                  hasEverCompletedBuildSuccess = true;
+                  resultText = `${toolRes.content}\n\n【未检测到云端自动构建任务】本次代码提交已成功推送到仓库，但在提交后 45 秒内未检测到 GitHub Actions 触发或排队新的构建任务（可能该代码变更未满足工作流触发条件或 GitHub 自动调度未响应）。项目代码已全部修改完成，无需继续等待，请直接向用户汇报修改详情。`;
+                  if (!abortSignal?.aborted && !clientResponse.destroyed) {
+                    sendReasoningChunk(
+                      clientResponse,
+                      `\n> ℹ️ 未检测到云端触发新构建任务，代码已就绪，正在生成最终汇报...\n`,
                       requestBody.model
                     );
                   }
@@ -2551,7 +2590,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                 isToolError = true;
               }
 
-              // 若已完成过一次构建验证（或混杂了读写工具）导致跳过了长耗时等待，给模型明确反馈
+              // 若本轮混杂了读写工具导致 actions_list 跳过了等待，给模型明确反馈
               if (isActionsListMethod && (hasBuildTriggered || hasPendingBuildVerification) && !isToolError) {
                 if (hasEverCompletedBuildSuccess) {
                   resultText = `${resultText}\n\n【系统提示】本次对话已完成过云端构建验证，系统已跳过数分钟的耗时阻塞等待（0秒极速响应）。当前最新构建已在后台打包，请直接向用户交付最终汇报。`;
