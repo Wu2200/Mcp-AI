@@ -1878,7 +1878,6 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
               } else {
                 actionsWaitChecked = true;
                 const primaryWorkflowName = "主要构建";
-                const remainingWait = 0;
                 addDebugLog("TOOL", "[Actions 即时检查] 提交后立即查询 GitHub Actions 构建状态");
                 let toolRes = null;
                 try {
@@ -2316,19 +2315,18 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
               isToolError = false;
             } else {
               actionsWaitChecked = true;
-              const primaryWorkflowName = "主要构建";
-              const remainingWait = 0;
-              addDebugLog("TOOL", "[Actions 即时检查] 提交后立即查询 GitHub Actions 构建状态");
+                                const primaryWorkflowName = "主要构建";
+                  addDebugLog("TOOL", "[Actions 即时检查] 提交后立即查询 GitHub Actions 构建状态");
 
-              if (!abortSignal?.aborted && !clientResponse.destroyed) {
-                sendReasoningChunk(
-                  clientResponse,
-                  "\n> ⏳ 修改已提交，正在立即查询 GitHub Actions 构建状态...\n",
-                  requestBody.model
-                );
-              }
+                  if (!abortSignal?.aborted && !clientResponse.destroyed) {
+                    sendReasoningChunk(
+                      clientResponse,
+                      "\n> ⏳ 修改已提交，正在立即查询 GitHub Actions 构建状态...\n",
+                      requestBody.model
+                    );
+                  }
 
-              let toolRes = null;
+                  let toolRes = null;
               try {
                 toolRes = await callMcpTool(resolvedToolKey, args);
               } catch (err) {
@@ -2348,30 +2346,30 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                 while (!buildStatus.completed && extensionCount < MAX_EXTENSIONS) {
                   if (abortSignal?.aborted || clientResponse.destroyed) break;
 
-                  if (buildStatus.isWaitingForNewRun) {
-                                      queueWaitCount += 1;
-                                      // 如果等待新排队超过 2 次（约 30 秒），说明 GitHub 没有自动触发构建，坚决退出等待，绝不空转！
-                                      if (queueWaitCount > 2) {
-                                        addDebugLog("TOOL", `[Actions 退出等待] 云端未检测到新提交排队或触发的构建任务（已等待约 30 秒），自动退出等待`);
-                                        break;
-                                      }
-                                    }
+                                    if (buildStatus.isWaitingForNewRun) {
+                    queueWaitCount += 1;
+                    // 如果等待新排队超过 2 次（约 30 秒），说明 GitHub 没有自动触发构建，坚决退出等待，绝不空转！
+                    if (queueWaitCount > 2) {
+                      addDebugLog("TOOL", `[Actions 退出等待] 云端未检测到新提交排队或触发的构建任务（已等待约 30 秒），自动退出等待`);
+                      break;
+                    }
+                  }
 
-                                    extensionCount += 1;
-                                    const waitPrompt = buildStatus.isWaitingForNewRun
-                                      ? `正在检测 GitHub Actions 云端调度状态（第 ${queueWaitCount}/2 次）...`
-                                      : `构建仍在打包中 [${buildStatus.status || "运行中"}]，自动延长等待 15 秒（第 ${extensionCount}/${MAX_EXTENSIONS} 次）...`;
+                  extensionCount += 1;
+                  const waitPrompt = buildStatus.isWaitingForNewRun
+                    ? `正在检测 GitHub Actions 云端调度状态（第 ${queueWaitCount}/2 次）...`
+                    : `构建仍在打包中 [${buildStatus.status || "运行中"}]，自动延长等待 15 秒（第 ${extensionCount}/${MAX_EXTENSIONS} 次）...`;
 
-                                    addDebugLog("TOOL", `[Actions 加等] 主要构建 [${primaryWorkflowName}] ${waitPrompt}`);
-                                    if (!abortSignal?.aborted && !clientResponse.destroyed) {
-                                      sendReasoningChunk(
-                                        clientResponse,
-                                        `\n> ⏳ ${waitPrompt}\n`,
-                                        requestBody.model
-                                      );
-                                    }
+                  addDebugLog("TOOL", `[Actions 加等] 主要构建 [${primaryWorkflowName}] ${waitPrompt}`);
+                  if (!abortSignal?.aborted && !clientResponse.destroyed) {
+                    sendReasoningChunk(
+                      clientResponse,
+                      `\n> ⏳ ${waitPrompt}\n`,
+                      requestBody.model
+                    );
+                  }
 
-                                    for (let s = 0; s < 15; s += 1) {
+                  for (let s = 0; s < 15; s += 1) {
                     if (abortSignal?.aborted || clientResponse.destroyed) break;
                     await new Promise((r) => setTimeout(r, 1000));
                   }
@@ -2385,7 +2383,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                   }
                 }
 
-                const totalWaited = remainingWait + (extensionCount * 15);
+                const totalWaited = extensionCount * 15;
                 if (buildStatus.isFailure) {
                   // 构建失败：解锁并引导模型调 get_job_logs 自动修复
                   actionsWaitChecked = false;
