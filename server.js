@@ -209,7 +209,14 @@ const server = http.createServer(async (request, response) => {
 
   try {
     if (request.method === "OPTIONS") {
-      setCorsHeaders(response);
+      if (request.url === "/mcp" || request.url === "/mcp/") {
+        setCorsHeaders(response);
+        response.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+        response.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, MCP-Protocol-Version, MCP-Session-Id, Last-Event-ID");
+        response.setHeader("Access-Control-Expose-Headers", "MCP-Protocol-Version, MCP-Session-Id");
+      } else {
+        setCorsHeaders(response);
+      }
       response.writeHead(204);
       response.end();
       return;
