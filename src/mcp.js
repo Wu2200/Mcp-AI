@@ -1286,6 +1286,21 @@ export async function callMcpTool(toolKey, args, onWaitNotice = null) {
   const info = findToolInfo(toolKey);
   if (!info) throw new Error(`未找到工具：${toolKey}`);
 
+  // 1. 拦截使用外部爬虫/抓取工具读取 GitHub 仓库代码
+  const isWebCrawler =
+    /firecrawl|scrape|crawl|browser|puppeteer|page|web_search/i.test(toolKey) ||
+    /firecrawl|scrape|crawl|browser|puppeteer|page|web_search/i.test(info?.rawName || "");
+  const targetUrl = String(args?.url || args?.start_url || "").toLowerCase();
+  if (isWebCrawler && (targetUrl.includes("raw.githubusercontent.com") || targetUrl.includes("github.com"))) {
+    return {
+      isError: true,
+      content: JSON.stringify({
+        error:
+          "【工具使用规范拦截】严禁使用网络爬虫/网页抓取工具爬取 GitHub 仓库或 raw.githubusercontent.com 代码！当前已挂载官方 GitHub 工具，请必须直接调用 `github_get_file_contents(owner, repo, path)` 获取最新纯源码！"
+      })
+    };
+  }
+
   const isCfExecute =
     (toolKey.toLowerCase().includes("cloudflare") || (info?.serverName || "").toLowerCase().includes("cloudflare")) &&
     (toolKey.endsWith("execute") || info?.rawName === "execute");
@@ -1380,8 +1395,18 @@ export function selectRelevantTools(userText, allTools) {
   }
 
   const text = userText.toLowerCase();
+  const isGithubCodeTask = /(?:openmcp|仓库|代码|编译|打包|commit|github|pr|swift|ios|bug|函数|组件|页面)/i.test(text);
 
-  const scored = allTools.map((t) => {
+  // 代码与 GitHub 任务完全屏蔽爬虫工具，不给模型任何跑偏或偷懒的机会
+  let candidateTools = allTools;
+  if (isGithubCodeTask) {
+    candidateTools = allTools.filter((t) => {
+      const name = (t.function?.name || t.name || "").toLowerCase();
+      return !/firecrawl|crawl|scrape/i.test(name);
+    });
+  }
+
+  const scored = candidateTools.map((t) => {
     const name = (t.function?.name || "").toLowerCase();
     const desc = (t.function?.description || "").toLowerCase();
     let score = 0;
