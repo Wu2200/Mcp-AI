@@ -1439,61 +1439,6 @@ export async function passThroughAndTransformGemini(requestBody, clientResponse,
   }
 }
 
-export async function estimatePrimaryBuildWaitSeconds(owner, repo) {
-  if (!owner || !repo) {
-    return { waitSec: 25, primaryWorkflowName: "主构建", lastDuration: 15 };
-  }
-  try {
-    const res = await callMcpTool("actions_list", {
-      method: "list_workflow_runs",
-      owner,
-      repo,
-      perPage: 15
-    });
-    if (res.isError || !res.content) {
-      return { waitSec: 25, primaryWorkflowName: "主构建", lastDuration: 15 };
-    }
-    const data = JSON.parse(res.content);
-    const runs = Array.isArray(data.workflow_runs) ? data.workflow_runs : [];
-    const successRuns = runs.filter((r) => r.status === "completed" && r.conclusion === "success");
-    if (successRuns.length === 0) {
-      return { waitSec: 25, primaryWorkflowName: "主要构建", lastDuration: 15 };
-    }
-
-    const isAuxiliary = (name = "", path = "") => {
-      const lower = `${name} ${path}`.toLowerCase();
-      return /cleanup|lint|format|stale|dependabot|pages|greeting|notify|label/i.test(lower);
-    };
-
-    let candidateRuns = successRuns.filter((r) => !isAuxiliary(r.name, r.path));
-    if (candidateRuns.length === 0) candidateRuns = successRuns;
-
-    const runsWithDuration = candidateRuns.map((r) => {
-      const start = new Date(r.run_started_at || r.created_at).getTime();
-      const end = new Date(r.updated_at).getTime();
-      const durSec = Math.max(1, Math.round((end - start) / 1000));
-      return { run: r, durSec };
-    });
-
-    runsWithDuration.sort((a, b) => b.durSec - a.durSec);
-    const primary = runsWithDuration[0];
-    if (!primary || !primary.run) {
-      return { waitSec: 25, primaryWorkflowName: "主要构建", lastDuration: 15 };
-    }
-    const lastDuration = primary.durSec || 60;
-    let waitSec = lastDuration + 10;
-    waitSec = Math.max(25, Math.min(180, waitSec));
-
-    return {
-      waitSec,
-      primaryWorkflowName: primary.run?.name || "主要构建",
-      lastDuration
-    };
-  } catch {
-    return { waitSec: 25, primaryWorkflowName: "主构建", lastDuration: 15 };
-  }
-}
-
 export function checkPrimaryBuildStatus(contentStr, primaryWorkflowName = "", minCreatedAtTimestamp = 0) {
   try {
     const data = typeof contentStr === "object" ? contentStr : JSON.parse(contentStr);
@@ -1932,17 +1877,9 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                 isToolError = false;
               } else {
                 actionsWaitChecked = true;
-                const { waitSec, primaryWorkflowName, lastDuration } = await estimatePrimaryBuildWaitSeconds(args.owner, args.repo);
-                const elapsedSinceWrite = lastWriteTimestamp > 0 ? (Date.now() - lastWriteTimestamp) : 999999;
-                const minSecNeeded = Math.max(10, waitSec);
-                // 初始等待限制为 15 秒，绝不在盲等阶段死等，快速发起第一次真实状态检查
-                const remainingWait = Math.min(15, Math.max(0, minSecNeeded - Math.floor(elapsedSinceWrite / 1000)));
-
-                addDebugLog("TOOL", `[Actions 动态等待] 提交后确认构建，主要工作流 [${primaryWorkflowName}] 上次耗时 ${lastDuration}s，初始等待 ${remainingWait}s`);
-                for (let s = 0; s < remainingWait; s += 1) {
-                  if (abortSignal?.aborted || clientResponse.destroyed) break;
-                  await new Promise((r) => setTimeout(r, 1000));
-                }
+                const primaryWorkflowName = "主要构建";
+                const remainingWait = 0;
+                addDebugLog("TOOL", "[Actions 即时检查] 提交后立即查询 GitHub Actions 构建状态");
                 let toolRes = null;
                 try {
                   toolRes = await callMcpTool(resolvedToolKey, args);
@@ -1964,9 +1901,9 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
 
                     if (buildStatus.isWaitingForNewRun) {
                       queueWaitCount += 1;
-                      // 如果等待新排队超过 2 次（即初始 15s + 30s = 45s），说明 GitHub 没有自动触发构建，坚决退出等待，绝不空转！
+                      // 如果等待新排队超过 2 次（约 30 秒），说明 GitHub 没有自动触发构建，坚决退出等待，绝不空转！
                       if (queueWaitCount > 2) {
-                        addDebugLog("TOOL", `[Actions 退出等待] 云端未检测到新提交排队或触发的构建任务（已等待约 45 秒），自动退出等待`);
+                        addDebugLog("TOOL", `[Actions 退出等待] 云端未检测到新提交排队或触发的构建任务（已等待约 30 秒），自动退出等待`);
                         break;
                       }
                     }
@@ -2379,37 +2316,18 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
               isToolError = false;
             } else {
               actionsWaitChecked = true;
-              const { waitSec, primaryWorkflowName, lastDuration } = await estimatePrimaryBuildWaitSeconds(args.owner, args.repo);
-              const elapsedSinceWrite = lastWriteTimestamp > 0 ? (Date.now() - lastWriteTimestamp) : 999999;
-              const minSecNeeded = Math.max(10, waitSec);
-              // 初始等待限制为 15 秒，绝不在盲等阶段死等，快速发起第一次真实状态检查
-              const remainingWait = Math.min(15, Math.max(0, minSecNeeded - Math.floor(elapsedSinceWrite / 1000)));
-
-              addDebugLog("TOOL", `[Actions 动态等待] 提交后确认构建，主要工作流 [${primaryWorkflowName}] 上次耗时 ${lastDuration}s，初始等待 ${remainingWait}s`);
+              const primaryWorkflowName = "主要构建";
+              const remainingWait = 0;
+              addDebugLog("TOOL", "[Actions 即时检查] 提交后立即查询 GitHub Actions 构建状态");
 
               if (!abortSignal?.aborted && !clientResponse.destroyed) {
                 sendReasoningChunk(
                   clientResponse,
-                  `\n> ⏳ 正在等待 GitHub Actions [${primaryWorkflowName}] 云端构建运行（预计等待 ${remainingWait} 秒后拉取结果）...\n`,
+                  "\n> ⏳ 修改已提交，正在立即查询 GitHub Actions 构建状态...\n",
                   requestBody.model
                 );
               }
 
-              // 1. 初始等待 (上限 15s)
-              const TOTAL_WAIT_SEC = remainingWait;
-              for (let sec = 1; sec <= TOTAL_WAIT_SEC; sec += 1) {
-                if (abortSignal?.aborted || clientResponse.destroyed) break;
-                await new Promise((r) => setTimeout(r, 1000));
-                if (sec % 15 === 0 && sec < TOTAL_WAIT_SEC && !abortSignal?.aborted && !clientResponse.destroyed) {
-                  sendReasoningChunk(
-                    clientResponse,
-                    `\n> ⏳ 云端构建进行中（已等待 ${sec}s / ${TOTAL_WAIT_SEC}s）...\n`,
-                    requestBody.model
-                  );
-                }
-              }
-
-              // 2. 首次查询构建状态
               let toolRes = null;
               try {
                 toolRes = await callMcpTool(resolvedToolKey, args);
@@ -2431,30 +2349,29 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                   if (abortSignal?.aborted || clientResponse.destroyed) break;
 
                   if (buildStatus.isWaitingForNewRun) {
-                    queueWaitCount += 1;
-                    // 如果等待新排队超过 2 次（即初始 15s + 30s = 45s），说明 GitHub 没有自动触发构建，坚决退出等待，绝不空转！
-                    if (queueWaitCount > 2) {
-                      addDebugLog("TOOL", `[Actions 退出等待] 云端未检测到新提交排队或触发的构建任务（已等待约 45 秒），自动退出等待`);
-                      break;
-                    }
-                  }
+                                      queueWaitCount += 1;
+                                      // 如果等待新排队超过 2 次（约 30 秒），说明 GitHub 没有自动触发构建，坚决退出等待，绝不空转！
+                                      if (queueWaitCount > 2) {
+                                        addDebugLog("TOOL", `[Actions 退出等待] 云端未检测到新提交排队或触发的构建任务（已等待约 30 秒），自动退出等待`);
+                                        break;
+                                      }
+                                    }
 
-                  extensionCount += 1;
-                  const waitPrompt = buildStatus.isWaitingForNewRun
-                    ? `正在检测 GitHub Actions 云端调度状态（第 ${queueWaitCount}/2 次）...`
-                    : `构建仍在打包中 [${buildStatus.status || "运行中"}]，自动延长等待 15 秒（第 ${extensionCount}/${MAX_EXTENSIONS} 次）...`;
+                                    extensionCount += 1;
+                                    const waitPrompt = buildStatus.isWaitingForNewRun
+                                      ? `正在检测 GitHub Actions 云端调度状态（第 ${queueWaitCount}/2 次）...`
+                                      : `构建仍在打包中 [${buildStatus.status || "运行中"}]，自动延长等待 15 秒（第 ${extensionCount}/${MAX_EXTENSIONS} 次）...`;
 
-                  addDebugLog("TOOL", `[Actions 加等] 主要构建 [${primaryWorkflowName}] ${waitPrompt}`);
+                                    addDebugLog("TOOL", `[Actions 加等] 主要构建 [${primaryWorkflowName}] ${waitPrompt}`);
+                                    if (!abortSignal?.aborted && !clientResponse.destroyed) {
+                                      sendReasoningChunk(
+                                        clientResponse,
+                                        `\n> ⏳ ${waitPrompt}\n`,
+                                        requestBody.model
+                                      );
+                                    }
 
-                  if (!abortSignal?.aborted && !clientResponse.destroyed) {
-                    sendReasoningChunk(
-                      clientResponse,
-                      `\n> ⏳ ${waitPrompt}\n`,
-                      requestBody.model
-                    );
-                  }
-
-                  for (let s = 0; s < 15; s += 1) {
+                                    for (let s = 0; s < 15; s += 1) {
                     if (abortSignal?.aborted || clientResponse.destroyed) break;
                     await new Promise((r) => setTimeout(r, 1000));
                   }
@@ -2499,7 +2416,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                   hasPendingBuildVerification = false;
                   hasBuildTriggered = false;
                   hasEverCompletedBuildSuccess = true;
-                  resultText = `${toolRes.content}\n\n【未检测到云端自动构建任务】本次代码提交已成功推送到仓库，但在提交后 45 秒内未检测到 GitHub Actions 触发或排队新的构建任务（可能该代码变更未满足工作流触发条件或 GitHub 自动调度未响应）。项目代码已全部修改完成，无需继续等待，请直接向用户汇报修改详情。`;
+                  resultText = `${toolRes.content}\n\n【未检测到云端自动构建任务】本次代码提交已成功推送到仓库，但在提交后约 30 秒内未检测到 GitHub Actions 触发或排队新的构建任务（可能该代码变更未满足工作流触发条件或 GitHub 自动调度未响应）。项目代码已全部修改完成，无需继续等待，请直接向用户汇报修改详情。`;
                   if (!abortSignal?.aborted && !clientResponse.destroyed) {
                     sendReasoningChunk(
                       clientResponse,
