@@ -1926,7 +1926,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                     }
                   }
 
-                  const totalWaited = remainingWait + (extensionCount * 15);
+                  const totalWaited = extensionCount * 15;
                   if (buildStatus.isFailure) {
                     // 构建失败：解锁并引导模型调 get_job_logs 自动修复
                     actionsWaitChecked = false;
@@ -2347,7 +2347,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                   if (abortSignal?.aborted || clientResponse.destroyed) break;
 
                     if (buildStatus.isWaitingForNewRun) {
-                    queueWaitCount += 1;
+                      queueWaitCount += 1;
                     // 如果等待新排队超过 2 次（约 30 秒），说明 GitHub 没有自动触发构建，坚决退出等待，绝不空转！
                     if (queueWaitCount > 2) {
                       addDebugLog("TOOL", `[Actions 退出等待] 云端未检测到新提交排队或触发的构建任务（已等待约 30 秒），自动退出等待`);
