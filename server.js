@@ -309,9 +309,18 @@ const server = http.createServer(async (request, response) => {
         { name: "mcp-ai-github", version: "1.0.0" },
         { capabilities: { tools: {} } }
       );
-      mcpServer.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: getGithubMcpTools() }));
+      mcpServer.setRequestHandler(ListToolsRequestSchema, async () => {
+        const tools = getGithubMcpTools();
+        if (tools.length === 0) {
+          throw new Error("尚未配置可用的 GitHub MCP 工具，请在控制面板连接并启动 GitHub MCP。");
+        }
+        return { tools };
+      });
       mcpServer.setRequestHandler(CallToolRequestSchema, async (mcpRequest) => {
         try {
+          if (!getGithubMcpTools().some((tool) => tool.name === mcpRequest.params.name)) {
+            throw new Error(`未找到已启用的 GitHub 工具：${mcpRequest.params.name}`);
+          }
           const result = await callMcpTool(mcpRequest.params.name, mcpRequest.params.arguments || {});
           return {
             content: [{ type: "text", text: String(result.content ?? "") }],
