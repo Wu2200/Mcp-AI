@@ -41,7 +41,8 @@ import {
   connectToMcpServer,
   updateMcpServer,
   checkAllTools,
-  registerVirtualTools
+  registerVirtualTools,
+  callMcpTool
 } from "./src/mcp.js";
 import {
   passThrough,
@@ -50,6 +51,9 @@ import {
   isModelEnabledForMcp,
   isTitleGenerationRequest
 } from "./src/agent.js";
+import { Server as McpServer } from "@modelcontextprotocol/sdk/server/index.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 
 process.on("uncaughtException", (err) => {
   if (err && (err.message === "aborted" || err.code === "ECONNRESET" || err.code === "EPIPE")) {
@@ -162,6 +166,39 @@ if (dbPool) {
 await loadMcpServersFromStorage();
 await loadSettingsFromStorage();
 
+function getGithubMcpTools() {
+  const tools = [];
+  const seen = new Set();
+
+  for (const serverInfo of mcpServers.values()) {
+    if (serverInfo.status !== "active" || !Array.isArray(serverInfo.tools)) continue;
+
+    const serverName = String(serverInfo.name || "").toLowerCase();
+    const rawNames = serverInfo.tools.map((tool) => String(tool.rawName || "").toLowerCase());
+    const hasGithubFileTools =
+      rawNames.some((name) => name === "get_file_contents" || name.endsWith("_get_file_contents")) &&
+      rawNames.some((name) => name === "create_or_update_file" || name.endsWith("_create_or_update_file"));
+    const isGithubServer =
+      serverName.includes("github") ||
+      rawNames.some((name) => name.startsWith("github_")) ||
+      hasGithubFileTools;
+
+    if (!isGithubServer) continue;
+
+    for (const tool of serverInfo.tools) {
+      if (tool.enabled === false || !tool.key || seen.has(tool.key) || !mcpToolRegistry.has(tool.key)) continue;
+      seen.add(tool.key);
+      tools.push({
+        name: tool.key,
+        description: tool.description || tool.rawName || tool.key,
+        inputSchema: tool.openAiTool?.function?.parameters || { type: "object", properties: {} }
+      });
+    }
+  }
+
+  return tools;
+}
+
 const server = http.createServer(async (request, response) => {
   request.on("error", (err) => {
     if (err?.message === "aborted" || err?.code === "ECONNRESET") return;
@@ -234,6 +271,78 @@ const server = http.createServer(async (request, response) => {
         "Set-Cookie": `panel_auth=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`
       });
       response.end(JSON.stringify({ success: true }));
+      return;
+    }
+
+    if (reqUrl.pathname === "/mcp" || reqUrl.pathname === "/mcp/") {
+      if (!isProxyAuthorized(request)) {
+        setCorsHeaders(response);
+        response.writeHead(401, {
+          "Content-Type": "application/json; charset=utf-8",
+          "WWW-Authenticate": "Bearer"
+        });
+        response.end(JSON.stringify({ error: "需要有效的 Bearer API Key" }));
+        return;
+      }
+
+      if (!["GET", "POST", "DELETE"].includes(request.method)) {
+        setCorsHeaders(response);
+        response.writeHead(405, {
+          "Allow": "GET, POST, DELETE",
+          "Content-Type": "application/json; charset=utf-8"
+        });
+        response.end(JSON.stringify({ error: "MCP endpoint only supports GET, POST, and DELETE" }));
+        return;
+      }
+
+      let mcpBody;
+      if (request.method === "POST") {
+        try {
+          mcpBody = await readRequestBody(request);
+        } catch (err) {
+          sendJson(response, err.statusCode || 400, { error: err.message || "无效 JSON" });
+          return;
+        }
+      }
+
+      const mcpServer = new McpServer(
+        { name: "mcp-ai-github", version: "1.0.0" },
+        { capabilities: { tools: {} } }
+      );
+      mcpServer.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: getGithubMcpTools() }));
+      mcpServer.setRequestHandler(CallToolRequestSchema, async (mcpRequest) => {
+        try {
+          const result = await callMcpTool(mcpRequest.params.name, mcpRequest.params.arguments || {});
+          return {
+            content: [{ type: "text", text: String(result.content ?? "") }],
+            ...(result.isError ? { isError: true } : {})
+          };
+        } catch (err) {
+          return {
+            content: [{ type: "text", text: err instanceof Error ? err.message : String(err) }],
+            isError: true
+          };
+        }
+      });
+
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+      try {
+        await mcpServer.connect(transport);
+        await transport.handleRequest(request, response, mcpBody);
+      } catch (err) {
+        if (!response.headersSent) {
+          sendJson(response, 500, { error: err.message || "MCP 请求处理失败" });
+        } else if (!response.writableEnded) {
+          response.end();
+        }
+      } finally {
+        try {
+          await transport.close();
+        } catch {}
+        try {
+          await mcpServer.close();
+        } catch {}
+      }
       return;
     }
 
