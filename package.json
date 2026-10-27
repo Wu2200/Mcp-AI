@@ -11,6 +11,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "pg": "^8.13.1"
   },
   "keywords": [
