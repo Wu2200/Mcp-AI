@@ -1286,21 +1286,6 @@ export async function callMcpTool(toolKey, args, onWaitNotice = null) {
   const info = findToolInfo(toolKey);
   if (!info) throw new Error(`未找到工具：${toolKey}`);
 
-  // 1. 拦截使用外部爬虫/抓取工具读取 GitHub 仓库代码
-  const isWebCrawler =
-    /firecrawl|scrape|crawl|browser|puppeteer|page|web_search/i.test(toolKey) ||
-    /firecrawl|scrape|crawl|browser|puppeteer|page|web_search/i.test(info?.rawName || "");
-  const targetUrl = String(args?.url || args?.start_url || "").toLowerCase();
-  if (isWebCrawler && (targetUrl.includes("raw.githubusercontent.com") || targetUrl.includes("github.com"))) {
-    return {
-      isError: true,
-      content: JSON.stringify({
-        error:
-          "【工具使用规范拦截】检测到试图通过网络爬虫/网页抓取工具爬取 GitHub 仓库或 raw.githubusercontent.com 代码！严禁使用外部爬虫抓取 GitHub 代码，这不仅极度缓慢、破坏代码格式，而且会浪费大量轮次。当前已挂载官方 GitHub 工具，请必须直接调用 `github_get_file_contents(owner, repo, path)` 获取最新纯源码！"
-      })
-    };
-  }
-
   const isCfExecute =
     (toolKey.toLowerCase().includes("cloudflare") || (info?.serverName || "").toLowerCase().includes("cloudflare")) &&
     (toolKey.endsWith("execute") || info?.rawName === "execute");
@@ -1395,18 +1380,8 @@ export function selectRelevantTools(userText, allTools) {
   }
 
   const text = userText.toLowerCase();
-  const isGithubCodeTask = /(?:openmcp|仓库|代码|编译|打包|commit|github|pr|swift|ios|bug|函数|组件|页面)/i.test(text);
 
-  // 如果当前任务是明确的 GitHub/代码排查任务，坚决过滤掉无关的网络爬虫工具（如 firecrawl 等），避免模型跑偏
-  let candidateTools = allTools;
-  if (isGithubCodeTask) {
-    candidateTools = allTools.filter((t) => {
-      const name = (t.function?.name || t.name || "").toLowerCase();
-      return !/firecrawl|crawl|scrape/i.test(name);
-    });
-  }
-
-  const scored = candidateTools.map((t) => {
+  const scored = allTools.map((t) => {
     const name = (t.function?.name || "").toLowerCase();
     const desc = (t.function?.description || "").toLowerCase();
     let score = 0;
@@ -1420,7 +1395,7 @@ export function selectRelevantTools(userText, allTools) {
 
     if (text.includes("git") || text.includes("github") || text.includes("仓库") || text.includes("提交") || text.includes("push") || text.includes("openmcp")) {
       if (name.includes("git") || name.includes("push") || name.includes("commit") || name.includes("file") || name.includes("branch")) {
-        score += 5;
+        score += 8;
       }
     }
 
