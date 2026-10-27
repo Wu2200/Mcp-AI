@@ -2315,18 +2315,18 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
               isToolError = false;
             } else {
               actionsWaitChecked = true;
-                                const primaryWorkflowName = "主要构建";
-                  addDebugLog("TOOL", "[Actions 即时检查] 提交后立即查询 GitHub Actions 构建状态");
+              const primaryWorkflowName = "主要构建";
+              addDebugLog("TOOL", "[Actions 即时检查] 提交后立即查询 GitHub Actions 构建状态");
 
-                  if (!abortSignal?.aborted && !clientResponse.destroyed) {
-                    sendReasoningChunk(
-                      clientResponse,
-                      "\n> ⏳ 修改已提交，正在立即查询 GitHub Actions 构建状态...\n",
-                      requestBody.model
-                    );
-                  }
+              if (!abortSignal?.aborted && !clientResponse.destroyed) {
+                sendReasoningChunk(
+                  clientResponse,
+                  "\n> ⏳ 修改已提交，正在立即查询 GitHub Actions 构建状态...\n",
+                  requestBody.model
+                );
+              }
 
-                  let toolRes = null;
+              let toolRes = null;
               try {
                 toolRes = await callMcpTool(resolvedToolKey, args);
               } catch (err) {
@@ -2346,7 +2346,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
                 while (!buildStatus.completed && extensionCount < MAX_EXTENSIONS) {
                   if (abortSignal?.aborted || clientResponse.destroyed) break;
 
-                                    if (buildStatus.isWaitingForNewRun) {
+                    if (buildStatus.isWaitingForNewRun) {
                     queueWaitCount += 1;
                     // 如果等待新排队超过 2 次（约 30 秒），说明 GitHub 没有自动触发构建，坚决退出等待，绝不空转！
                     if (queueWaitCount > 2) {
