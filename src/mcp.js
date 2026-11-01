@@ -1370,25 +1370,32 @@ export async function callMcpTool(toolKey, args, onWaitNoticeOrOptions = null, m
       const duration = Date.now() - startTime;
       const isError = Boolean(res && res.isError);
       const content = typeof res?.content === "string" ? res.content : JSON.stringify(res || {});
+      const rawContent = Array.isArray(res?.content)
+        ? res.content
+        : [{ type: "text", text: content }];
       if (!skipLogging) {
         addDebugLog(isError ? "ERROR" : "TOOL", `虚拟 MCP 工具 [${toolKey}] 执行${isError ? "失败" : "成功"} - 耗时 ${duration}ms`, {
           arguments: args,
           outputPreview: content.slice(0, 500)
         });
       }
-      return { isError, content };
+      return { isError, content, rawContent };
     } catch (err) {
       const duration = Date.now() - startTime;
       const msg = err instanceof Error ? err.message : String(err);
       if (!skipLogging) {
         addDebugLog("ERROR", `虚拟 MCP 工具 [${toolKey}] 异常 - 耗时 ${duration}ms`, msg);
       }
-      return { isError: true, content: JSON.stringify({ error: msg }) };
+      return {
+        isError: true,
+        content: JSON.stringify({ error: msg }),
+        rawContent: [{ type: "text", text: JSON.stringify({ error: msg }) }]
+      };
     }
   }
 
   try {
-    const { rawResult, isToolError, textContent } = await invokeMcpRawTool(info, info.rawName, args, onWaitNotice, skipLogging);
+    const { rawResult, isToolError, textContent, rawContent } = await invokeMcpRawTool(info, info.rawName, args, onWaitNotice, skipLogging);
     const duration = Date.now() - startTime;
     if (isToolError) {
       let refinedContent = textContent;
@@ -1399,7 +1406,7 @@ export async function callMcpTool(toolKey, args, onWaitNoticeOrOptions = null, m
       } else if (isCfExecute && (textContent.includes("is not one of this session's accounts") || textContent.includes("Could not route to /client/v4/accounts"))) {
         refinedContent = `${textContent}\n\n【账户ID诊断指引】account_id 错误！传入的 account_id 必须为 32 位十六进制字符串（如错误提示中给出的可用账户 ID），切勿使用账户邮箱或显示名称。亦可直接使用沙箱内置的全局变量 accountId。`;
       } else if (isCfExecute && (textContent.includes("part 'metadata'") || textContent.includes("main_module") || textContent.includes("binding") || textContent.includes("10021"))) {
-        refinedContent = `${textContent}\n\n【Cloudflare Worker 部署格式自愈指引】Cloudflare Module Worker 上传失败。规范要求且仅要求提供两个 FormData 部件：\n1. metadata：必须为 JSON 字符串对象 \`JSON.stringify({ main_module: "worker.js" })\`。注意：【严禁在 metadata 中传入 bindings】（因为环境变量/密钥在 GET 接口中脱敏加密，传入会导致 missing text property 校验失败；留空 bindings 会自动保留云端所有现有环境变量与密钥）！\n2. worker.js：修改后的完整脚本代码 Blob。\n标准上传代码：\nconst form = new FormData();\nform.append("metadata", new Blob([JSON.stringify({ main_module: "worker.js" })], { type: "application/json" }));\nform.append("worker.js", new Blob([updatedCode], { type: "application/javascript+module" }), "worker.js");\nreturn await cloudflare.request({ method: "PUT", path: \`/accounts/\${accountId}/workers/scripts/\${scriptName}\`, body: form });`;
+        refinedContent = `${textContent}\n\n【Cloudflare Worker 部署格式自愈指引】Cloudflare Module Worker 上传失败。规范要求且仅要求提供两个 FormData 部件：\n1. metadata：必须为 JSON 字符串对象 \`JSON.stringify({ main_module: \"worker.js\" })\`。注意：【严禁在 metadata 中传入 bindings】（因为环境变量/密钥在 GET 接口中脱敏加密，传入会导致 missing text property 校验失败；留空 bindings 会自动保留云端所有现有环境变量与密钥）！\n2. worker.js：修改后的完整脚本代码 Blob。\n标准上传代码：\nconst form = new FormData();\nform.append(\"metadata\", new Blob([JSON.stringify({ main_module: \"worker.js\" })], { type: \"application/json\" }));\nform.append(\"worker.js\", new Blob([updatedCode], { type: \"application/javascript+module\" }), \"worker.js\");\nreturn await cloudflare.request({ method: \"PUT\", path: \`/accounts/\${accountId}/workers/scripts/\${scriptName}\`, body: form });`;
       }
       if (!skipLogging) {
         addDebugLog("ERROR", `MCP 工具 [${toolKey}] 返回错误 - 耗时 ${duration}ms`, {
@@ -1407,7 +1414,13 @@ export async function callMcpTool(toolKey, args, onWaitNoticeOrOptions = null, m
           errorOutput: refinedContent.slice(0, 500)
         });
       }
-      return { isError: true, content: refinedContent };
+      return {
+        isError: true,
+        content: refinedContent,
+        rawContent: (rawContent && rawContent.length > 0 && refinedContent === textContent)
+          ? rawContent
+          : [{ type: "text", text: refinedContent }]
+      };
     }
     if (!skipLogging) {
       addDebugLog("TOOL", `MCP 工具 [${toolKey}] 执行成功 - 耗时 ${duration}ms, 输出 ${textContent.length} 字符`, {
@@ -1415,7 +1428,13 @@ export async function callMcpTool(toolKey, args, onWaitNoticeOrOptions = null, m
         outputPreview: textContent.slice(0, 500)
       });
     }
-    return { isError: false, content: textContent };
+    return {
+      isError: false,
+      content: textContent,
+      rawContent: (rawContent && rawContent.length > 0)
+        ? rawContent
+        : [{ type: "text", text: textContent }]
+    };
   } catch (err) {
     const duration = Date.now() - startTime;
     let msg = err instanceof Error ? err.message : String(err);
