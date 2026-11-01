@@ -1572,7 +1572,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
   }
   if (isWrite) {
     systemRules.push(
-      "【执行规范】检测到代码或配置修改任务。请根据目标资源类型选择匹配的工具：\n- 若修改 GitHub 仓库文件，优先调用局部修改工具（如 github_edit_file）替换代码片段；\n- 若修改 Cloudflare Worker/KV 等远程云资源，直接使用 Cloudflare 工具处理，严禁跨平台跑到 GitHub 检索无关个人或仓库；\n- 修改已有代码前先快速获取关键逻辑上下文，一旦定位根因立即收敛修改，避免多轮无效探索。"
+      "【执行规范】检测到代码或配置修改任务。请根据目标资源类型选择匹配的工具：\n- 若修改 GitHub 仓库文件，优先调用局部修改工具（如 edit_file 或 github_edit_file）替换代码片段；\n- 若修改 Cloudflare Worker/KV 等远程云资源，直接使用 Cloudflare 工具处理，严禁跨平台跑到 GitHub 检索无关个人或仓库；\n- 修改已有代码前先快速获取关键逻辑上下文，一旦定位根因立即收敛修改，避免多轮无效探索。"
     );
   }
 
