@@ -171,7 +171,7 @@ await loadChannelsFromStorage();
 await loadMcpServersFromStorage();
 await loadSettingsFromStorage();
 
-function getExportedMcpTools(targetFilter = "", preferRawNames = false) {
+function getExportedMcpTools(targetFilter = "") {
   const tools = [];
   const seenNames = new Set();
   const filter = (targetFilter || "").trim().toLowerCase();
@@ -179,12 +179,6 @@ function getExportedMcpTools(targetFilter = "", preferRawNames = false) {
   const activeServers = Array.from(mcpServers.values()).filter(
     (s) => s.status === "active" && Array.isArray(s.tools)
   );
-
-  // 判定是否优先使用原生工具名：
-  // 1. 显式传参 preferRawNames === true
-  // 2. 指定了具体的服务过滤（如 /mcp/github 或 ?server=github）
-  // 3. 当前系统中仅有 1 个处于活跃状态的 MCP 服务
-  const useRawName = Boolean(preferRawNames || filter || activeServers.length === 1);
 
   for (const serverInfo of activeServers) {
     const sName = String(serverInfo.name || "").trim().toLowerCase();
@@ -199,9 +193,10 @@ function getExportedMcpTools(targetFilter = "", preferRawNames = false) {
     for (const tool of serverInfo.tools) {
       if (tool.enabled === false || !tool.key || !mcpToolRegistry.has(tool.key)) continue;
 
-      // 原生工具名处理：
-      // 如果使用原生名，优先采用 tool.rawName；若已发生重名冲突，则退回 tool.key 避免覆盖
-      let exportName = useRawName ? (tool.rawName || tool.key) : tool.key;
+      // 默认 100% 采用原生工具名，无需任何额外配置或 query 过滤
+      // 仅当多服务存在完全同名工具冲突时，才退回 tool.key 避免覆盖丢失
+      const rawName = tool.rawName || tool.key;
+      let exportName = rawName;
       if (seenNames.has(exportName)) {
         exportName = tool.key;
       }
