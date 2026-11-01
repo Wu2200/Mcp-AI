@@ -4,38 +4,14 @@ MCP-AI 可将已挂载的 GitHub MCP 与本项目提供的 GitHub 文件局部�
 
 ## 原生 MCP 接入
 
-服务启动后，Streamable HTTP MCP 端点为 `/mcp` 或 `/mcp/:serverName`。将部署地址配置到支持 Streamable HTTP 的 MCP 客户端（如 Cursor, Claude Desktop, Windsurf, OpenMCP 等）即可。
+服务启动后，Streamable HTTP MCP 端点为 `/mcp`（聚合所有服务）或 `/mcp/:serverName`（限定单服务）。**默认直接采用 100% 官方原生工具名与描述，无需任何特殊开关或参数！**
 
-### 1. 极致原生：单服务纯净反代（推荐）
-
-直接反代特定上游服务（如 GitHub MCP），所有工具名 **100% 保持上游官方原生名称**（如 `get_file_contents`、`create_or_update_file`），去除一切前缀干扰，无缝适配任何第三方 Prompt 与 Agent 规则：
+将部署地址配置到支持 Streamable HTTP 的 MCP 客户端（如 Cursor, Claude Desktop, Windsurf, OpenMCP 等）即可开箱即用：
 
 ```json
 {
   "mcpServers": {
-    "github": {
-      "url": "https://你的服务地址/mcp/github",
-      "headers": {
-        "Authorization": "Bearer 你的PROXY_API_KEY"
-      }
-    }
-  }
-}
-```
-
-- **零前缀污染**：工具名保留官方原生命名（不带 `github_` 等前缀），描述去除 `[github]` 标签；
-- **全多模态透传**：完整保留上游返回的图片（`image`）、嵌入文件资源（`resource`）与多段结构，绝无扁平化压文本损失；
-- **虚拟局部编辑增强**：原生提供 `edit_file`（代码片段比对替换，自动拉取、容错自愈与提交），无需全量重写几十 KB 文件；
-- **双向无缝路由**：无论客户端发起原生名调用还是带前缀调用，均自动精准命中上游对应工具。
-
-### 2. 全局多服务聚合反代
-
-若希望一个端点同时暴露已连接的所有活跃 MCP 服务，可直接使用 `/mcp`：
-
-```json
-{
-  "mcpServers": {
-    "mcp-ai-hub": {
+    "mcp-ai": {
       "url": "https://你的服务地址/mcp",
       "headers": {
         "Authorization": "Bearer 你的PROXY_API_KEY"
@@ -44,7 +20,14 @@ MCP-AI 可将已挂载的 GitHub MCP 与本项目提供的 GitHub 文件局部�
   }
 }
 ```
-*(注：若需要在多服务聚合模式下同样优先采用原生工具名，可添加参数 `https://你的服务地址/mcp?native=true`)*
+
+- **默认 100% 原生命名**：工具名默认直接使用官方原生名称（如 `get_file_contents`、`create_or_update_file` 等），绝无 `github_` 等前缀干扰；
+- **纯净无噪描述**：工具描述自动剔除类似 `[github]` 的标签干扰，不影响下游大模型的标准指令遵循；
+- **全多模态透传**：完整保留上游返回的图片（`type: "image"`）、嵌入资源（`type: "resource"`）与多段结构，绝无强行压扁成文本的损耗；
+- **虚拟局部编辑增强**：原生提供 `edit_file`（代码片段比对替换，自动拉取、容错自愈与提交），告别大模型全量重写几十 KB 代码的截断与损坏问题；
+- **双向无缝路由**：无论客户端发起原生名调用还是带前缀名调用，底层均实现 O(1) 精准双向直连匹配。
+
+如果需要限定单服务，只需在路径中指定服务名（如 `/mcp/github`）。
 
 `PROXY_API_KEY` 用于 `/mcp` 鉴权；客户端需支持为远程 MCP 配置 `Authorization: Bearer ...` 请求头。未设置该变量时端点不要求 API Key，公开部署时建议设置。
 
