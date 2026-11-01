@@ -10,6 +10,8 @@ import {
   initDatabase,
   loadUpstreamChannelsFromEnv,
   loadSettingsFromStorage,
+  saveChannelsToStorage,
+  loadChannelsFromStorage,
   upstreamChannels,
   getActiveChannel,
   upstreamModelsUrl,
@@ -163,27 +165,26 @@ loadUpstreamChannelsFromEnv();
 if (dbPool) {
   await initDatabase();
 }
+await loadChannelsFromStorage();
 await loadMcpServersFromStorage();
 await loadSettingsFromStorage();
 
-function getGithubMcpTools() {
+function getExportedMcpTools(targetFilter = "") {
   const tools = [];
   const seen = new Set();
+  const filter = (targetFilter || "").trim().toLowerCase();
 
   for (const serverInfo of mcpServers.values()) {
     if (serverInfo.status !== "active" || !Array.isArray(serverInfo.tools)) continue;
 
-    const serverName = String(serverInfo.name || "").toLowerCase();
-    const rawNames = serverInfo.tools.map((tool) => String(tool.rawName || "").toLowerCase());
-    const hasGithubFileTools =
-      rawNames.some((name) => name === "get_file_contents" || name.endsWith("_get_file_contents")) &&
-      rawNames.some((name) => name === "create_or_update_file" || name.endsWith("_create_or_update_file"));
-    const isGithubServer =
-      serverName.includes("github") ||
-      rawNames.some((name) => name.startsWith("github_")) ||
-      hasGithubFileTools;
+    const sName = String(serverInfo.name || "").trim().toLowerCase();
+    const sId = String(serverInfo.id || "").trim().toLowerCase();
 
-    if (!isGithubServer) continue;
+    // 如果指定了具体名称/ID进行过滤（非空且非 all）
+    if (filter && filter !== "all") {
+      const isMatch = sName === filter || sId === filter || sName.includes(filter) || filter.includes(sName);
+      if (!isMatch) continue;
+    }
 
     for (const tool of serverInfo.tools) {
       if (tool.enabled === false || !tool.key || seen.has(tool.key) || !mcpToolRegistry.has(tool.key)) continue;
@@ -209,7 +210,7 @@ const server = http.createServer(async (request, response) => {
 
   try {
     if (request.method === "OPTIONS") {
-      if (request.url === "/mcp" || request.url === "/mcp/") {
+      if (reqUrl.pathname === "/mcp" || reqUrl.pathname.startsWith("/mcp/")) {
         setCorsHeaders(response);
         response.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
         response.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, MCP-Protocol-Version, MCP-Session-Id, Last-Event-ID");
@@ -281,7 +282,8 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    if (reqUrl.pathname === "/mcp" || reqUrl.pathname === "/mcp/") {
+    const matchMcp = reqUrl.pathname.match(/^\/mcp(?:\/([^\/]+))?\/?$/);
+    if (matchMcp) {
       if (!isProxyAuthorized(request)) {
         setCorsHeaders(response);
         response.writeHead(401, {
@@ -302,6 +304,10 @@ const server = http.createServer(async (request, response) => {
         return;
       }
 
+      const pathServerName = matchMcp[1] ? decodeURIComponent(matchMcp[1]).trim() : "";
+      const queryServerName = (reqUrl.searchParams.get("server") || reqUrl.searchParams.get("name") || "").trim();
+      const serverFilter = pathServerName || queryServerName || "";
+
       let mcpBody;
       if (request.method === "POST") {
         try {
@@ -313,22 +319,28 @@ const server = http.createServer(async (request, response) => {
       }
 
       const mcpServer = new McpServer(
-        { name: "mcp-ai-github", version: "1.0.0" },
+        { name: `mcp-ai-${serverFilter || "hub"}`, version: "1.0.0" },
         { capabilities: { tools: {} } }
       );
       mcpServer.setRequestHandler(ListToolsRequestSchema, async () => {
-        const tools = getGithubMcpTools();
+        const tools = getExportedMcpTools(serverFilter);
         if (tools.length === 0) {
-          throw new Error("尚未配置可用的 GitHub MCP 工具，请在控制面板连接并启动 GitHub MCP。");
+          const hint = serverFilter
+            ? `未找到服务名称包含 [${serverFilter}] 的已启用 MCP 工具，请检查控制面板中该服务的名称与状态。`
+            : "尚未配置任何可用的 MCP 工具，请在控制面板连接并启动远程 MCP 服务。";
+          throw new Error(hint);
         }
         return { tools };
       });
       mcpServer.setRequestHandler(CallToolRequestSchema, async (mcpRequest) => {
         try {
-          if (!getGithubMcpTools().some((tool) => tool.name === mcpRequest.params.name)) {
-            throw new Error(`未找到已启用的 GitHub 工具：${mcpRequest.params.name}`);
+          const targetTools = getExportedMcpTools(serverFilter);
+          const requestedName = mcpRequest.params.name;
+          if (!targetTools.some((tool) => tool.name === requestedName)) {
+            throw new Error(`未找到已启用的工具：${requestedName}${serverFilter ? ` (限定在 ${serverFilter})` : ""}`);
           }
-          const result = await callMcpTool(mcpRequest.params.name, mcpRequest.params.arguments || {});
+          // 作为外部 MCP 代理服务被调用时完全静默，无需将外部请求写进控制台 (skipLogging: true)
+          const result = await callMcpTool(requestedName, mcpRequest.params.arguments || {}, null, true);
           return {
             content: [{ type: "text", text: String(result.content ?? "") }],
             ...(result.isError ? { isError: true } : {})
@@ -375,12 +387,89 @@ const server = http.createServer(async (request, response) => {
           channels: upstreamChannels.map((c) => ({
             id: c.id,
             name: c.name,
-            envKey: c.envKey,
+            envKey: c.envKey || "自定义",
             baseUrl: c.baseUrl,
             maskedKey: maskApiKey(c.apiKey),
             active: Boolean(active && active.id === c.id)
           }))
         });
+        return;
+      }
+
+      if (request.method === "POST" && reqUrl.pathname === "/api/upstream/channels/add") {
+        const body = await readRequestBody(request);
+        const name = String(body.name || "").trim();
+        let baseUrl = String(body.baseUrl || "").trim().replace(/\/+$/, "");
+        const apiKey = String(body.apiKey || "").trim().replace(/^Bearer\s+/i, "");
+
+        if (!name || !baseUrl || !apiKey) {
+          sendJson(response, 400, { error: "名称、API 链接与密钥不能为空" });
+          return;
+        }
+
+        const id = `ch_custom_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+        const newChannel = { id, name, envKey: "自定义", baseUrl, apiKey };
+        upstreamChannels.push(newChannel);
+
+        if (!activeChannelId) {
+          activeChannelId = id;
+          await saveActiveChannelToStorage(id);
+        }
+        await saveChannelsToStorage();
+
+        addDebugLog("UPSTREAM", `已添加并保存新上游渠道 [${name}]`, { id, name, baseUrl });
+        sendJson(response, 200, { success: true, channel: { id, name, baseUrl, maskedKey: maskApiKey(apiKey) } });
+        return;
+      }
+
+      if (request.method === "POST" && reqUrl.pathname === "/api/upstream/channels/update") {
+        const body = await readRequestBody(request);
+        const id = String(body.id || "").trim();
+        const found = upstreamChannels.find((c) => c.id === id);
+        if (!found) {
+          sendJson(response, 404, { error: "未找到指定的上游渠道" });
+          return;
+        }
+
+        const name = String(body.name || "").trim();
+        let baseUrl = String(body.baseUrl || "").trim().replace(/\/+$/, "");
+        const rawKey = String(body.apiKey || "").trim().replace(/^Bearer\s+/i, "");
+
+        if (name) found.name = name;
+        if (baseUrl) found.baseUrl = baseUrl;
+        if (rawKey) found.apiKey = rawKey;
+
+        await saveChannelsToStorage();
+
+        addDebugLog("UPSTREAM", `已更新并保存上游渠道 [${found.name}]`, { id: found.id, name: found.name, baseUrl: found.baseUrl });
+        sendJson(response, 200, { success: true, name: found.name });
+        return;
+      }
+
+      const matchDeleteChannel = reqUrl.pathname.match(/^\/api\/upstream\/channels\/([^/]+)$/);
+      if (request.method === "DELETE" && matchDeleteChannel) {
+        const id = decodeURIComponent(matchDeleteChannel[1]);
+        const idx = upstreamChannels.findIndex((c) => c.id === id);
+        if (idx === -1) {
+          sendJson(response, 404, { error: "未找到该渠道" });
+          return;
+        }
+        if (upstreamChannels.length <= 1) {
+          sendJson(response, 400, { error: "至少需要保留一个上游渠道" });
+          return;
+        }
+
+        const deletedName = upstreamChannels[idx].name;
+        upstreamChannels.splice(idx, 1);
+
+        if (activeChannelId === id) {
+          activeChannelId = upstreamChannels[0].id;
+          await saveActiveChannelToStorage(activeChannelId);
+        }
+        await saveChannelsToStorage();
+
+        addDebugLog("UPSTREAM", `已删除上游渠道 [${deletedName}]`, { id });
+        sendJson(response, 200, { success: true });
         return;
       }
 
