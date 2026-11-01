@@ -434,6 +434,60 @@ export function extractMcpResultContent(data) {
   return contentStr;
 }
 
+export function buildCompatibleMcpContent(data, fallbackText = "") {
+  const rawResult = data?.result !== undefined ? data.result : data;
+  if (Array.isArray(rawResult?.content) && rawResult.content.length > 0) {
+    const blocks = [];
+    for (const item of rawResult.content) {
+      if (!item) continue;
+      if (item.type === "image" || item.type === "audio") {
+        blocks.push(item);
+      } else if (item.type === "text" && typeof item.text === "string") {
+        blocks.push({ type: "text", text: item.text });
+      } else if ((item.type === "resource" || item.type === "embedded_resource") && item.resource) {
+        if (typeof item.resource.text === "string") {
+          blocks.push({ type: "text", text: item.resource.text });
+        } else if (item.resource.blob) {
+          try {
+            const decoded = Buffer.from(item.resource.blob, "base64").toString("utf8");
+            blocks.push({ type: "text", text: decoded });
+          } catch {
+            blocks.push(item);
+          }
+        } else {
+          blocks.push(item);
+        }
+      } else if (typeof item.text === "string") {
+        blocks.push({ type: "text", text: item.text });
+      } else {
+        blocks.push(item);
+      }
+    }
+    if (blocks.length > 0) return blocks;
+  }
+  return [{ type: "text", text: String(fallbackText ?? "") }];
+}
+
+export function sanitizeToolSchema(schema) {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    return { type: "object", properties: {} };
+  }
+  const copy = { ...schema };
+  delete copy.$schema;
+  if (!copy.type) {
+    copy.type = "object";
+  }
+  if (copy.type === "object" && (!copy.properties || typeof copy.properties !== "object")) {
+    copy.properties = {};
+  }
+  if (copy.properties && Object.keys(copy.properties).length > 0) {
+    delete copy.anyOf;
+    delete copy.oneOf;
+    delete copy.allOf;
+  }
+  return copy;
+}
+
 export function extractErrorMessage(text) {
   if (!text) return "";
   if (typeof text === "object") {
@@ -482,7 +536,7 @@ export function parseRateLimitWaitSeconds(errorText) {
   return 0;
 }
 
-export async function invokeMcpRawTool(serverInfo, rawName, args, onWaitNotice = null, skipLogging = false) {
+export async function invokeMcpRawTool(serverInfo, rawName, args, onWaitNotice = null, skipLogging = false, logCategory = "chat") {
   const maxRetries = 2;
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
     let res;
@@ -512,7 +566,7 @@ export async function invokeMcpRawTool(serverInfo, rawName, args, onWaitNotice =
           onWaitNotice(waitSec);
         }
         if (!skipLogging) {
-          addDebugLog("TOOL", `[频控保护] 接口调用触发限制，正在等待 ${waitSec + 1} 秒后自动重试...`);
+          addDebugLog("TOOL", `[频控保护] 接口调用触发限制，正在等待 ${waitSec + 1} 秒后自动重试...`, "", logCategory);
         }
         await new Promise((resolve) => setTimeout(resolve, (waitSec + 1) * 1000));
         continue;
@@ -529,7 +583,7 @@ export async function invokeMcpRawTool(serverInfo, rawName, args, onWaitNotice =
           onWaitNotice(waitSec);
         }
         if (!skipLogging) {
-          addDebugLog("TOOL", `[频控保护] 接口调用触发限制，正在等待 ${waitSec + 1} 秒后自动重试...`);
+          addDebugLog("TOOL", `[频控保护] 接口调用触发限制，正在等待 ${waitSec + 1} 秒后自动重试...`, "", logCategory);
         }
         await new Promise((resolve) => setTimeout(resolve, (waitSec + 1) * 1000));
         continue;
@@ -540,7 +594,7 @@ export async function invokeMcpRawTool(serverInfo, rawName, args, onWaitNotice =
     const rawResult = data.result !== undefined ? data.result : data;
     const isToolError = Boolean(rawResult && (rawResult.isError === true || rawResult.is_error === true));
     const textContent = extractMcpResultContent(data);
-    const rawContent = Array.isArray(rawResult?.content) ? rawResult.content : null;
+    const rawContent = buildCompatibleMcpContent(data, textContent);
 
     if (isToolError) {
       const waitSec = parseRateLimitWaitSeconds(textContent);
@@ -549,7 +603,7 @@ export async function invokeMcpRawTool(serverInfo, rawName, args, onWaitNotice =
           onWaitNotice(waitSec);
         }
         if (!skipLogging) {
-          addDebugLog("TOOL", `[频控保护] 工具返回频率限制错误，正在等待 ${waitSec + 1} 秒后自动重试...`);
+          addDebugLog("TOOL", `[频控保护] 工具返回频率限制错误，正在等待 ${waitSec + 1} 秒后自动重试...`, "", logCategory);
         }
         await new Promise((resolve) => setTimeout(resolve, (waitSec + 1) * 1000));
         continue;
@@ -1062,7 +1116,7 @@ export function applyStringReplacements(content, edits, filePath = "") {
   return updated;
 }
 
-export async function executeGithubEditFile(serverInfo, readToolRawName, writeToolRawName, args, onWaitNotice = null, skipLogging = false) {
+export async function executeGithubEditFile(serverInfo, readToolRawName, writeToolRawName, args, onWaitNotice = null, skipLogging = false, logCategory = "chat") {
   const { owner, repo, path: filePath, old_str, new_str, edits, message, branch } = args || {};
 
   if (!owner || !repo || !filePath) {
@@ -1084,9 +1138,9 @@ export async function executeGithubEditFile(serverInfo, readToolRawName, writeTo
   }
 
   if (!skipLogging) {
-    addDebugLog("TOOL", `[局部编辑] 读取文件: ${owner}/${repo}/${filePath} (分支: ${branch || "默认"})`);
+    addDebugLog("TOOL", `[局部编辑] 读取文件: ${owner}/${repo}/${filePath} (分支: ${branch || "默认"})`, getArgs, logCategory);
   }
-  const getRes = await invokeMcpRawTool(serverInfo, readToolRawName, getArgs, onWaitNotice, skipLogging);
+  const getRes = await invokeMcpRawTool(serverInfo, readToolRawName, getArgs, onWaitNotice, skipLogging, logCategory);
   if (getRes.isToolError) {
     throw new Error(`读取文件失败: ${getRes.textContent.slice(0, 300)}`);
   }
@@ -1146,7 +1200,7 @@ export async function executeGithubEditFile(serverInfo, readToolRawName, writeTo
     const branchTool = findServerTool(serverInfo, ["list_branches"]);
     if (branchTool) {
       try {
-        const branchRes = await invokeMcpRawTool(serverInfo, branchTool.rawName, { owner, repo }, onWaitNotice, skipLogging);
+        const branchRes = await invokeMcpRawTool(serverInfo, branchTool.rawName, { owner, repo }, onWaitNotice, skipLogging, logCategory);
         if (!branchRes.isToolError && branchRes.textContent) {
           const names = Array.from(branchRes.textContent.matchAll(/"name"\s*:\s*"([^"]+)"/g), (m) => m[1]);
           if (names.length > 0) {
@@ -1172,9 +1226,9 @@ export async function executeGithubEditFile(serverInfo, readToolRawName, writeTo
   };
 
   if (!skipLogging) {
-    addDebugLog("TOOL", `[局部编辑] 提交更新到 GitHub: ${owner}/${repo}/${filePath} (SHA: ${fileSha})`);
+    addDebugLog("TOOL", `[局部编辑] 提交更新到 GitHub: ${owner}/${repo}/${filePath} (SHA: ${fileSha})`, { owner, repo, path: filePath, branch: targetBranch, message: commitMsg }, logCategory);
   }
-  const putRes = await invokeMcpRawTool(serverInfo, writeToolRawName, putArgs, onWaitNotice, skipLogging);
+  const putRes = await invokeMcpRawTool(serverInfo, writeToolRawName, putArgs, onWaitNotice, skipLogging, logCategory);
   if (putRes.isToolError) {
     throw new Error(`提交更新失败: ${putRes.textContent.slice(0, 300)}`);
   }
@@ -1259,11 +1313,7 @@ export function registerVirtualTools(serverInfo) {
         description: "目标分支名称 (可选，默认使用仓库默认分支)"
       }
     },
-    required: ["owner", "repo", "path", "message"],
-    anyOf: [
-      { required: ["old_str", "new_str"] },
-      { required: ["edits"] }
-    ]
+    required: ["owner", "repo", "path", "message"]
   };
 
   let virtualTool = serverInfo.tools.find((t) => t.key === toolKey || t.rawName === virtualRawName);
@@ -1301,8 +1351,8 @@ export function registerVirtualTools(serverInfo) {
   }
 
   if (serverInfo.status === "active" && virtualTool.enabled !== false) {
-    const virtualHandler = async (args, onWaitNotice, skipLogging = false) => {
-      return await executeGithubEditFile(serverInfo, readTool.rawName, writeTool.rawName, args, onWaitNotice, skipLogging);
+    const virtualHandler = async (args, onWaitNotice, skipLogging = false, logCategory = "chat") => {
+      return await executeGithubEditFile(serverInfo, readTool.rawName, writeTool.rawName, args, onWaitNotice, skipLogging, logCategory);
     };
     const regItem = {
       serverId: serverInfo.id,
@@ -1322,6 +1372,7 @@ export function registerVirtualTools(serverInfo) {
 export async function callMcpTool(toolKey, args, onWaitNoticeOrOptions = null, maybeSkipLogging = false) {
   let onWaitNotice = null;
   let skipLogging = false;
+  let logCategory = "chat";
 
   if (typeof onWaitNoticeOrOptions === "function") {
     onWaitNotice = onWaitNoticeOrOptions;
@@ -1329,6 +1380,9 @@ export async function callMcpTool(toolKey, args, onWaitNoticeOrOptions = null, m
   } else if (onWaitNoticeOrOptions && typeof onWaitNoticeOrOptions === "object") {
     onWaitNotice = onWaitNoticeOrOptions.onWaitNotice || null;
     skipLogging = Boolean(onWaitNoticeOrOptions.skipLogging);
+    if (onWaitNoticeOrOptions.logCategory) {
+      logCategory = onWaitNoticeOrOptions.logCategory;
+    }
   } else {
     skipLogging = Boolean(maybeSkipLogging);
   }
@@ -1336,26 +1390,28 @@ export async function callMcpTool(toolKey, args, onWaitNoticeOrOptions = null, m
   const info = findToolInfo(toolKey);
   if (!info) throw new Error(`未找到工具：${toolKey}`);
 
-  // 1. 拦截使用外部爬虫/抓取工具读取 GitHub 仓库代码
-  const isWebCrawler =
-    /firecrawl|scrape|crawl|browser|puppeteer|page|web_search/i.test(toolKey) ||
-    /firecrawl|scrape|crawl|browser|puppeteer|page|web_search/i.test(info?.rawName || "");
-  const targetUrl = String(args?.url || args?.start_url || "").toLowerCase();
-  if (isWebCrawler && (targetUrl.includes("raw.githubusercontent.com") || targetUrl.includes("github.com"))) {
-    return {
-      isError: true,
-      content: JSON.stringify({
-        error:
-          "【工具使用规范拦截】严禁使用网络爬虫/网页抓取工具爬取 GitHub 仓库或 raw.githubusercontent.com 代码！当前已挂载官方 GitHub 工具，请必须直接调用 `github_get_file_contents(owner, repo, path)` 获取最新纯源码！"
-      })
-    };
+  // 1. 仅在内部 Agent 对话模式下拦截使用外部爬虫读取 GitHub 仓库代码；外部 MCP 模式完全保持原生不拦截
+  if (logCategory !== "mcp") {
+    const isWebCrawler =
+      /firecrawl|scrape|crawl|browser|puppeteer|page|web_search/i.test(toolKey) ||
+      /firecrawl|scrape|crawl|browser|puppeteer|page|web_search/i.test(info?.rawName || "");
+    const targetUrl = String(args?.url || args?.start_url || "").toLowerCase();
+    if (isWebCrawler && (targetUrl.includes("raw.githubusercontent.com") || targetUrl.includes("github.com"))) {
+      return {
+        isError: true,
+        content: JSON.stringify({
+          error:
+            "【工具使用规范拦截】严禁使用网络爬虫/网页抓取工具爬取 GitHub 仓库或 raw.githubusercontent.com 代码！当前已挂载官方 GitHub 工具，请必须直接调用 `get_file_contents(owner, repo, path)` 获取最新纯源码！"
+        })
+      };
+    }
   }
 
   const isCfExecute =
     (toolKey.toLowerCase().includes("cloudflare") || (info?.serverName || "").toLowerCase().includes("cloudflare")) &&
     (toolKey.endsWith("execute") || info?.rawName === "execute");
 
-  if (isCfExecute) {
+  if (isCfExecute && logCategory !== "mcp") {
     if (typeof args?.account_id === "string" && (args.account_id.includes("@") || args.account_id.includes(" ") || args.account_id.includes("Account"))) {
       return {
         isError: true,
@@ -1366,7 +1422,7 @@ export async function callMcpTool(toolKey, args, onWaitNoticeOrOptions = null, m
     }
   }
 
-  if (isCfExecute && typeof args?.code === "string") {
+  if (isCfExecute && typeof args?.code === "string" && logCategory !== "mcp") {
     const rawCode = args.code;
     if (
       rawCode.includes("DEFAULT_BASE_URL") ||
@@ -1386,7 +1442,7 @@ export async function callMcpTool(toolKey, args, onWaitNoticeOrOptions = null, m
   const startTime = Date.now();
   if (typeof info.handler === "function") {
     try {
-      const res = await info.handler(args, onWaitNotice, skipLogging);
+      const res = await info.handler(args, onWaitNotice, skipLogging, logCategory);
       const duration = Date.now() - startTime;
       const isError = Boolean(res && res.isError);
       const content = typeof res?.content === "string" ? res.content : JSON.stringify(res || {});
@@ -1394,17 +1450,22 @@ export async function callMcpTool(toolKey, args, onWaitNoticeOrOptions = null, m
         ? res.content
         : [{ type: "text", text: content }];
       if (!skipLogging) {
-        addDebugLog(isError ? "ERROR" : "TOOL", `虚拟 MCP 工具 [${toolKey}] 执行${isError ? "失败" : "成功"} - 耗时 ${duration}ms`, {
-          arguments: args,
-          outputPreview: content.slice(0, 500)
-        });
+        addDebugLog(
+          isError ? "ERROR" : "TOOL",
+          `虚拟 MCP 工具 [${info.rawName || toolKey}] 执行${isError ? "失败" : "成功"} - 耗时 ${duration}ms`,
+          {
+            arguments: args,
+            outputPreview: content.slice(0, 500)
+          },
+          logCategory
+        );
       }
       return { isError, content, rawContent };
     } catch (err) {
       const duration = Date.now() - startTime;
       const msg = err instanceof Error ? err.message : String(err);
       if (!skipLogging) {
-        addDebugLog("ERROR", `虚拟 MCP 工具 [${toolKey}] 异常 - 耗时 ${duration}ms`, msg);
+        addDebugLog("ERROR", `虚拟 MCP 工具 [${info.rawName || toolKey}] 异常 - 耗时 ${duration}ms`, msg, logCategory);
       }
       return {
         isError: true,
@@ -1415,24 +1476,31 @@ export async function callMcpTool(toolKey, args, onWaitNoticeOrOptions = null, m
   }
 
   try {
-    const { rawResult, isToolError, textContent, rawContent } = await invokeMcpRawTool(info, info.rawName, args, onWaitNotice, skipLogging);
+    const { rawResult, isToolError, textContent, rawContent } = await invokeMcpRawTool(info, info.rawName, args, onWaitNotice, skipLogging, logCategory);
     const duration = Date.now() - startTime;
     if (isToolError) {
       let refinedContent = textContent;
-      if (isCfExecute && (textContent.includes("Unexpected token 'F'") || textContent.includes("Forbidden"))) {
-        refinedContent = `${textContent}\n\n【诊断指引】此报错通常是因为在 execute 脚本中使用了原生 fetch 请求 Cloudflare 接口导致被 403 拦截并返回纯文本。请使用沙箱内置的 \`cloudflare.request({ method, path, body })\` 与全局变量 \`accountId\`，严禁在脚本中自拼 URL 或裸调 fetch。`;
-      } else if (isCfExecute && (textContent.includes("Invalid or unexpected token") || textContent.includes("SyntaxError"))) {
-        refinedContent = `${textContent}\n\n【语法错误自愈指引】execute 代码解析失败（通常是因为在 code 字符串中直接嵌套包含反引号、模板字符串 \${...} 或大段 HTML 的源码导致的转义冲突）。\n【正确做法】：严禁在 code 中全量硬编码几十 KB 源码！请改用内存局部替换流程：\n1. 先通过 GET 读取当前脚本：const raw = await cloudflare.request({ method: 'GET', path: \`/accounts/\${accountId}/workers/scripts/\${scriptName}\`, rawBody: true });\n2. 使用 raw.replace(oldCode, newCode) 替换目标片段；\n3. 再调用 PUT 将替换后的代码更新上传。这样无需转义完整脚本，避免语法错误。`;
-      } else if (isCfExecute && (textContent.includes("is not one of this session's accounts") || textContent.includes("Could not route to /client/v4/accounts"))) {
-        refinedContent = `${textContent}\n\n【账户ID诊断指引】account_id 错误！传入的 account_id 必须为 32 位十六进制字符串（如错误提示中给出的可用账户 ID），切勿使用账户邮箱或显示名称。亦可直接使用沙箱内置的全局变量 accountId。`;
-      } else if (isCfExecute && (textContent.includes("part 'metadata'") || textContent.includes("main_module") || textContent.includes("binding") || textContent.includes("10021"))) {
-        refinedContent = `${textContent}\n\n【Cloudflare Worker 部署格式自愈指引】Cloudflare Module Worker 上传失败。规范要求且仅要求提供两个 FormData 部件：\n1. metadata：必须为 JSON 字符串对象 \`JSON.stringify({ main_module: \"worker.js\" })\`。注意：【严禁在 metadata 中传入 bindings】（因为环境变量/密钥在 GET 接口中脱敏加密，传入会导致 missing text property 校验失败；留空 bindings 会自动保留云端所有现有环境变量与密钥）！\n2. worker.js：修改后的完整脚本代码 Blob。\n标准上传代码：\nconst form = new FormData();\nform.append(\"metadata\", new Blob([JSON.stringify({ main_module: \"worker.js\" })], { type: \"application/json\" }));\nform.append(\"worker.js\", new Blob([updatedCode], { type: \"application/javascript+module\" }), \"worker.js\");\nreturn await cloudflare.request({ method: \"PUT\", path: \`/accounts/\${accountId}/workers/scripts/\${scriptName}\`, body: form });`;
+      if (logCategory !== "mcp") {
+        if (isCfExecute && (textContent.includes("Unexpected token 'F'") || textContent.includes("Forbidden"))) {
+          refinedContent = `${textContent}\n\n【诊断指引】此报错通常是因为在 execute 脚本中使用了原生 fetch 请求 Cloudflare 接口导致被 403 拦截并返回纯文本。请使用沙箱内置的 \`cloudflare.request({ method, path, body })\` 与全局变量 \`accountId\`，严禁在脚本中自拼 URL 或裸调 fetch。`;
+        } else if (isCfExecute && (textContent.includes("Invalid or unexpected token") || textContent.includes("SyntaxError"))) {
+          refinedContent = `${textContent}\n\n【语法错误自愈指引】execute 代码解析失败（通常是因为在 code 字符串中直接嵌套包含反引号、模板字符串 \${...} 或大段 HTML 的源码导致的转义冲突）。\n【正确做法】：严禁在 code 中全量硬编码几十 KB 源码！请改用内存局部替换流程：\n1. 先通过 GET 读取当前脚本：const raw = await cloudflare.request({ method: 'GET', path: \`/accounts/\${accountId}/workers/scripts/\${scriptName}\`, rawBody: true });\n2. 使用 raw.replace(oldCode, newCode) 替换目标片段；\n3. 再调用 PUT 将替换后的代码更新上传。这样无需转义完整脚本，避免语法错误。`;
+        } else if (isCfExecute && (textContent.includes("is not one of this session's accounts") || textContent.includes("Could not route to /client/v4/accounts"))) {
+          refinedContent = `${textContent}\n\n【账户ID诊断指引】account_id 错误！传入的 account_id 必须为 32 位十六进制字符串（如错误提示中给出的可用账户 ID），切勿使用账户邮箱或显示名称。亦可直接使用沙箱内置的全局变量 accountId。`;
+        } else if (isCfExecute && (textContent.includes("part 'metadata'") || textContent.includes("main_module") || textContent.includes("binding") || textContent.includes("10021"))) {
+          refinedContent = `${textContent}\n\n【Cloudflare Worker 部署格式自愈指引】Cloudflare Module Worker 上传失败。规范要求且仅要求提供两个 FormData 部件：\n1. metadata：必须为 JSON 字符串对象 \`JSON.stringify({ main_module: \"worker.js\" })\`。注意：【严禁在 metadata 中传入 bindings】（因为环境变量/密钥在 GET 接口中脱敏加密，传入会导致 missing text property 校验失败；留空 bindings 会自动保留云端所有现有环境变量与密钥）！\n2. worker.js：修改后的完整脚本代码 Blob。\n标准上传代码：\nconst form = new FormData();\nform.append(\"metadata\", new Blob([JSON.stringify({ main_module: \"worker.js\" })], { type: \"application/json\" }));\nform.append(\"worker.js\", new Blob([updatedCode], { type: \"application/javascript+module\" }), \"worker.js\");\nreturn await cloudflare.request({ method: \"PUT\", path: \`/accounts/\${accountId}/workers/scripts/\${scriptName}\`, body: form });`;
+        }
       }
       if (!skipLogging) {
-        addDebugLog("ERROR", `MCP 工具 [${toolKey}] 返回错误 - 耗时 ${duration}ms`, {
-          arguments: args,
-          errorOutput: refinedContent.slice(0, 500)
-        });
+        addDebugLog(
+          "ERROR",
+          `MCP 工具 [${info.rawName || toolKey}] 返回错误 - 耗时 ${duration}ms`,
+          {
+            arguments: args,
+            errorOutput: refinedContent.slice(0, 500)
+          },
+          logCategory
+        );
       }
       return {
         isError: true,
@@ -1443,10 +1511,15 @@ export async function callMcpTool(toolKey, args, onWaitNoticeOrOptions = null, m
       };
     }
     if (!skipLogging) {
-      addDebugLog("TOOL", `MCP 工具 [${toolKey}] 执行成功 - 耗时 ${duration}ms, 输出 ${textContent.length} 字符`, {
-        arguments: args,
-        outputPreview: textContent.slice(0, 500)
-      });
+      addDebugLog(
+        "TOOL",
+        `MCP 工具 [${info.rawName || toolKey}] 执行成功 - 耗时 ${duration}ms, 输出 ${textContent.length} 字符`,
+        {
+          arguments: args,
+          outputPreview: textContent.slice(0, 500)
+        },
+        logCategory
+      );
     }
     return {
       isError: false,
@@ -1458,19 +1531,21 @@ export async function callMcpTool(toolKey, args, onWaitNoticeOrOptions = null, m
   } catch (err) {
     const duration = Date.now() - startTime;
     let msg = err instanceof Error ? err.message : String(err);
-    if (isCfExecute && (msg.includes("Unexpected token 'F'") || msg.includes("Forbidden"))) {
-      msg = `${msg} (诊断指引: 请使用沙箱内置的 cloudflare.request 与 accountId，严禁使用原生 fetch 或自拼 DEFAULT_BASE_URL)`;
-    } else if (isCfExecute && (msg.includes("Invalid or unexpected token") || msg.includes("SyntaxError"))) {
-      msg = `${msg} (语法自愈指引: 请勿在 code 脚本中全量硬编码大段源码字符串！建议在内存中先 GET 读取现有代码，通过 .replace(旧逻辑, 新逻辑) 局部替换后再 PUT 上传)`;
-    } else if (isCfExecute && (msg.includes("is not one of this session's accounts") || msg.includes("Could not route to /client/v4/accounts"))) {
-      msg = `${msg} (账户ID指引: account_id 必须为 32 位十六进制字符串，切勿传入邮箱或名称，建议直接使用全局变量 accountId)`;
-    } else if (isCfExecute && (msg.includes("Cannot read properties of undefined") || msg.includes("split"))) {
-      msg = `${msg} (脚本解析指引: GET 返回的 multipart 文本中不含 metadata，切勿尝试从 GET 结果中提取 metadata！提取 worker.js 请直接使用: code = raw.split('name=\"worker.js\"')[1].split(/\\r?\\n\\r?\\n/)[1]，然后构造包含 { main_module: "worker.js" } 的 FormData 发送 PUT)`;
-    } else if (isCfExecute && (msg.includes("part 'metadata'") || msg.includes("main_module") || msg.includes("binding") || msg.includes("10021"))) {
-      msg = `${msg} (Worker部署指引: 请使用 FormData 且仅添加 metadata: { main_module: "worker.js" } 与 worker.js。切勿在 metadata 中传入 bindings，留空会自动保留云端环境变量)`;
+    if (logCategory !== "mcp") {
+      if (isCfExecute && (msg.includes("Unexpected token 'F'") || msg.includes("Forbidden"))) {
+        msg = `${msg} (诊断指引: 请使用沙箱内置的 cloudflare.request 与 accountId，严禁使用原生 fetch 或自拼 DEFAULT_BASE_URL)`;
+      } else if (isCfExecute && (msg.includes("Invalid or unexpected token") || msg.includes("SyntaxError"))) {
+        msg = `${msg} (语法自愈指引: 请勿在 code 脚本中全量硬编码大段源码字符串！建议在内存中先 GET 读取现有代码，通过 .replace(旧逻辑, 新逻辑) 局部替换后再 PUT 上传)`;
+      } else if (isCfExecute && (msg.includes("is not one of this session's accounts") || msg.includes("Could not route to /client/v4/accounts"))) {
+        msg = `${msg} (账户ID指引: account_id 必须为 32 位十六进制字符串，切勿传入邮箱或名称，建议直接使用全局变量 accountId)`;
+      } else if (isCfExecute && (msg.includes("Cannot read properties of undefined") || msg.includes("split"))) {
+        msg = `${msg} (脚本解析指引: GET 返回的 multipart 文本中不含 metadata，切勿尝试从 GET 结果中提取 metadata！提取 worker.js 请直接使用: code = raw.split('name=\"worker.js\"')[1].split(/\\r?\\n\\r?\\n/)[1]，然后构造包含 { main_module: "worker.js" } 的 FormData 发送 PUT)`;
+      } else if (isCfExecute && (msg.includes("part 'metadata'") || msg.includes("main_module") || msg.includes("binding") || msg.includes("10021"))) {
+        msg = `${msg} (Worker部署指引: 请使用 FormData 且仅添加 metadata: { main_module: "worker.js" } 与 worker.js。切勿在 metadata 中传入 bindings，留空会自动保留云端环境变量)`;
+      }
     }
     if (!skipLogging) {
-      addDebugLog("ERROR", `MCP 工具 [${toolKey}] 异常 - 耗时 ${duration}ms`, msg);
+      addDebugLog("ERROR", `MCP 工具 [${info.rawName || toolKey}] 异常 - 耗时 ${duration}ms`, msg, logCategory);
     }
     throw (err instanceof Error ? new Error(msg) : new Error(String(msg)));
   }
