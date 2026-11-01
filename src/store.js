@@ -442,7 +442,7 @@ export async function loadChannelsFromStorage() {
   if (dbPool) {
     stored = await getStorageItem("upstream_channels");
   }
-  if (!stored && fs.existsSync(CHANNELS_FILE)) {
+  if (stored === null && fs.existsSync(CHANNELS_FILE)) {
     try {
       const raw = fs.readFileSync(CHANNELS_FILE, "utf8");
       stored = JSON.parse(raw);
@@ -452,19 +452,18 @@ export async function loadChannelsFromStorage() {
     } catch {}
   }
 
-  if (Array.isArray(stored) && stored.length > 0) {
+  // 如果数据库或本地文件已保存过渠道配置，以数据库/存储的权威配置为准
+  if (Array.isArray(stored)) {
+    upstreamChannels.length = 0;
     for (const sc of stored) {
       if (sc && sc.id && sc.baseUrl && sc.apiKey) {
-        const existingIdx = upstreamChannels.findIndex((c) => c.id === sc.id);
-        if (existingIdx !== -1) {
-          upstreamChannels[existingIdx] = {
-            ...upstreamChannels[existingIdx],
-            ...sc
-          };
-        } else {
-          upstreamChannels.push(sc);
-        }
+        upstreamChannels.push(sc);
       }
+    }
+  } else {
+    // 首次运行尚未存入数据库，将当前从环境变量解析的初始渠道自动存入数据库
+    if (upstreamChannels.length > 0) {
+      await saveChannelsToStorage();
     }
   }
 
