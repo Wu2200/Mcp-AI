@@ -188,20 +188,25 @@ export async function connectToMcpServer({ name, url, token }) {
       openAiTool: {
         type: "function",
         function: {
-          name: toolKey,
-          description: `[${name}] ${t.description || t.name}`,
+          name: t.name,
+          description: t.description || t.name,
           parameters: t.inputSchema || { type: "object", properties: {} }
         }
       }
     });
 
-    mcpToolRegistry.set(toolKey, {
+    const registryItem = {
       serverId,
       serverName: name,
       rawName: t.name,
       postEndpoint: cleanUrl,
       headers
-    });
+    };
+    mcpToolRegistry.set(toolKey, registryItem);
+    // 默认双向原生注册：使原生名直接在底层 O(1) 索引，无需前缀或映射查找
+    if (!mcpToolRegistry.has(t.name)) {
+      mcpToolRegistry.set(t.name, registryItem);
+    }
   }
 
   const serverInfo = {
