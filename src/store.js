@@ -570,16 +570,22 @@ export function sendOpenAIError(response, statusCode, message, type = "invalid_r
 export function isProxyAuthorized(request) {
   if (!PROXY_API_KEY) return true;
   const reqUrl = new URL(request.url, `http://${request.headers.host || "localhost"}`);
-  const queryKey = reqUrl.searchParams.get("key") || "";
-  if (queryKey && queryKey === PROXY_API_KEY) return true;
+  const queryKey =
+    reqUrl.searchParams.get("key") ||
+    reqUrl.searchParams.get("token") ||
+    reqUrl.searchParams.get("api_key") ||
+    "";
+  if (queryKey && queryKey.trim() === PROXY_API_KEY) return true;
 
-  const headerKey = request.headers["x-goog-api-key"] || "";
+  const headerKey =
+    request.headers["x-goog-api-key"] ||
+    request.headers["x-api-key"] ||
+    request.headers["api-key"] ||
+    "";
   if (headerKey && headerKey.trim() === PROXY_API_KEY) return true;
 
   const authorization = request.headers.authorization || "";
-  const token = authorization.startsWith("Bearer ")
-    ? authorization.slice(7).trim()
-    : authorization.trim();
+  const token = authorization.replace(/^Bearer\s+/i, "").trim();
   return token === PROXY_API_KEY;
 }
 
