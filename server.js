@@ -211,6 +211,8 @@ const server = http.createServer(async (request, response) => {
   });
 
   try {
+    const reqUrl = new URL(request.url, `http://${request.headers.host || "localhost"}`);
+
     if (request.method === "OPTIONS") {
       if (reqUrl.pathname === "/mcp" || reqUrl.pathname.startsWith("/mcp/")) {
         setCorsHeaders(response);
@@ -224,8 +226,6 @@ const server = http.createServer(async (request, response) => {
       response.end();
       return;
     }
-
-    const reqUrl = new URL(request.url, `http://${request.headers.host || "localhost"}`);
 
     if ((request.method === "GET" || request.method === "HEAD") && (reqUrl.pathname === "/" || reqUrl.pathname === "")) {
       setCorsHeaders(response);
