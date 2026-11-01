@@ -624,13 +624,17 @@ const server = http.createServer(async (request, response) => {
             t.statusMessage = "";
             count += 1;
             if (s.status === "active" && !t.isVirtual) {
-              mcpToolRegistry.set(t.key, {
+              const regItem = {
                 serverId: s.id,
                 serverName: s.name,
                 rawName: t.rawName,
                 postEndpoint: s.postEndpoint,
                 headers: s.headers
-              });
+              };
+              mcpToolRegistry.set(t.key, regItem);
+              if (!mcpToolRegistry.has(t.rawName)) {
+                mcpToolRegistry.set(t.rawName, regItem);
+              }
             }
           }
           if (s.status === "active") {
