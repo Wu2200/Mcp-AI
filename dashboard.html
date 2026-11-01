@@ -571,9 +571,12 @@
           <span>上游渠道切换</span>
           <span id="active-channel-badge" class="badge badge-blue">加载中</span>
         </div>
+        <div class="action-group">
+          <button class="btn-action btn-start" onclick="handleOpenAddChannel()">+ 添加渠道</button>
+        </div>
       </div>
       <p style="font-size: 12px; color: #64748b; margin-bottom: 12px;">
-        通过环境变量 UPSTREAM_1、UPSTREAM_2 等配置多组渠道，格式为 链接|密钥 或 名称|链接|密钥。点击下方按钮可随时切换当前生效渠道。
+        支持在此直接添加、编辑和删除上游渠道（自动同步至数据库持久化保存），亦支持通过环境变量 UPSTREAM_1 等配置。点击切换按钮随时切换当前生效渠道。
       </p>
       <div id="channel-list">
         <div class="empty-state">正在加载上游渠道...</div>
@@ -588,11 +591,18 @@
         </div>
       </div>
       <div class="group">
-        <label>API 域名</label>
+        <label>API 基础地址 (Chat 客户端接入)</label>
         <div class="box" id="proxy-url"></div>
       </div>
       <div class="group">
-        <label>模型</label>
+        <label>第三方 MCP 服务接入地址 (支持按服务名或挂载全部)</label>
+        <div class="box" id="mcp-endpoint-url"></div>
+        <p style="font-size: 12px; color: #64748b; margin-top: 4px;">
+          在 Cursor、Claude Desktop 等第三方平台填入此 URL 即可挂载全部工具；亦可将后缀追加已导入的服务名称（如 <code>/mcp/github</code> 或 <code>/mcp/cloudflare</code>）按需接入。外部调用完全静默，不记录到控制台日志。
+        </p>
+      </div>
+      <div class="group">
+        <label>支持模型</label>
         <div class="box">跟随当前所选上游渠道支持的模型，例如 gpt-4o、claude-3-5-sonnet、gemini-2.5-flash</div>
       </div>
     </div>
@@ -693,6 +703,33 @@
     </div>
   </div>
 
+  <div id="channel-modal" class="modal-overlay" onclick="if(event.target===this)closeChannelModal()">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3 id="channel-modal-title">添加上游渠道</h3>
+        <button class="modal-close" onclick="closeChannelModal()">×</button>
+      </div>
+      <input type="hidden" id="channel-modal-id">
+      <div class="group">
+        <label>渠道名称</label>
+        <input id="channel-modal-name" placeholder="例如：第1组 或 DeepSeek官方">
+      </div>
+      <div class="group">
+        <label>API 基础地址 (Base URL)</label>
+        <input id="channel-modal-url" placeholder="例如：https://api.openai.com 或 https://api.deepseek.com">
+      </div>
+      <div class="group">
+        <label>API 密钥 (API Key)</label>
+        <input id="channel-modal-key" type="password" placeholder="sk-...">
+      </div>
+      <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; align-items: center;">
+        <span id="channel-modal-msg" style="margin-right: auto; font-size: 12px; font-weight: 500;"></span>
+        <button class="btn btn-secondary" onclick="closeChannelModal()">取消</button>
+        <button id="btn-save-channel" class="btn" onclick="handleSaveChannel()">保存并应用</button>
+      </div>
+    </div>
+  </div>
+
   <div id="edit-modal" class="modal-overlay" onclick="if(event.target===this)closeEditModal()">
     <div class="modal-box">
       <div class="modal-header">
@@ -722,11 +759,13 @@
 
   <script>
     document.getElementById("proxy-url").innerText = window.location.origin + "/v1";
+    document.getElementById("mcp-endpoint-url").innerText = window.location.origin + "/mcp";
 
     let currentEnabledList = [];
     let isLoggingActive = true;
     let cachedLogs = [];
     let cachedServers = [];
+    let cachedChannels = [];
 
     async function handleLogout() {
       await fetch("/api/panel/logout", { method: "POST" });
@@ -741,11 +780,12 @@
         if (!res.ok) throw new Error("获取渠道失败");
         const data = await res.json();
         const channels = data.channels || [];
+        cachedChannels = channels;
 
         if (channels.length === 0) {
           badge.className = "badge badge-red";
           badge.innerText = "未配置";
-          container.innerHTML = '<div class="empty-state">尚未检测到上游渠道环境变量。请在环境变量中添加 UPSTREAM_1，值为 链接|密钥。</div>';
+          container.innerHTML = '<div class="empty-state">尚未配置任何上游渠道。请点击右上角“+ 添加渠道”或在环境变量中配置 UPSTREAM_1。</div>';
           return;
         }
 
@@ -755,22 +795,29 @@
 
         container.innerHTML = channels.map(c => {
           const statusBadge = c.active
-            ? '<span class="badge badge-green">使用中</span>'
-            : '<span class="badge badge-gray">备用</span>';
-          const actionBtn = c.active
+            ? '<span class="badge badge-green">当前使用</span>'
+            : '';
+
+          const switchBtn = c.active
             ? '<button class="btn-action btn-active-channel" disabled>当前使用</button>'
-            : `<button class="btn-action btn-start" onclick="switchChannel('${c.id}')">切换使用</button>`;
+            : `<button class="btn-action btn-start" onclick="switchChannel('${c.id}')">切换至此</button>`;
+
+          const deleteBtn = channels.length > 1
+            ? `<button class="btn-action btn-del" onclick="handleDeleteChannel('${c.id}', '${escapeHtml(c.name)}')">删除</button>`
+            : '';
 
           return `
             <div class="channel-item ${c.active ? 'active' : ''}">
               <div class="server-item-head">
                 <div class="server-item-title">
                   <span class="server-name-text">${escapeHtml(c.name)}</span>
-                  <span class="badge badge-blue">${escapeHtml(c.envKey)}</span>
+                  <span class="badge badge-blue">${escapeHtml(c.envKey || '自定义')}</span>
                   ${statusBadge}
                 </div>
                 <div class="action-group">
-                  ${actionBtn}
+                  <button class="btn-action btn-edit" onclick="handleOpenEditChannel('${c.id}')">编辑</button>
+                  ${switchBtn}
+                  ${deleteBtn}
                 </div>
               </div>
               <div class="channel-meta">
@@ -805,6 +852,92 @@
       } catch (e) {
         msg.innerText = e.message;
         msg.style.color = "#dc2626";
+      }
+    }
+
+    function handleOpenAddChannel() {
+      document.getElementById("channel-modal-title").innerText = "添加上游渠道";
+      document.getElementById("channel-modal-id").value = "";
+      document.getElementById("channel-modal-name").value = "";
+      document.getElementById("channel-modal-url").value = "";
+      document.getElementById("channel-modal-key").value = "";
+      document.getElementById("channel-modal-key").placeholder = "粘贴 API 密钥 (sk-...)";
+      document.getElementById("channel-modal-msg").innerText = "";
+      document.getElementById("channel-modal").classList.add("open");
+    }
+
+    function handleOpenEditChannel(id) {
+      const c = cachedChannels.find(item => item.id === id);
+      if (!c) return;
+      document.getElementById("channel-modal-title").innerText = "编辑上游渠道";
+      document.getElementById("channel-modal-id").value = c.id;
+      document.getElementById("channel-modal-name").value = c.name || "";
+      document.getElementById("channel-modal-url").value = c.baseUrl || "";
+      document.getElementById("channel-modal-key").value = "";
+      document.getElementById("channel-modal-key").placeholder = "留空则保持现有密钥不变";
+      document.getElementById("channel-modal-msg").innerText = "";
+      document.getElementById("channel-modal").classList.add("open");
+    }
+
+    function closeChannelModal() {
+      document.getElementById("channel-modal").classList.remove("open");
+    }
+
+    async function handleSaveChannel() {
+      const id = document.getElementById("channel-modal-id").value.trim();
+      const name = document.getElementById("channel-modal-name").value.trim();
+      const baseUrl = document.getElementById("channel-modal-url").value.trim();
+      const apiKey = document.getElementById("channel-modal-key").value.trim();
+      const msg = document.getElementById("channel-modal-msg");
+      const btn = document.getElementById("btn-save-channel");
+
+      if (!name || !baseUrl) {
+        msg.innerText = "渠道名称与 API 链接不能为空";
+        msg.style.color = "#dc2626";
+        return;
+      }
+      if (!id && !apiKey) {
+        msg.innerText = "新添加渠道必须提供 API 密钥";
+        msg.style.color = "#dc2626";
+        return;
+      }
+
+      msg.innerText = "正在保存到数据库...";
+      msg.style.color = "#2563eb";
+      btn.disabled = true;
+
+      try {
+        const url = id ? "/api/upstream/channels/update" : "/api/upstream/channels/add";
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id, name, baseUrl, apiKey })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "保存失败");
+        msg.innerText = "保存成功";
+        msg.style.color = "#16a34a";
+        setTimeout(() => {
+          closeChannelModal();
+          loadChannels();
+        }, 500);
+      } catch (e) {
+        msg.innerText = e.message;
+        msg.style.color = "#dc2626";
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function handleDeleteChannel(id, name) {
+      if (!confirm(`确认删除上游渠道 [${name}]？`)) return;
+      try {
+        const res = await fetch(`/api/upstream/channels/${encodeURIComponent(id)}`, { method: "DELETE" });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "删除失败");
+        loadChannels();
+      } catch (e) {
+        alert(e.message);
       }
     }
 
