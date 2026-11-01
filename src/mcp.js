@@ -1305,6 +1305,17 @@ export async function callMcpTool(toolKey, args, onWaitNotice = null) {
     (toolKey.toLowerCase().includes("cloudflare") || (info?.serverName || "").toLowerCase().includes("cloudflare")) &&
     (toolKey.endsWith("execute") || info?.rawName === "execute");
 
+  if (isCfExecute) {
+    if (typeof args?.account_id === "string" && (args.account_id.includes("@") || args.account_id.includes(" ") || args.account_id.includes("Account"))) {
+      return {
+        isError: true,
+        content: JSON.stringify({
+          error: `【Cloudflare 参数错误】传入的 account_id ("${args.account_id}") 不是有效的 32 位十六进制 Account ID！切勿使用邮箱或账户名。请直接在 code 脚本中使用全局预置的 \`accountId\` 变量，或使用 32 位十六进制 ID。`
+        })
+      };
+    }
+  }
+
   if (isCfExecute && typeof args?.code === "string") {
     const rawCode = args.code;
     if (
@@ -1349,6 +1360,10 @@ export async function callMcpTool(toolKey, args, onWaitNotice = null) {
       let refinedContent = textContent;
       if (isCfExecute && (textContent.includes("Unexpected token 'F'") || textContent.includes("Forbidden"))) {
         refinedContent = `${textContent}\n\n【诊断指引】此报错通常是因为在 execute 脚本中使用了原生 fetch 请求 Cloudflare 接口导致被 403 拦截并返回纯文本。请使用沙箱内置的 \`cloudflare.request({ method, path, body })\` 与全局变量 \`accountId\`，严禁在脚本中自拼 URL 或裸调 fetch。`;
+      } else if (isCfExecute && (textContent.includes("Invalid or unexpected token") || textContent.includes("SyntaxError"))) {
+        refinedContent = `${textContent}\n\n【语法错误自愈指引】execute 代码解析失败（通常是因为在 code 字符串中直接嵌套包含反引号、模板字符串 \${...} 或大段 HTML 的源码导致的转义冲突）。\n【正确做法】：严禁在 code 中全量硬编码几十 KB 源码！请改用内存局部替换流程：\n1. 先通过 GET 读取当前脚本：const raw = await cloudflare.request({ method: 'GET', path: \`/accounts/\${accountId}/workers/scripts/\${scriptName}\`, rawBody: true });\n2. 使用 raw.replace(oldCode, newCode) 替换目标片段；\n3. 再调用 PUT 将替换后的代码更新上传。这样无需转义完整脚本，避免语法错误。`;
+      } else if (isCfExecute && (textContent.includes("is not one of this session's accounts") || textContent.includes("Could not route to /client/v4/accounts"))) {
+        refinedContent = `${textContent}\n\n【账户ID诊断指引】account_id 错误！传入的 account_id 必须为 32 位十六进制字符串（如错误提示中给出的可用账户 ID），切勿使用账户邮箱或显示名称。亦可直接使用沙箱内置的全局变量 accountId。`;
       }
       addDebugLog("ERROR", `MCP 工具 [${toolKey}] 返回错误 - 耗时 ${duration}ms`, {
         arguments: args,
@@ -1366,6 +1381,10 @@ export async function callMcpTool(toolKey, args, onWaitNotice = null) {
     let msg = err instanceof Error ? err.message : String(err);
     if (isCfExecute && (msg.includes("Unexpected token 'F'") || msg.includes("Forbidden"))) {
       msg = `${msg} (诊断指引: 请使用沙箱内置的 cloudflare.request 与 accountId，严禁使用原生 fetch 或自拼 DEFAULT_BASE_URL)`;
+    } else if (isCfExecute && (msg.includes("Invalid or unexpected token") || msg.includes("SyntaxError"))) {
+      msg = `${msg} (语法自愈指引: 请勿在 code 脚本中全量硬编码大段源码字符串！建议在内存中先 GET 读取现有代码，通过 .replace(旧逻辑, 新逻辑) 局部替换后再 PUT 上传)`;
+    } else if (isCfExecute && (msg.includes("is not one of this session's accounts") || msg.includes("Could not route to /client/v4/accounts"))) {
+      msg = `${msg} (账户ID指引: account_id 必须为 32 位十六进制字符串，切勿传入邮箱或名称，建议直接使用全局变量 accountId)`;
     }
     addDebugLog("ERROR", `MCP 工具 [${toolKey}] 异常 - 耗时 ${duration}ms`, msg);
     throw (err instanceof Error ? new Error(msg) : new Error(String(msg)));
@@ -1443,7 +1462,7 @@ export function selectRelevantTools(userText, allTools) {
   return scored.map((item) => item.tool);
 }
 
-export function isWriteTool(toolName) {
+export function isWriteTool(toolName, args = null) {
   if (!toolName || typeof toolName !== "string") return false;
   const lower = toolName.toLowerCase();
   const writePatterns = [
@@ -1451,7 +1470,19 @@ export function isWriteTool(toolName) {
     "push", "modify", "merge", "fork", "cancel", "rerun",
     "trigger", "comment", "star", "unstar", "manage"
   ];
-  return writePatterns.some((pattern) => lower.includes(pattern));
+  if (writePatterns.some((pattern) => lower.includes(pattern))) return true;
+
+  if (lower.includes("execute") || lower.includes("exec") || lower.includes("run") || lower.includes("bash") || lower.includes("terminal")) {
+    if (args && typeof args === "object") {
+      const codeStr = String(args.code || args.command || args.cmd || "").toLowerCase();
+      const methodStr = String(args.method || "").toLowerCase();
+      if (methodStr === "put" || methodStr === "post" || methodStr === "patch" || methodStr === "delete") return true;
+      if (/method\s*:\s*['"](?:put|post|patch|delete)['"]/i.test(codeStr)) return true;
+      if (/(?:put|post|patch|delete)\s*\(/i.test(codeStr)) return true;
+      if (/(?:rm|mv|cp|mkdir|touch|sed|git\s+commit|git\s+push|npm\s+install|yarn\s+add)/i.test(codeStr)) return true;
+    }
+  }
+  return false;
 }
 
 export async function checkAllTools(modelName) {
