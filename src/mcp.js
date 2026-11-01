@@ -340,6 +340,7 @@ export async function updateMcpServer({ id, name, url, token }) {
       key: toolKey,
       rawName: t.name,
       description: t.description || t.name,
+      inputSchema: t.inputSchema || { type: "object", properties: {} },
       enabled: isEnabled,
       status,
       statusMessage,
