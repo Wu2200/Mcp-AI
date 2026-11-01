@@ -1546,14 +1546,27 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
   if (hasCloudflare) {
     systemRules.push(
       "【Cloudflare 工具执行规范】\n" +
-      "1. 沙箱环境预置：沙箱内已预置带有鉴权的全局客户端 `cloudflare.request({ method, path, body, contentType, rawBody })` 与当前账户的全局变量 `accountId`（32位十六进制字符串）。严禁自行拼接 BaseURL 或使用原生 fetch()，必须直接使用 `cloudflare.request`；account_id 参数若提供必须是 32 位十六进制 ID（严禁使用用户邮箱或账户显示名称），亦可直接使用全局预置的 `accountId`。\n" +
-      "2. 读取 Worker 脚本: `await cloudflare.request({ method: 'GET', path: `/accounts/${accountId}/workers/scripts/${name}`, rawBody: true })`。\n" +
-      "3. 【更新已有 Worker 脚本规范（极度重要）】：\n" +
-      "   - 严禁在 execute 的 code 脚本中全量硬编码几十 KB 的完整源码字符串！这会因为反引号嵌套、模板字符串 ${...} 转义冲突直接引发 \"Invalid or unexpected token\" 语法错误而导致任务中断放弃！\n" +
-      "   - 正确修改流程（内存局部替换法）：\n" +
-      "     1) 先 GET 读取线上现有最新脚本并存为变量：`const currentCode = await cloudflare.request({ method: 'GET', path: \`/accounts/\${accountId}/workers/scripts/\${name}\`, rawBody: true });`\n" +
-      "     2) 使用字符串局部替换（.replace）将待修改逻辑替换为新逻辑：`const updatedCode = currentCode.replace(oldLogicSnippet, newLogicSnippet);`\n" +
-      "     3) 将替换后的 `updatedCode` 通过 PUT 提交更新。若为 Module / Multipart 格式 Worker，直接保持原 boundary 与 multipart 结构（在原返回文本上直接 replace 局部代码），设置对应 `contentType: 'multipart/form-data; boundary=...'` 并 PUT 即可。\n" +
+      "1. 沙箱环境说明：沙箱已预置带有鉴权的全局客户端 `cloudflare.request({ method, path, body, contentType, rawBody })` 与当前账户的全局变量 `accountId`（32位十六进制字符串）。严禁自拼 URL 或使用原生 fetch()；account_id 必须为 32 位十六进制 ID（或直接使用全局 `accountId`），切勿使用邮箱或账户名。\n" +
+      "2. 读取 Worker 脚本: `const raw = await cloudflare.request({ method: 'GET', path: `/accounts/${accountId}/workers/scripts/${name}`, rawBody: true });`\n" +
+      "3. 【修改并上传 Worker 脚本标准范式（极度重要，严格遵循）】：\n" +
+      "   - 严禁在 code 中全量硬编码几十 KB 的源码字符串（会因模板字符串嵌套反引号转义引发 Invalid or unexpected token 语法错误）！\n" +
+      "   - 注意：Cloudflare GET 响应只返回脚本代码（不含 metadata）；而 PUT 部署 Module Worker 时必须且仅需提供 metadata 与 worker.js 两个 FormData 字段。\n" +
+      "   - 【切勿在 metadata 中传入 bindings】！环境变量/Secret 密钥在 GET 时无法获取明文，传入会导致 \"invalid or missing text property for binding\" 报错！留空 bindings 会自动完整保留云端现有全部环境变量与密钥！\n" +
+      "   - 完整、无错的读取/替换/上传标准代码模板：\n" +
+      "     ```javascript\n" +
+      "     const raw = await cloudflare.request({ method: 'GET', path: `/accounts/${accountId}/workers/scripts/${name}`, rawBody: true });\n" +
+      "     let code = raw;\n" +
+      "     if (raw.includes('name=\"worker.js\"')) {\n" +
+      "       code = raw.split('name=\"worker.js\"')[1].split(/\\r?\\n\\r?\\n/)[1];\n" +
+      "       const lastBoundary = code.lastIndexOf('\\r\\n--');\n" +
+      "       if (lastBoundary !== -1) code = code.slice(0, lastBoundary);\n" +
+      "     }\n" +
+      "     const updatedCode = code.replace(oldCodeSnippet, newCodeSnippet);\n" +
+      "     const form = new FormData();\n" +
+      "     form.append(\"metadata\", new Blob([JSON.stringify({ main_module: \"worker.js\" })], { type: \"application/json\" }));\n" +
+      "     form.append(\"worker.js\", new Blob([updatedCode], { type: \"application/javascript+module\" }), \"worker.js\");\n" +
+      "     return await cloudflare.request({ method: \"PUT\", path: `/accounts/${accountId}/workers/scripts/${name}`, body: form });\n" +
+      "     ```\n" +
       "4. 若操作对象是 Cloudflare 资源，切勿跨平台在 GitHub 相关工具上搜索无关个人或仓库。"
     );
   }
