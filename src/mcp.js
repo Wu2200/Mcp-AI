@@ -1391,6 +1391,8 @@ export async function callMcpTool(toolKey, args, onWaitNoticeOrOptions = null, m
         refinedContent = `${textContent}\n\n【语法错误自愈指引】execute 代码解析失败（通常是因为在 code 字符串中直接嵌套包含反引号、模板字符串 \${...} 或大段 HTML 的源码导致的转义冲突）。\n【正确做法】：严禁在 code 中全量硬编码几十 KB 源码！请改用内存局部替换流程：\n1. 先通过 GET 读取当前脚本：const raw = await cloudflare.request({ method: 'GET', path: \`/accounts/\${accountId}/workers/scripts/\${scriptName}\`, rawBody: true });\n2. 使用 raw.replace(oldCode, newCode) 替换目标片段；\n3. 再调用 PUT 将替换后的代码更新上传。这样无需转义完整脚本，避免语法错误。`;
       } else if (isCfExecute && (textContent.includes("is not one of this session's accounts") || textContent.includes("Could not route to /client/v4/accounts"))) {
         refinedContent = `${textContent}\n\n【账户ID诊断指引】account_id 错误！传入的 account_id 必须为 32 位十六进制字符串（如错误提示中给出的可用账户 ID），切勿使用账户邮箱或显示名称。亦可直接使用沙箱内置的全局变量 accountId。`;
+      } else if (isCfExecute && (textContent.includes("part 'metadata'") || textContent.includes("main_module") || textContent.includes("binding") || textContent.includes("10021"))) {
+        refinedContent = `${textContent}\n\n【Cloudflare Worker 部署格式自愈指引】Cloudflare Module Worker 上传失败。规范要求且仅要求提供两个 FormData 部件：\n1. metadata：必须为 JSON 字符串对象 \`JSON.stringify({ main_module: "worker.js" })\`。注意：【严禁在 metadata 中传入 bindings】（因为环境变量/密钥在 GET 接口中脱敏加密，传入会导致 missing text property 校验失败；留空 bindings 会自动保留云端所有现有环境变量与密钥）！\n2. worker.js：修改后的完整脚本代码 Blob。\n标准上传代码：\nconst form = new FormData();\nform.append("metadata", new Blob([JSON.stringify({ main_module: "worker.js" })], { type: "application/json" }));\nform.append("worker.js", new Blob([updatedCode], { type: "application/javascript+module" }), "worker.js");\nreturn await cloudflare.request({ method: "PUT", path: \`/accounts/\${accountId}/workers/scripts/\${scriptName}\`, body: form });`;
       }
       if (!skipLogging) {
         addDebugLog("ERROR", `MCP 工具 [${toolKey}] 返回错误 - 耗时 ${duration}ms`, {
@@ -1416,6 +1418,10 @@ export async function callMcpTool(toolKey, args, onWaitNoticeOrOptions = null, m
       msg = `${msg} (语法自愈指引: 请勿在 code 脚本中全量硬编码大段源码字符串！建议在内存中先 GET 读取现有代码，通过 .replace(旧逻辑, 新逻辑) 局部替换后再 PUT 上传)`;
     } else if (isCfExecute && (msg.includes("is not one of this session's accounts") || msg.includes("Could not route to /client/v4/accounts"))) {
       msg = `${msg} (账户ID指引: account_id 必须为 32 位十六进制字符串，切勿传入邮箱或名称，建议直接使用全局变量 accountId)`;
+    } else if (isCfExecute && (msg.includes("Cannot read properties of undefined") || msg.includes("split"))) {
+      msg = `${msg} (脚本解析指引: GET 返回的 multipart 文本中不含 metadata，切勿尝试从 GET 结果中提取 metadata！提取 worker.js 请直接使用: code = raw.split('name=\"worker.js\"')[1].split(/\\r?\\n\\r?\\n/)[1]，然后构造包含 { main_module: "worker.js" } 的 FormData 发送 PUT)`;
+    } else if (isCfExecute && (msg.includes("part 'metadata'") || msg.includes("main_module") || msg.includes("binding") || msg.includes("10021"))) {
+      msg = `${msg} (Worker部署指引: 请使用 FormData 且仅添加 metadata: { main_module: "worker.js" } 与 worker.js。切勿在 metadata 中传入 bindings，留空会自动保留云端环境变量)`;
     }
     if (!skipLogging) {
       addDebugLog("ERROR", `MCP 工具 [${toolKey}] 异常 - 耗时 ${duration}ms`, msg);
