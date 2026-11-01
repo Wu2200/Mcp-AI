@@ -352,21 +352,25 @@ export async function updateMcpServer({ id, name, url, token }) {
       openAiTool: {
         type: "function",
         function: {
-          name: toolKey,
-          description: `[${targetName}] ${t.description || t.name}`,
+          name: t.name,
+          description: t.description || t.name,
           parameters: t.inputSchema || { type: "object", properties: {} }
         }
       }
     });
 
     if (existing.status !== "disabled" && isEnabled) {
-      mcpToolRegistry.set(toolKey, {
+      const registryItem = {
         serverId: id,
         serverName: targetName,
         rawName: t.name,
         postEndpoint: cleanUrl,
         headers
-      });
+      };
+      mcpToolRegistry.set(toolKey, registryItem);
+      if (!mcpToolRegistry.has(t.name)) {
+        mcpToolRegistry.set(t.name, registryItem);
+      }
     }
   }
 
