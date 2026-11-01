@@ -66,8 +66,8 @@ export function compactContextMessages(messages, maxChars = 200000, activeFileCo
         const name = (tc.function?.name || tc.name || "").toLowerCase();
         const args = toolArguments(tc) || {};
         const filePath = args.path || args.file || args.filePath || "";
-        toolCallMap.set(tc.id, { name, path: filePath, isWrite: isWriteTool(name) });
-        if (filePath && isWriteTool(name)) {
+        toolCallMap.set(tc.id, { name, path: filePath, isWrite: isWriteTool(name, args) });
+        if (filePath && isWriteTool(name, args)) {
           modifiedFiles.add(filePath);
         }
       }
@@ -98,7 +98,8 @@ export function compactContextMessages(messages, maxChars = 200000, activeFileCo
 
     const meta = toolCallMap.get(m.tool_call_id) || {};
     const filePath = meta.path || "";
-    const isFileContent = m.content.startsWith("successfully downloaded text file") || m.content.startsWith("Resource Text:") || meta.name?.includes("file");
+    const isWorkerScript = meta.name?.includes("cloudflare") && (m.content.includes("worker.js") || m.content.includes("export default") || m.content.includes("addEventListener"));
+    const isFileContent = m.content.startsWith("successfully downloaded text file") || m.content.startsWith("Resource Text:") || meta.name?.includes("file") || isWorkerScript;
 
     if (isFileContent) {
       // 若该文件是最新活跃文件或曾被修改，严禁触碰，保留 100% 完整源码
@@ -614,12 +615,14 @@ export function buildChineseToolGoal(rawAction, args = {}, toolMeta = null, acti
   // 3. Cloudflare 操作族
   if (/cloudflare/i.test(action) || (toolMeta?.serverName && /cloudflare/i.test(toolMeta.serverName))) {
     const path = String(argsObj.path || "").toLowerCase();
-    if (path.includes("/workers/scripts")) {
-      return argsObj.method === "PUT" ? "部署/更新 Cloudflare Worker 脚本" : "读取 Cloudflare Worker 脚本代码";
+    const code = String(argsObj.code || "").toLowerCase();
+    if (path.includes("/workers/scripts") || code.includes("/workers/scripts")) {
+      const isPut = argsObj.method === "PUT" || code.includes("method: 'put'") || code.includes('method: "put"');
+      return isPut ? "部署/更新 Cloudflare Worker 脚本" : "读取/更新 Cloudflare Worker 脚本代码";
     }
-    if (path.includes("/kv/namespaces")) return "操作 Cloudflare KV 键值数据";
-    if (path.includes("/d1/database")) return "执行 Cloudflare D1 数据库查询";
-    if (path.includes("/dns_records")) return "查询/管理 Cloudflare DNS 解析记录";
+    if (path.includes("/kv/namespaces") || code.includes("/kv/namespaces")) return "操作 Cloudflare KV 键值数据";
+    if (path.includes("/d1/database") || code.includes("/d1/database")) return "执行 Cloudflare D1 数据库查询";
+    if (path.includes("/dns_records") || code.includes("/dns_records")) return "查询/管理 Cloudflare DNS 解析记录";
     return "调用 Cloudflare 接口管理云端资源";
   }
 
@@ -794,17 +797,18 @@ export function detectActionIntent(userText) {
   const isConsultation =
     /^(?:为什么|为啥|为何|请问|帮我看下为什么|分析|排查原因|查下原因|怎么回事|怎么会|why|how|what)/i.test(text) ||
     /(?:为什么|为啥|为何|怎么回事|正常吗)[？?\s]*$/i.test(text);
-  if (isConsultation && !/(?:帮我|直接|请|现在).*(?:修改|改一下|修复|更新|写入|提交|替换)/i.test(text)) {
+  if (isConsultation && !/(?:帮我|直接|请|现在).*(?:修改|改一下|修复|更新|写入|提交|替换|并入|处理)/i.test(text)) {
     return { needsTool: false, isWrite: false };
   }
 
-  const writeVerb = /(修改|修改下|改下|改一下|修一下|修复|更新|更新下|添加|增加|加一个|删除|删掉|重写|创建|新建|写入|覆盖|替换|调整|优化|补齐|同步|把.+改成|提交|推送|打包|编译|运行|commit|push|write|update|create|delete|edit|trigger|build)/i;
-  const writeTarget = /(代码|文件|配置|仓库|bug|接口|函数|样式|组件|依赖|项目|分支|插件|脚本|产物|测试|pr|github|readme|dist|打包|编译|workflow|actions|\.[a-z0-9]{1,6})/i;
-  const isDirectWrite = writeVerb.test(text) && (writeTarget.test(text) || text.length <= 60);
+  const writeVerb = /(修改|修改下|改下|改一下|修一下|修复|更新|更新下|添加|增加|加一个|删除|删掉|重写|创建|新建|写入|覆盖|替换|调整|优化|补齐|同步|把.+改成|并入|合并|拆分|处理|实现|配置|接入|集成|调度|轮换|改成|设为|变为|提交|推送|打包|编译|运行|commit|push|write|update|create|delete|edit|trigger|build)/i;
+  const writeTarget = /(代码|文件|配置|仓库|bug|接口|函数|样式|组件|依赖|项目|分支|插件|脚本|产物|测试|pr|github|readme|dist|打包|编译|workflow|actions|凭证|证书|分组|组|worker|workers|cloudflare|cf|调度|规则|逻辑|token|密钥|账号|环境变量|\.[a-z0-9]{1,6})/i;
+  const hasWriteDesire = /(?:希望|想|要|能不能|可以把|把).*(?:并入|合并|改成|设为|变成|调整|优化|修改|实现|调度|轮换)/i.test(text);
+  const isDirectWrite = (writeVerb.test(text) && (writeTarget.test(text) || text.length <= 80)) || hasWriteDesire;
 
-  const readVerb = /(查看|看一下|读取|获取|搜索|查一下|查找|找一下|列出|分析|检查|排查|看看|读一下|fetch|get|read|search|list)/i;
-  const readTarget = /(文件|代码|目录|仓库|分支|提交|日志|报错|错误|问题|原因|commit|pr|issue|内容|log|\.[a-z0-9]{1,6})/i;
-  const isDirectRead = readVerb.test(text) && (readTarget.test(text) || text.length <= 60);
+  const readVerb = /(查看|看一下|读取|获取|搜索|查一下|查找|找一下|列出|分析|检查|排查|看看|读一下|查询|查下|查|了解|诊断|fetch|get|read|search|list|check|query)/i;
+  const readTarget = /(文件|代码|目录|仓库|分支|提交|日志|报错|错误|问题|原因|commit|pr|issue|内容|log|凭证|证书|分组|组|worker|workers|cloudflare|cf|状态|记录|\.[a-z0-9]{1,6})/i;
+  const isDirectRead = readVerb.test(text) && (readTarget.test(text) || text.length <= 80);
 
   const isWrite = Boolean(isDirectWrite);
   const needsTool = Boolean(isDirectWrite || isDirectRead);
@@ -1541,7 +1545,16 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
   });
   if (hasCloudflare) {
     systemRules.push(
-      "【Cloudflare 工具执行规范】\n1. 沙箱内已预置带有鉴权的全局客户端 `cloudflare.request({ method, path, body, contentType, rawBody })` 与全局变量 `accountId`。严禁自行拼接 BaseURL 或使用原生 fetch()，必须直接使用 `cloudflare.request`。\n2. 读取 Worker 脚本: `cloudflare.request({ method: 'GET', path: `/accounts/${accountId}/workers/scripts/${name}` })`。\n3. 更新单文件 Worker 脚本: `cloudflare.request({ method: 'PUT', path: `/accounts/${accountId}/workers/scripts/${name}`, body: codeString, contentType: 'application/javascript', rawBody: true })`（若为模块 Worker 则按 multipart/form-data格式）。切勿盲目遍历搜索庞大的 OpenAPI 规范。\n4. 若操作对象是 Cloudflare 资源，切勿跨平台在 GitHub 相关工具上搜索无关个人或仓库。"
+      "【Cloudflare 工具执行规范】\n" +
+      "1. 沙箱环境预置：沙箱内已预置带有鉴权的全局客户端 `cloudflare.request({ method, path, body, contentType, rawBody })` 与当前账户的全局变量 `accountId`（32位十六进制字符串）。严禁自行拼接 BaseURL 或使用原生 fetch()，必须直接使用 `cloudflare.request`；account_id 参数若提供必须是 32 位十六进制 ID（严禁使用用户邮箱或账户显示名称），亦可直接使用全局预置的 `accountId`。\n" +
+      "2. 读取 Worker 脚本: `await cloudflare.request({ method: 'GET', path: `/accounts/${accountId}/workers/scripts/${name}`, rawBody: true })`。\n" +
+      "3. 【更新已有 Worker 脚本规范（极度重要）】：\n" +
+      "   - 严禁在 execute 的 code 脚本中全量硬编码几十 KB 的完整源码字符串！这会因为反引号嵌套、模板字符串 ${...} 转义冲突直接引发 \"Invalid or unexpected token\" 语法错误而导致任务中断放弃！\n" +
+      "   - 正确修改流程（内存局部替换法）：\n" +
+      "     1) 先 GET 读取线上现有最新脚本并存为变量：`const currentCode = await cloudflare.request({ method: 'GET', path: \`/accounts/\${accountId}/workers/scripts/\${name}\`, rawBody: true });`\n" +
+      "     2) 使用字符串局部替换（.replace）将待修改逻辑替换为新逻辑：`const updatedCode = currentCode.replace(oldLogicSnippet, newLogicSnippet);`\n" +
+      "     3) 将替换后的 `updatedCode` 通过 PUT 提交更新。若为 Module / Multipart 格式 Worker，直接保持原 boundary 与 multipart 结构（在原返回文本上直接 replace 局部代码），设置对应 `contentType: 'multipart/form-data; boundary=...'` 并 PUT 即可。\n" +
+      "4. 若操作对象是 Cloudflare 资源，切勿跨平台在 GitHub 相关工具上搜索无关个人或仓库。"
     );
   }
   if (isWrite) {
@@ -1813,7 +1826,8 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
         const hasWriteInRound = mcpCalls.some((tc) => {
           const n = tc.function?.name || tc.name || "";
           const info = findToolInfo(n);
-          return isWriteTool(info?.rawName || n);
+          const rawArgs = toolArguments(tc);
+          return isWriteTool(info?.rawName || n, rawArgs);
         });
 
         // 检查本轮是否混杂了除 Actions 之外的其他工作（例如代码读取、搜索、修改）
@@ -1844,7 +1858,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
           const resolvedToolKey = toolInfo?.key || toolCallName;
           const displayName = toolInfo?.serverName || "MCP";
           const rawAction = toolInfo?.rawName || toolCallName;
-          const isWrite = isWriteTool(rawAction);
+          const isWrite = isWriteTool(rawAction, args);
           const isActions = /actions_(list|get)/i.test(rawAction);
           const isActionsListMethod = isActions && (args?.method === "list_workflow_runs" || !args?.method);
           const isTrigger = /actions_run_trigger/i.test(rawAction);
@@ -2250,7 +2264,8 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
       const hasWriteInRound = mcpCalls.some((tc) => {
         const n = tc.function?.name || tc.name || "";
         const info = findToolInfo(n);
-        return isWriteTool(info?.rawName || n);
+        const rawArgs = toolArguments(tc);
+        return isWriteTool(info?.rawName || n, rawArgs);
       });
 
       // 检查本轮是否混杂了除 Actions 之外的其他工作（例如代码读取、搜索、修改）
