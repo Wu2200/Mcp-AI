@@ -476,13 +476,14 @@
       margin-bottom: 10px;
       border-bottom: 1px solid #e2e8f0;
       padding-bottom: 10px;
-      flex-wrap: wrap;
     }
     .log-tab-btn {
+      flex: 1;
       display: inline-flex;
       align-items: center;
+      justify-content: center;
       gap: 6px;
-      padding: 6px 14px;
+      padding: 8px 10px;
       border-radius: 8px;
       font-size: 13px;
       font-weight: 600;
@@ -490,6 +491,7 @@
       border: 1px solid #cbd5e1;
       background: #f8fafc;
       color: #475569;
+      white-space: nowrap;
       transition: all 0.15s;
     }
     .log-tab-btn:hover {
@@ -595,7 +597,7 @@
       .card { padding: 14px 12px; }
       .card-title { margin-bottom: 10px; }
       .action-group { width: 100%; justify-content: flex-start; }
-      .action-group .btn-action { flex: 1 1 calc(33.33% - 6px); text-align: center; }
+      .action-group .btn-action { flex: 1 1 calc(25% - 6px); text-align: center; padding: 6px 4px; }
     }
   </style>
 </head>
@@ -659,18 +661,18 @@
         </div>
         <div class="action-group">
           <button id="btn-toggle-log" class="btn-action btn-stop" onclick="toggleLogging()">关闭日志</button>
-          <button class="btn-action btn-start" onclick="copyAllLogs()">复制当前分类</button>
-          <button class="btn-action btn-del" onclick="clearAllLogs()">清空当前分类</button>
+          <button class="btn-action btn-start" onclick="copyAllLogs()">复制日志</button>
+          <button class="btn-action btn-del" onclick="clearAllLogs()">清空日志</button>
           <button class="btn-action btn-start" onclick="loadLogs()">刷新</button>
         </div>
       </div>
       <div class="log-tabs">
         <button id="tab-log-chat" class="log-tab-btn active" onclick="switchLogCategory('chat')">
-          <span>对话代理日志 (Chat)</span>
+          <span>对话代理日志</span>
           <span id="count-log-chat" class="log-tab-count">0</span>
         </button>
         <button id="tab-log-mcp" class="log-tab-btn" onclick="switchLogCategory('mcp')">
-          <span>第三方 MCP 调用 (MCP 接入)</span>
+          <span>第三方MCP调用</span>
           <span id="count-log-mcp" class="log-tab-count">0</span>
         </button>
       </div>
