@@ -1280,8 +1280,8 @@ export function registerVirtualTools(serverInfo) {
       openAiTool: {
         type: "function",
         function: {
-          name: toolKey,
-          description: `[${serverInfo.name}] 局部编辑 GitHub 仓库中的指定文件。通过比对替换指定的代码片段（old_str -> new_str），自动拉取最新文件、完成局部替换并提交更新，无需全量读取或全量重写。`,
+          name: virtualRawName,
+          description: "局部编辑 GitHub 仓库中的指定文件。通过比对替换指定的代码片段（old_str -> new_str），自动拉取最新文件、完成局部替换并提交更新，无需全量读取或全量重写。",
           parameters: virtualInputSchema
         }
       }
@@ -1293,18 +1293,29 @@ export function registerVirtualTools(serverInfo) {
     virtualTool.inputSchema = virtualInputSchema;
     virtualTool.status = "supported";
     virtualTool.statusMessage = "支持";
+    if (virtualTool.openAiTool?.function) {
+      virtualTool.openAiTool.function.name = virtualRawName;
+      virtualTool.openAiTool.function.description = "局部编辑 GitHub 仓库中的指定文件。通过比对替换指定的代码片段（old_str -> new_str），自动拉取最新文件、完成局部替换并提交更新，无需全量读取或全量重写。";
+      virtualTool.openAiTool.function.parameters = virtualInputSchema;
+    }
   }
 
   if (serverInfo.status === "active" && virtualTool.enabled !== false) {
-    mcpToolRegistry.set(toolKey, {
+    const virtualHandler = async (args, onWaitNotice, skipLogging = false) => {
+      return await executeGithubEditFile(serverInfo, readTool.rawName, writeTool.rawName, args, onWaitNotice, skipLogging);
+    };
+    const regItem = {
       serverId: serverInfo.id,
       serverName: serverInfo.name,
       rawName: virtualRawName,
       isVirtual: true,
-      handler: async (args, onWaitNotice, skipLogging = false) => {
-        return await executeGithubEditFile(serverInfo, readTool.rawName, writeTool.rawName, args, onWaitNotice, skipLogging);
-      }
-    });
+      handler: virtualHandler
+    };
+    mcpToolRegistry.set(toolKey, regItem);
+    // 默认双向注册：原生名 edit_file 与 github_edit_file 均可被直接 O(1) 索引并调用
+    mcpToolRegistry.set(virtualRawName, regItem);
+    mcpToolRegistry.set("edit_file", regItem);
+    mcpToolRegistry.set("github_edit_file", regItem);
   }
 }
 
