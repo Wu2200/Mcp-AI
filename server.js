@@ -332,10 +332,6 @@ const server = http.createServer(async (request, response) => {
       const pathServerName = matchMcp[1] ? decodeURIComponent(matchMcp[1]).trim() : "";
       const queryServerName = (reqUrl.searchParams.get("server") || reqUrl.searchParams.get("name") || "").trim();
       const serverFilter = pathServerName || queryServerName || "";
-      const preferRaw =
-        Boolean(serverFilter) ||
-        reqUrl.searchParams.get("raw") === "true" ||
-        reqUrl.searchParams.get("native") === "true";
 
       let mcpBody;
       if (request.method === "POST") {
@@ -352,7 +348,7 @@ const server = http.createServer(async (request, response) => {
         { capabilities: { tools: {} } }
       );
       mcpServer.setRequestHandler(ListToolsRequestSchema, async () => {
-        const tools = getExportedMcpTools(serverFilter, preferRaw);
+        const tools = getExportedMcpTools(serverFilter);
         if (tools.length === 0) {
           const hint = serverFilter
             ? `未找到服务名称包含 [${serverFilter}] 的已启用 MCP 工具，请检查控制面板中该服务的名称与状态。`
@@ -369,17 +365,14 @@ const server = http.createServer(async (request, response) => {
       });
       mcpServer.setRequestHandler(CallToolRequestSchema, async (mcpRequest) => {
         try {
-          const targetTools = getExportedMcpTools(serverFilter, preferRaw);
+          const targetTools = getExportedMcpTools(serverFilter);
           const requestedName = mcpRequest.params.name;
           const matchedTool = targetTools.find(
             (tool) => tool.name === requestedName || tool.rawName === requestedName || tool.key === requestedName
           );
-          if (!matchedTool) {
-            throw new Error(`未找到已启用的工具：${requestedName}${serverFilter ? ` (限定在 ${serverFilter})` : ""}`);
-          }
-          // 作为外部 MCP 代理服务被调用时完全静默，无需将外部请求写进控制台 (skipLogging: true)
-          // 优先传递 matchedTool.key，确保底层注册表 100% 精准匹配
-          const result = await callMcpTool(matchedTool.key || requestedName, mcpRequest.params.arguments || {}, null, true);
+          // 无论外界传原生名还是历史带前缀名，优先使用精准映射或直接透传调用
+          const lookupKey = matchedTool?.key || matchedTool?.rawName || requestedName;
+          const result = await callMcpTool(lookupKey, mcpRequest.params.arguments || {}, null, true);
           // 原生透传：若上游返回原生 content 数组（图片、嵌入资源、多段内容），直接原汁原味透传
           if (Array.isArray(result.rawContent) && result.rawContent.length > 0) {
             return {
