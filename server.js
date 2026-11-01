@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
@@ -20,6 +21,7 @@ import {
   maskApiKey,
   saveActiveChannelToStorage,
   debugLogs,
+  mcpCallLogs,
   loggingEnabled,
   saveLoggingConfigToStorage,
   enabledModels,
@@ -46,7 +48,8 @@ import {
   updateMcpServer,
   checkAllTools,
   registerVirtualTools,
-  callMcpTool
+  callMcpTool,
+  sanitizeToolSchema
 } from "./src/mcp.js";
 import {
   passThrough,
@@ -55,9 +58,6 @@ import {
   isModelEnabledForMcp,
   isTitleGenerationRequest
 } from "./src/agent.js";
-import { Server as McpServer } from "@modelcontextprotocol/sdk/server/index.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 
 process.on("uncaughtException", (err) => {
   if (err && (err.message === "aborted" || err.code === "ECONNRESET" || err.code === "EPIPE")) {
@@ -207,8 +207,9 @@ function getExportedMcpTools(targetFilter = "") {
       let cleanDescription = tool.description || tool.rawName || exportName;
       cleanDescription = cleanDescription.replace(/^\[[^\]]+\]\s*/, "").trim();
 
-      // 原生 inputSchema 优先
-      const schema = tool.inputSchema || tool.openAiTool?.function?.parameters || { type: "object", properties: {} };
+      // 原生 inputSchema 优先，并进行跨平台兼容性清洗（剔除顶层 anyOf/$schema 等易导致第三方客户端报错的字段）
+      const rawSchema = tool.inputSchema || tool.openAiTool?.function?.parameters || { type: "object", properties: {} };
+      const schema = sanitizeToolSchema(rawSchema);
 
       tools.push({
         name: exportName,
@@ -223,6 +224,176 @@ function getExportedMcpTools(targetFilter = "") {
   }
 
   return tools;
+}
+
+const mcpSseSessions = new Map();
+
+async function handleSingleMcpRpcMessage(rpcMsg, serverFilter, reqUrl, clientIp) {
+  if (!rpcMsg || typeof rpcMsg !== "object") {
+    return null;
+  }
+
+  const { id, method, params } = rpcMsg;
+
+  // JSON-RPC 通知消息（无 id，如 notifications/initialized），无需返回响应体
+  if (id === undefined || id === null) {
+    return null;
+  }
+
+  try {
+    if (method === "initialize") {
+      const clientName = params?.clientInfo?.name || "未知客户端";
+      const clientVersion = params?.clientInfo?.version || "";
+      const requestedProto = params?.protocolVersion || "2024-11-05";
+      const negotiatedProto = requestedProto === "2025-03-26" ? "2025-03-26" : "2024-11-05";
+
+      addDebugLog(
+        "MCP_INIT",
+        `第三方 MCP 客户端握手连接 [${clientName}${clientVersion ? " v" + clientVersion : ""}] -> ${reqUrl.pathname}`,
+        {
+          clientInfo: params?.clientInfo || {},
+          protocolVersion: requestedProto,
+          negotiatedProtocolVersion: negotiatedProto,
+          path: reqUrl.pathname,
+          serverFilter: serverFilter || "全部服务",
+          clientIp
+        },
+        "mcp"
+      );
+
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: {
+          protocolVersion: negotiatedProto,
+          capabilities: {
+            tools: { listChanged: false }
+          },
+          serverInfo: {
+            name: `mcp-ai-${serverFilter || "hub"}`,
+            version: "1.0.0"
+          }
+        }
+      };
+    }
+
+    if (method === "ping") {
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: {}
+      };
+    }
+
+    if (method === "tools/list") {
+      const tools = getExportedMcpTools(serverFilter);
+      addDebugLog(
+        "MCP_LIST",
+        `第三方客户端拉取工具列表 -> 返回 ${tools.length} 个原生工具${serverFilter ? ` (筛选: ${serverFilter})` : ""}`,
+        {
+          path: reqUrl.pathname,
+          serverFilter: serverFilter || "全部服务",
+          toolCount: tools.length,
+          tools: tools.map((t) => t.name)
+        },
+        "mcp"
+      );
+
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: {
+          tools: tools.map((t) => ({
+            name: t.name,
+            description: t.description,
+            inputSchema: t.inputSchema
+          }))
+        }
+      };
+    }
+
+    if (method === "tools/call") {
+      const requestedName = params?.name || "";
+      const toolArgs = params?.arguments || {};
+      const targetTools = getExportedMcpTools(serverFilter);
+      const matchedTool = targetTools.find(
+        (tool) => tool.name === requestedName || tool.rawName === requestedName || tool.key === requestedName
+      );
+      const lookupKey = matchedTool?.key || matchedTool?.rawName || requestedName;
+
+      addDebugLog(
+        "MCP_CALL",
+        `收到第三方 MCP 工具调用请求: [${requestedName}]`,
+        {
+          requestedTool: requestedName,
+          resolvedKey: lookupKey,
+          arguments: toolArgs,
+          path: reqUrl.pathname,
+          clientIp
+        },
+        "mcp"
+      );
+
+      try {
+        const result = await callMcpTool(lookupKey, toolArgs, { logCategory: "mcp", skipLogging: false });
+        const contentBlocks =
+          Array.isArray(result.rawContent) && result.rawContent.length > 0
+            ? result.rawContent
+            : [{ type: "text", text: String(result.content ?? "") }];
+
+        return {
+          jsonrpc: "2.0",
+          id,
+          result: {
+            content: contentBlocks,
+            ...(result.isError ? { isError: true } : {})
+          }
+        };
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        return {
+          jsonrpc: "2.0",
+          id,
+          result: {
+            content: [{ type: "text", text: errMsg }],
+            isError: true
+          }
+        };
+      }
+    }
+
+    if (method === "resources/list") {
+      return { jsonrpc: "2.0", id, result: { resources: [] } };
+    }
+
+    if (method === "resources/templates/list") {
+      return { jsonrpc: "2.0", id, result: { resourceTemplates: [] } };
+    }
+
+    if (method === "prompts/list") {
+      return { jsonrpc: "2.0", id, result: { prompts: [] } };
+    }
+
+    return {
+      jsonrpc: "2.0",
+      id,
+      error: {
+        code: -32601,
+        message: `Method not found: ${method}`
+      }
+    };
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    addDebugLog("ERROR", `处理第三方 MCP 请求异常 [${method}]: ${errMsg}`, err?.stack || errMsg, "mcp");
+    return {
+      jsonrpc: "2.0",
+      id,
+      error: {
+        code: -32603,
+        message: errMsg
+      }
+    };
+  }
 }
 
 const server = http.createServer(async (request, response) => {
@@ -309,7 +480,12 @@ const server = http.createServer(async (request, response) => {
 
     const matchMcp = reqUrl.pathname.match(/^\/mcp(?:\/([^\/]+))?\/?$/);
     if (matchMcp) {
-      if (!isProxyAuthorized(request)) {
+      const querySessionId = (reqUrl.searchParams.get("sessionId") || "").trim();
+      const headerSessionId = (request.headers["mcp-session-id"] || "").trim();
+      const activeSessionId = querySessionId || headerSessionId;
+      const hasValidSession = Boolean(activeSessionId && mcpSseSessions.has(activeSessionId));
+
+      if (!isProxyAuthorized(request) && !hasValidSession) {
         setCorsHeaders(response);
         response.writeHead(401, {
           "Content-Type": "application/json; charset=utf-8",
@@ -332,84 +508,126 @@ const server = http.createServer(async (request, response) => {
       const pathServerName = matchMcp[1] ? decodeURIComponent(matchMcp[1]).trim() : "";
       const queryServerName = (reqUrl.searchParams.get("server") || reqUrl.searchParams.get("name") || "").trim();
       const serverFilter = pathServerName || queryServerName || "";
+      const clientIp = request.headers["x-forwarded-for"] || request.socket.remoteAddress || "";
 
-      let mcpBody;
-      if (request.method === "POST") {
-        try {
-          mcpBody = await readRequestBody(request);
-        } catch (err) {
-          sendJson(response, err.statusCode || 400, { error: err.message || "无效 JSON" });
-          return;
+      // 1. DELETE：关闭会话
+      if (request.method === "DELETE") {
+        if (activeSessionId && mcpSseSessions.has(activeSessionId)) {
+          const sess = mcpSseSessions.get(activeSessionId);
+          if (sess?.timer) clearInterval(sess.timer);
+          try {
+            sess?.response?.end();
+          } catch {}
+          mcpSseSessions.delete(activeSessionId);
         }
+        setCorsHeaders(response);
+        response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        response.end(JSON.stringify({ status: "closed" }));
+        return;
       }
 
-      const mcpServer = new McpServer(
-        { name: `mcp-ai-${serverFilter || "hub"}`, version: "1.0.0" },
-        { capabilities: { tools: {} } }
-      );
-      mcpServer.setRequestHandler(ListToolsRequestSchema, async () => {
-        const tools = getExportedMcpTools(serverFilter);
-        if (tools.length === 0) {
-          const hint = serverFilter
-            ? `未找到服务名称包含 [${serverFilter}] 的已启用 MCP 工具，请检查控制面板中该服务的名称与状态。`
-            : "尚未配置任何可用的 MCP 工具，请在控制面板连接并启动远程 MCP 服务。";
-          throw new Error(hint);
-        }
-        return {
-          tools: tools.map((t) => ({
-            name: t.name,
-            description: t.description,
-            inputSchema: t.inputSchema
-          }))
-        };
-      });
-      mcpServer.setRequestHandler(CallToolRequestSchema, async (mcpRequest) => {
-        try {
-          const targetTools = getExportedMcpTools(serverFilter);
-          const requestedName = mcpRequest.params.name;
-          const matchedTool = targetTools.find(
-            (tool) => tool.name === requestedName || tool.rawName === requestedName || tool.key === requestedName
-          );
-          // 无论外界传原生名还是历史带前缀名，优先使用精准映射或直接透传调用
-          const lookupKey = matchedTool?.key || matchedTool?.rawName || requestedName;
-          const result = await callMcpTool(lookupKey, mcpRequest.params.arguments || {}, null, true);
-          // 原生透传：若上游返回原生 content 数组（图片、嵌入资源、多段内容），直接原汁原味透传
-          if (Array.isArray(result.rawContent) && result.rawContent.length > 0) {
-            return {
-              content: result.rawContent,
-              ...(result.isError ? { isError: true } : {})
-            };
+      // 2. GET：支持旧版 SSE 握手 (event: endpoint) 及 Streamable HTTP 监听流
+      if (request.method === "GET") {
+        const sessionId = activeSessionId || crypto.randomUUID();
+        setCorsHeaders(response);
+        response.writeHead(200, {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache, no-transform",
+          "Connection": "keep-alive",
+          "X-Accel-Buffering": "no",
+          "MCP-Session-Id": sessionId
+        });
+
+        const timer = setInterval(() => {
+          if (response.writableEnded || response.destroyed) {
+            clearInterval(timer);
+            mcpSseSessions.delete(sessionId);
+            return;
           }
-          return {
-            content: [{ type: "text", text: String(result.content ?? "") }],
-            ...(result.isError ? { isError: true } : {})
-          };
-        } catch (err) {
-          return {
-            content: [{ type: "text", text: err instanceof Error ? err.message : String(err) }],
-            isError: true
-          };
-        }
-      });
+          try {
+            response.write(": keep-alive\n\n");
+          } catch {}
+        }, 15000);
 
-      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-      try {
-        await mcpServer.connect(transport);
-        await transport.handleRequest(request, response, mcpBody);
-      } catch (err) {
-        if (!response.headersSent) {
-          sendJson(response, 500, { error: err.message || "MCP 请求处理失败" });
-        } else if (!response.writableEnded) {
-          response.end();
+        mcpSseSessions.set(sessionId, {
+          response,
+          serverFilter,
+          timer,
+          createdAt: Date.now()
+        });
+
+        // 若客户端未携带 MCP-Session-Id 头发起 GET，说明是旧版 SSE 模式，主动推送 endpoint 事件
+        if (!headerSessionId) {
+          const endpointUri = `${reqUrl.pathname}?sessionId=${encodeURIComponent(sessionId)}`;
+          response.write(`event: endpoint\ndata: ${endpointUri}\n\n`);
+          addDebugLog(
+            "MCP_INIT",
+            `第三方客户端建立旧版 SSE 通道 -> ${reqUrl.pathname}`,
+            { sessionId, endpointUri, clientIp },
+            "mcp"
+          );
+        } else {
+          response.write(": connected\n\n");
         }
-      } finally {
-        try {
-          await transport.close();
-        } catch {}
-        try {
-          await mcpServer.close();
-        } catch {}
+
+        request.on("close", () => {
+          clearInterval(timer);
+          mcpSseSessions.delete(sessionId);
+        });
+        return;
       }
+
+      // 3. POST：处理无状态 Streamable HTTP JSON-RPC 请求与旧版 SSE 消息投递
+      let mcpBody;
+      try {
+        mcpBody = await readRequestBody(request);
+      } catch (err) {
+        sendJson(response, err.statusCode || 400, { error: err.message || "无效 JSON" });
+        return;
+      }
+
+      const isBatch = Array.isArray(mcpBody);
+      const messages = isBatch ? mcpBody : [mcpBody];
+      const responses = [];
+
+      for (const msg of messages) {
+        const resObj = await handleSingleMcpRpcMessage(msg, serverFilter, reqUrl, clientIp);
+        if (resObj !== null) {
+          responses.push(resObj);
+        }
+      }
+
+      const sseSession = querySessionId ? mcpSseSessions.get(querySessionId) : null;
+
+      // 若属于旧版 SSE 会话（URL 带有 ?sessionId=... 且 SSE 流存活），将结果通过 SSE 推送并返回 202
+      if (sseSession && !sseSession.response.writableEnded && !sseSession.response.destroyed) {
+        for (const resObj of responses) {
+          sseSession.response.write(`event: message\ndata: ${JSON.stringify(resObj)}\n\n`);
+        }
+        setCorsHeaders(response);
+        response.writeHead(202, { "Content-Type": "text/plain; charset=utf-8" });
+        response.end("Accepted");
+        return;
+      }
+
+      // 若全部为通知消息（如 notifications/initialized），按标准返回 202 Accepted
+      if (responses.length === 0) {
+        setCorsHeaders(response);
+        response.writeHead(202);
+        response.end();
+        return;
+      }
+
+      // 标准无状态 Streamable HTTP：直接返回 200 OK JSON-RPC 响应
+      const outSessionId = headerSessionId || crypto.randomUUID();
+      setCorsHeaders(response);
+      response.setHeader("MCP-Session-Id", outSessionId);
+      response.setHeader("Access-Control-Expose-Headers", "MCP-Protocol-Version, MCP-Session-Id");
+      response.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-store"
+      });
+      response.end(JSON.stringify(isBatch ? responses : responses[0]));
       return;
     }
 
@@ -535,7 +753,8 @@ const server = http.createServer(async (request, response) => {
       if (request.method === "GET" && reqUrl.pathname === "/api/logs") {
         sendJson(response, 200, {
           enabled: loggingEnabled,
-          logs: debugLogs
+          logs: debugLogs,
+          mcpLogs: mcpCallLogs
         });
         return;
       }
@@ -549,8 +768,20 @@ const server = http.createServer(async (request, response) => {
       }
 
       if (request.method === "POST" && reqUrl.pathname === "/api/logs/clear") {
-        debugLogs.length = 0;
-        sendJson(response, 200, { success: true, logs: [] });
+        let body = {};
+        try {
+          body = await readRequestBody(request);
+        } catch {}
+        const category = body?.category || "all";
+        if (category === "mcp") {
+          mcpCallLogs.length = 0;
+        } else if (category === "chat") {
+          debugLogs.length = 0;
+        } else {
+          debugLogs.length = 0;
+          mcpCallLogs.length = 0;
+        }
+        sendJson(response, 200, { success: true, logs: debugLogs, mcpLogs: mcpCallLogs });
         return;
       }
 
