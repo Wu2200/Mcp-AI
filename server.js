@@ -456,17 +456,14 @@ const server = http.createServer(async (request, response) => {
           sendJson(response, 404, { error: "未找到该渠道" });
           return;
         }
-        if (upstreamChannels.length <= 1) {
-          sendJson(response, 400, { error: "至少需要保留一个上游渠道" });
-          return;
-        }
 
         const deletedName = upstreamChannels[idx].name;
         upstreamChannels.splice(idx, 1);
 
         const active = getActiveChannel();
         if (active && active.id === id) {
-          await saveActiveChannelToStorage(upstreamChannels[0].id);
+          const nextId = upstreamChannels.length > 0 ? upstreamChannels[0].id : "";
+          await saveActiveChannelToStorage(nextId);
         }
         await saveChannelsToStorage();
 
