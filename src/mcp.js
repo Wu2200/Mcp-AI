@@ -1720,19 +1720,30 @@ export async function loadMcpServersFromStorage() {
       t.enabled = typeof t.enabled === "boolean" ? t.enabled : true;
       t.status = t.status || "unchecked";
       t.statusMessage = t.statusMessage || "";
+      // 保持 openAiTool 原生化与无噪描述
+      if (t.openAiTool?.function) {
+        t.openAiTool.function.name = t.rawName || t.openAiTool.function.name;
+        if (typeof t.openAiTool.function.description === "string") {
+          t.openAiTool.function.description = t.openAiTool.function.description.replace(/^\[[^\]]+\]\s*/, "");
+        }
+      }
     }
     mcpServers.set(item.id, item);
     registerVirtualTools(item);
     if (status === "active") {
       for (const t of item.tools || []) {
         if (t.enabled !== false && !t.isVirtual) {
-          mcpToolRegistry.set(t.key, {
+          const regItem = {
             serverId: item.id,
             serverName: item.name,
             rawName: t.rawName,
             postEndpoint: item.postEndpoint,
             headers: item.headers
-          });
+          };
+          mcpToolRegistry.set(t.key, regItem);
+          if (!mcpToolRegistry.has(t.rawName)) {
+            mcpToolRegistry.set(t.rawName, regItem);
+          }
         }
       }
     }
