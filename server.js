@@ -679,16 +679,21 @@ const server = http.createServer(async (request, response) => {
           if (tool.isVirtual) {
             registerVirtualTools(s);
           } else {
-            mcpToolRegistry.set(tool.key, {
+            const regItem = {
               serverId: s.id,
               serverName: s.name,
               rawName: tool.rawName,
               postEndpoint: s.postEndpoint,
               headers: s.headers
-            });
+            };
+            mcpToolRegistry.set(tool.key, regItem);
+            if (!mcpToolRegistry.has(tool.rawName)) {
+              mcpToolRegistry.set(tool.rawName, regItem);
+            }
           }
         } else {
           mcpToolRegistry.delete(tool.key);
+          if (tool.rawName) mcpToolRegistry.delete(tool.rawName);
         }
         await saveServerToStorage();
         sendJson(response, 200, { success: true, enabled: tool.enabled });
@@ -707,13 +712,17 @@ const server = http.createServer(async (request, response) => {
         registerVirtualTools(s);
         for (const t of s.tools) {
           if (t.enabled !== false && !t.isVirtual) {
-            mcpToolRegistry.set(t.key, {
+            const regItem = {
               serverId: s.id,
               serverName: s.name,
               rawName: t.rawName,
               postEndpoint: s.postEndpoint,
               headers: s.headers
-            });
+            };
+            mcpToolRegistry.set(t.key, regItem);
+            if (!mcpToolRegistry.has(t.rawName)) {
+              mcpToolRegistry.set(t.rawName, regItem);
+            }
           }
         }
         await saveServerToStorage();
