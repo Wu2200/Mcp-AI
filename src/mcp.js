@@ -181,6 +181,7 @@ export async function connectToMcpServer({ name, url, token }) {
       key: toolKey,
       rawName: t.name,
       description: t.description || t.name,
+      inputSchema: t.inputSchema || { type: "object", properties: {} },
       enabled: true,
       status: "unchecked",
       statusMessage: "",
