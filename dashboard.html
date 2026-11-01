@@ -802,9 +802,7 @@
             ? '<button class="btn-action btn-active-channel" disabled>当前使用</button>'
             : `<button class="btn-action btn-start" onclick="switchChannel('${c.id}')">切换至此</button>`;
 
-          const deleteBtn = channels.length > 1
-            ? `<button class="btn-action btn-del" onclick="handleDeleteChannel('${c.id}', '${escapeHtml(c.name)}')">删除</button>`
-            : '';
+          const deleteBtn = `<button class="btn-action btn-del" onclick="handleDeleteChannel('${c.id}', '${escapeHtml(c.name)}')">删除</button>`;
 
           return `
             <div class="channel-item ${c.active ? 'active' : ''}">
