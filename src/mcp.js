@@ -1206,12 +1206,64 @@ export function registerVirtualTools(serverInfo) {
     ? virtualRawName
     : `${safePrefix}_${virtualRawName}`;
 
+  const virtualInputSchema = {
+    type: "object",
+    properties: {
+      owner: {
+        type: "string",
+        description: "仓库所有者 (用户名或组织名)"
+      },
+      repo: {
+        type: "string",
+        description: "仓库名称"
+      },
+      path: {
+        type: "string",
+        description: "要修改的文件路径"
+      },
+      old_str: {
+        type: "string",
+        description: "待替换的原始代码片段。必须在文件中唯一存在，建议包含周围几行上下文以确保唯一性。"
+      },
+      new_str: {
+        type: "string",
+        description: "替换后的新代码片段。"
+      },
+      edits: {
+        type: "array",
+        description: "可选的多处同时替换列表。每项包含 old_str 与 new_str。若提供此项则按顺序批量替换。",
+        items: {
+          type: "object",
+          properties: {
+            old_str: { type: "string", description: "待替换的代码片段" },
+            new_str: { type: "string", description: "替换后的新代码片段" }
+          },
+          required: ["old_str", "new_str"]
+        }
+      },
+      message: {
+        type: "string",
+        description: "Git 提交说明"
+      },
+      branch: {
+        type: "string",
+        description: "目标分支名称 (可选，默认使用仓库默认分支)"
+      }
+    },
+    required: ["owner", "repo", "path", "message"],
+    anyOf: [
+      { required: ["old_str", "new_str"] },
+      { required: ["edits"] }
+    ]
+  };
+
   let virtualTool = serverInfo.tools.find((t) => t.key === toolKey || t.rawName === virtualRawName);
   if (!virtualTool) {
     virtualTool = {
       key: toolKey,
       rawName: virtualRawName,
-      description: `[${serverInfo.name}] 局部编辑 GitHub 文件`,
+      description: "局部编辑 GitHub 仓库中的指定文件。通过比对替换指定的代码片段（old_str -> new_str），自动拉取最新文件、完成局部替换并提交更新，无需全量读取或全量重写。",
+      inputSchema: virtualInputSchema,
       enabled: true,
       status: "supported",
       statusMessage: "支持",
@@ -1221,56 +1273,7 @@ export function registerVirtualTools(serverInfo) {
         function: {
           name: toolKey,
           description: `[${serverInfo.name}] 局部编辑 GitHub 仓库中的指定文件。通过比对替换指定的代码片段（old_str -> new_str），自动拉取最新文件、完成局部替换并提交更新，无需全量读取或全量重写。`,
-          parameters: {
-            type: "object",
-            properties: {
-              owner: {
-                type: "string",
-                description: "仓库所有者 (用户名或组织名)"
-              },
-              repo: {
-                type: "string",
-                description: "仓库名称"
-              },
-              path: {
-                type: "string",
-                description: "要修改的文件路径"
-              },
-              old_str: {
-                type: "string",
-                description: "待替换的原始代码片段。必须在文件中唯一存在，建议包含周围几行上下文以确保唯一性。"
-              },
-              new_str: {
-                type: "string",
-                description: "替换后的新代码片段。"
-              },
-              edits: {
-                type: "array",
-                description: "可选的多处同时替换列表。每项包含 old_str 与 new_str。若提供此项则按顺序批量替换。",
-                items: {
-                  type: "object",
-                  properties: {
-                    old_str: { type: "string", description: "待替换的代码片段" },
-                    new_str: { type: "string", description: "替换后的新代码片段" }
-                  },
-                  required: ["old_str", "new_str"]
-                }
-              },
-              message: {
-                type: "string",
-                description: "Git 提交说明"
-              },
-              branch: {
-                type: "string",
-                description: "目标分支名称 (可选，默认使用仓库默认分支)"
-              }
-            },
-            required: ["owner", "repo", "path", "message"],
-            anyOf: [
-              { required: ["old_str", "new_str"] },
-              { required: ["edits"] }
-            ]
-          }
+          parameters: virtualInputSchema
         }
       }
     };
@@ -1278,6 +1281,7 @@ export function registerVirtualTools(serverInfo) {
     serverInfo.toolCount = serverInfo.tools.length;
   } else {
     virtualTool.isVirtual = true;
+    virtualTool.inputSchema = virtualInputSchema;
     virtualTool.status = "supported";
     virtualTool.statusMessage = "支持";
   }
