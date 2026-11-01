@@ -487,7 +487,7 @@ export async function invokeMcpRawTool(serverInfo, rawName, args, onWaitNotice =
           method: "tools/call",
           params: { name: rawName, arguments: args }
         }),
-        signal: AbortSignal.timeout(35000)
+        signal: AbortSignal.timeout(120000)
       });
     } catch (err) {
       if (attempt === maxRetries) throw err;
@@ -531,6 +531,7 @@ export async function invokeMcpRawTool(serverInfo, rawName, args, onWaitNotice =
     const rawResult = data.result !== undefined ? data.result : data;
     const isToolError = Boolean(rawResult && (rawResult.isError === true || rawResult.is_error === true));
     const textContent = extractMcpResultContent(data);
+    const rawContent = Array.isArray(rawResult?.content) ? rawResult.content : null;
 
     if (isToolError) {
       const waitSec = parseRateLimitWaitSeconds(textContent);
@@ -546,7 +547,7 @@ export async function invokeMcpRawTool(serverInfo, rawName, args, onWaitNotice =
       }
     }
 
-    return { data, rawResult, isToolError, textContent };
+    return { data, rawResult, isToolError, textContent, rawContent };
   }
 }
 
