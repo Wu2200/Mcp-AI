@@ -171,14 +171,22 @@ await loadChannelsFromStorage();
 await loadMcpServersFromStorage();
 await loadSettingsFromStorage();
 
-function getExportedMcpTools(targetFilter = "") {
+function getExportedMcpTools(targetFilter = "", preferRawNames = false) {
   const tools = [];
-  const seen = new Set();
+  const seenNames = new Set();
   const filter = (targetFilter || "").trim().toLowerCase();
 
-  for (const serverInfo of mcpServers.values()) {
-    if (serverInfo.status !== "active" || !Array.isArray(serverInfo.tools)) continue;
+  const activeServers = Array.from(mcpServers.values()).filter(
+    (s) => s.status === "active" && Array.isArray(s.tools)
+  );
 
+  // 判定是否优先使用原生工具名：
+  // 1. 显式传参 preferRawNames === true
+  // 2. 指定了具体的服务过滤（如 /mcp/github 或 ?server=github）
+  // 3. 当前系统中仅有 1 个处于活跃状态的 MCP 服务
+  const useRawName = Boolean(preferRawNames || filter || activeServers.length === 1);
+
+  for (const serverInfo of activeServers) {
     const sName = String(serverInfo.name || "").trim().toLowerCase();
     const sId = String(serverInfo.id || "").trim().toLowerCase();
 
@@ -189,12 +197,32 @@ function getExportedMcpTools(targetFilter = "") {
     }
 
     for (const tool of serverInfo.tools) {
-      if (tool.enabled === false || !tool.key || seen.has(tool.key) || !mcpToolRegistry.has(tool.key)) continue;
-      seen.add(tool.key);
+      if (tool.enabled === false || !tool.key || !mcpToolRegistry.has(tool.key)) continue;
+
+      // 原生工具名处理：
+      // 如果使用原生名，优先采用 tool.rawName；若已发生重名冲突，则退回 tool.key 避免覆盖
+      let exportName = useRawName ? (tool.rawName || tool.key) : tool.key;
+      if (seenNames.has(exportName)) {
+        exportName = tool.key;
+      }
+      if (seenNames.has(exportName)) continue;
+      seenNames.add(exportName);
+
+      // 清洗描述：去除类似 "[github] " 这类前缀污染，保持纯净原生说明
+      let cleanDescription = tool.description || tool.rawName || exportName;
+      cleanDescription = cleanDescription.replace(/^\[[^\]]+\]\s*/, "").trim();
+
+      // 原生 inputSchema 优先
+      const schema = tool.inputSchema || tool.openAiTool?.function?.parameters || { type: "object", properties: {} };
+
       tools.push({
-        name: tool.key,
-        description: tool.description || tool.rawName || tool.key,
-        inputSchema: tool.openAiTool?.function?.parameters || { type: "object", properties: {} }
+        name: exportName,
+        rawName: tool.rawName || exportName,
+        key: tool.key,
+        serverId: serverInfo.id,
+        serverName: serverInfo.name,
+        description: cleanDescription,
+        inputSchema: schema
       });
     }
   }
