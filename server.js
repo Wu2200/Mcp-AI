@@ -337,6 +337,10 @@ const server = http.createServer(async (request, response) => {
       const pathServerName = matchMcp[1] ? decodeURIComponent(matchMcp[1]).trim() : "";
       const queryServerName = (reqUrl.searchParams.get("server") || reqUrl.searchParams.get("name") || "").trim();
       const serverFilter = pathServerName || queryServerName || "";
+      const preferRaw =
+        Boolean(serverFilter) ||
+        reqUrl.searchParams.get("raw") === "true" ||
+        reqUrl.searchParams.get("native") === "true";
 
       let mcpBody;
       if (request.method === "POST") {
@@ -353,24 +357,41 @@ const server = http.createServer(async (request, response) => {
         { capabilities: { tools: {} } }
       );
       mcpServer.setRequestHandler(ListToolsRequestSchema, async () => {
-        const tools = getExportedMcpTools(serverFilter);
+        const tools = getExportedMcpTools(serverFilter, preferRaw);
         if (tools.length === 0) {
           const hint = serverFilter
             ? `未找到服务名称包含 [${serverFilter}] 的已启用 MCP 工具，请检查控制面板中该服务的名称与状态。`
             : "尚未配置任何可用的 MCP 工具，请在控制面板连接并启动远程 MCP 服务。";
           throw new Error(hint);
         }
-        return { tools };
+        return {
+          tools: tools.map((t) => ({
+            name: t.name,
+            description: t.description,
+            inputSchema: t.inputSchema
+          }))
+        };
       });
       mcpServer.setRequestHandler(CallToolRequestSchema, async (mcpRequest) => {
         try {
-          const targetTools = getExportedMcpTools(serverFilter);
+          const targetTools = getExportedMcpTools(serverFilter, preferRaw);
           const requestedName = mcpRequest.params.name;
-          if (!targetTools.some((tool) => tool.name === requestedName)) {
+          const matchedTool = targetTools.find(
+            (tool) => tool.name === requestedName || tool.rawName === requestedName || tool.key === requestedName
+          );
+          if (!matchedTool) {
             throw new Error(`未找到已启用的工具：${requestedName}${serverFilter ? ` (限定在 ${serverFilter})` : ""}`);
           }
           // 作为外部 MCP 代理服务被调用时完全静默，无需将外部请求写进控制台 (skipLogging: true)
-          const result = await callMcpTool(requestedName, mcpRequest.params.arguments || {}, null, true);
+          // 优先传递 matchedTool.key，确保底层注册表 100% 精准匹配
+          const result = await callMcpTool(matchedTool.key || requestedName, mcpRequest.params.arguments || {}, null, true);
+          // 原生透传：若上游返回原生 content 数组（图片、嵌入资源、多段内容），直接原汁原味透传
+          if (Array.isArray(result.rawContent) && result.rawContent.length > 0) {
+            return {
+              content: result.rawContent,
+              ...(result.isError ? { isError: true } : {})
+            };
+          }
           return {
             content: [{ type: "text", text: String(result.content ?? "") }],
             ...(result.isError ? { isError: true } : {})
