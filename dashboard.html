@@ -467,7 +467,51 @@
     .tag-upstream { background: #d97706; color: #ffffff; }
     .tag-agent { background: #7c3aed; color: #ffffff; }
     .tag-tool { background: #059669; color: #ffffff; }
+    .tag-mcp { background: #0d9488; color: #ffffff; }
     .tag-error { background: #dc2626; color: #ffffff; }
+
+    .log-tabs {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 10px;
+      border-bottom: 1px solid #e2e8f0;
+      padding-bottom: 10px;
+      flex-wrap: wrap;
+    }
+    .log-tab-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 14px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      border: 1px solid #cbd5e1;
+      background: #f8fafc;
+      color: #475569;
+      transition: all 0.15s;
+    }
+    .log-tab-btn:hover {
+      background: #f1f5f9;
+      color: #0f172a;
+    }
+    .log-tab-btn.active {
+      background: #2563eb;
+      color: #ffffff;
+      border-color: #2563eb;
+    }
+    .log-tab-count {
+      font-size: 11px;
+      padding: 1px 6px;
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.12);
+      color: inherit;
+    }
+    .log-tab-btn.active .log-tab-count {
+      background: rgba(255, 255, 255, 0.22);
+      color: #ffffff;
+    }
     .log-summary {
       flex: 1 1 160px;
       min-width: 0;
@@ -595,10 +639,10 @@
         <div class="box" id="proxy-url"></div>
       </div>
       <div class="group">
-        <label>第三方 MCP 服务接入地址 (支持按服务名或挂载全部)</label>
+        <label>第三方 MCP 服务接入地址 (默认 100% 原生工具名，支持按服务名或挂载全部)</label>
         <div class="box" id="mcp-endpoint-url"></div>
         <p style="font-size: 12px; color: #64748b; margin-top: 4px;">
-          在 Cursor、Claude Desktop 等第三方平台填入此 URL 即可挂载全部工具；亦可将后缀追加已导入的服务名称（如 <code>/mcp/github</code> 或 <code>/mcp/cloudflare</code>）按需接入。外部调用完全静默，不记录到控制台日志。
+          在手机客户端、Cursor、Claude Desktop 等第三方平台填入此 URL 即可原生挂载全部工具；亦可追加服务名后缀（如 <code>/mcp/github</code> 或 <code>/mcp/cloudflare</code>）按需接入。第三方调用过程会实时输出至控制台，并可在下方日志面板切换至「第三方 MCP 调用」独立查看。
         </p>
       </div>
       <div class="group">
@@ -610,18 +654,28 @@
     <div class="card">
       <div class="card-title">
         <div class="card-title-left">
-          <span>全链路调试抓包日志 (单次完整对话)</span>
+          <span>全链路调试抓包日志</span>
           <span id="log-status-badge" class="badge badge-green">抓取中</span>
         </div>
         <div class="action-group">
           <button id="btn-toggle-log" class="btn-action btn-stop" onclick="toggleLogging()">关闭日志</button>
-          <button class="btn-action btn-start" onclick="copyAllLogs()">复制本次对话日志</button>
-          <button class="btn-action btn-del" onclick="clearAllLogs()">清空日志</button>
+          <button class="btn-action btn-start" onclick="copyAllLogs()">复制当前分类</button>
+          <button class="btn-action btn-del" onclick="clearAllLogs()">清空当前分类</button>
           <button class="btn-action btn-start" onclick="loadLogs()">刷新</button>
         </div>
       </div>
-      <p style="font-size: 12px; color: #64748b; margin-bottom: 10px;">
-        控制台永远仅展示当前最新一次完整对话（涵盖该次会话的所有 Agent 轮次、工具调用、深度思考及最终响应），发起新对话时自动覆盖旧日志。
+      <div class="log-tabs">
+        <button id="tab-log-chat" class="log-tab-btn active" onclick="switchLogCategory('chat')">
+          <span>对话代理日志 (Chat)</span>
+          <span id="count-log-chat" class="log-tab-count">0</span>
+        </button>
+        <button id="tab-log-mcp" class="log-tab-btn" onclick="switchLogCategory('mcp')">
+          <span>第三方 MCP 调用 (MCP 接入)</span>
+          <span id="count-log-mcp" class="log-tab-count">0</span>
+        </button>
+      </div>
+      <p id="log-desc-text" style="font-size: 12px; color: #64748b; margin-bottom: 10px;">
+        当前展示「对话代理日志」：记录通过 /v1 或 Gemini 接口发起的最新一次完整对话（涵盖 Agent 轮次、工具调用、深度思考及最终响应）。
       </p>
       <div id="log-panel" class="log-panel-container">
         <div class="empty-state" style="color: #64748b;">暂无抓包记录。在客户端发起对话即可在此实时查看本次完整对话。</div>
@@ -763,7 +817,10 @@
 
     let currentEnabledList = [];
     let isLoggingActive = true;
-    let cachedLogs = [];
+    let currentLogCategory = "chat";
+    let cachedChatLogs = [];
+    let cachedMcpLogs = [];
+    let expandedLogIds = new Set();
     let cachedServers = [];
     let cachedChannels = [];
 
@@ -1047,15 +1104,18 @@
       if (!bodyEl) return;
       if (bodyEl.style.display === "block") {
         bodyEl.style.display = "none";
+        expandedLogIds.delete(id);
         if (iconEl) iconEl.innerText = "▶";
       } else {
         bodyEl.style.display = "block";
+        expandedLogIds.add(id);
         if (iconEl) iconEl.innerText = "▼";
       }
     }
 
     function getTagClass(type) {
       if (type.startsWith("CONVERSATION")) return "tag-conv";
+      if (type.startsWith("MCP_")) return "tag-mcp";
       if (type.startsWith("DOWNSTREAM")) return "tag-downstream";
       if (type.startsWith("UPSTREAM")) return "tag-upstream";
       if (type.startsWith("AGENT")) return "tag-agent";
@@ -1064,13 +1124,70 @@
       return "tag-downstream";
     }
 
+    function switchLogCategory(cat) {
+      currentLogCategory = cat === "mcp" ? "mcp" : "chat";
+      const chatBtn = document.getElementById("tab-log-chat");
+      const mcpBtn = document.getElementById("tab-log-mcp");
+      const descEl = document.getElementById("log-desc-text");
+
+      if (currentLogCategory === "mcp") {
+        chatBtn.classList.remove("active");
+        mcpBtn.classList.add("active");
+        descEl.innerText = "当前展示「第三方 MCP 调用日志」：记录本项目作为原生 MCP 服务（/mcp）被外部客户端握手、拉取工具列表及调用执行工具的全链路日志。";
+      } else {
+        mcpBtn.classList.remove("active");
+        chatBtn.classList.add("active");
+        descEl.innerText = "当前展示「对话代理日志」：记录通过 /v1 或 Gemini 接口发起的最新一次完整对话（涵盖 Agent 轮次、工具调用、深度思考及最终响应）。";
+      }
+      renderCurrentCategoryLogs();
+    }
+
+    function getActiveLogsArray() {
+      return currentLogCategory === "mcp" ? cachedMcpLogs : cachedChatLogs;
+    }
+
+    function renderCurrentCategoryLogs() {
+      const chatCountEl = document.getElementById("count-log-chat");
+      const mcpCountEl = document.getElementById("count-log-mcp");
+      if (chatCountEl) chatCountEl.innerText = String(cachedChatLogs.length);
+      if (mcpCountEl) mcpCountEl.innerText = String(cachedMcpLogs.length);
+
+      const panel = document.getElementById("log-panel");
+      const activeLogs = getActiveLogsArray();
+
+      if (activeLogs.length === 0) {
+        const emptyHint = currentLogCategory === "mcp"
+          ? "暂无第三方 MCP 调用记录。在手机客户端、Cursor 等平台接入 /mcp 并调用工具后将在此实时显示。"
+          : "暂无对话代理抓包记录。在客户端发起对话即可在此实时查看本次完整对话。";
+        panel.innerHTML = `<div class="empty-state" style="color: #64748b;">${emptyHint}</div>`;
+        return;
+      }
+
+      const list = [...activeLogs].reverse();
+      panel.innerHTML = list.map(item => {
+        const isExpanded = expandedLogIds.has(item.id);
+        return `
+          <div class="log-item">
+            <div class="log-header" onclick="toggleLogDetail('${item.id}')">
+              <span class="log-expand-icon" id="log-icon-${item.id}">${isExpanded ? "▼" : "▶"}</span>
+              <span class="log-time">${item.time}</span>
+              <span class="log-type-tag ${getTagClass(item.type)}">${item.type}</span>
+              <span class="log-summary" title="${escapeHtml(item.summary)}">${escapeHtml(item.summary)}</span>
+            </div>
+            <div class="log-body" id="log-detail-${item.id}" style="display: ${isExpanded ? "block" : "none"};">${escapeHtml(item.detail)}</div>
+          </div>
+        `;
+      }).join("");
+    }
+
     async function loadLogs() {
       try {
         const res = await fetch("/api/logs");
         if (!res.ok) return;
         const data = await res.json();
         isLoggingActive = !!data.enabled;
-        cachedLogs = data.logs || [];
+        cachedChatLogs = data.logs || [];
+        cachedMcpLogs = data.mcpLogs || [];
 
         const badge = document.getElementById("log-status-badge");
         const toggleBtn = document.getElementById("btn-toggle-log");
@@ -1086,24 +1203,7 @@
           toggleBtn.innerText = "开启日志";
         }
 
-        const panel = document.getElementById("log-panel");
-        if (cachedLogs.length === 0) {
-          panel.innerHTML = '<div class="empty-state" style="color: #64748b;">暂无抓包记录。在客户端发起对话即可在此实时查看本次完整对话。</div>';
-          return;
-        }
-
-        const list = [...cachedLogs].reverse();
-        panel.innerHTML = list.map(item => `
-          <div class="log-item">
-            <div class="log-header" onclick="toggleLogDetail('${item.id}')">
-              <span class="log-expand-icon" id="log-icon-${item.id}">▶</span>
-              <span class="log-time">${item.time}</span>
-              <span class="log-type-tag ${getTagClass(item.type)}">${item.type}</span>
-              <span class="log-summary" title="${escapeHtml(item.summary)}">${escapeHtml(item.summary)}</span>
-            </div>
-            <div class="log-body" id="log-detail-${item.id}">${escapeHtml(item.detail)}</div>
-          </div>
-        `).join("");
+        renderCurrentCategoryLogs();
       } catch {}
     }
 
@@ -1132,9 +1232,14 @@
     }
 
     async function clearAllLogs() {
-      if (!confirm("确认清空抓包日志？")) return;
+      const catLabel = currentLogCategory === "mcp" ? "第三方 MCP 调用" : "对话代理";
+      if (!confirm(`确认清空「${catLabel}」抓包日志？`)) return;
       try {
-        const res = await fetch("/api/logs/clear", { method: "POST" });
+        const res = await fetch("/api/logs/clear", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ category: currentLogCategory })
+        });
         if (res.ok) {
           loadLogs();
         }
@@ -1142,14 +1247,16 @@
     }
 
     function copyAllLogs() {
-      if (!cachedLogs || cachedLogs.length === 0) {
-        alert("暂无日志可复制");
+      const activeLogs = getActiveLogsArray();
+      if (!activeLogs || activeLogs.length === 0) {
+        alert("当前分类暂无日志可复制");
         return;
       }
-      const text = cachedLogs.map(l => `[${l.time}] [${l.type}] ${l.summary}\n${l.detail}\n----------------------------------------`).join("\n\n");
+      const text = activeLogs.map(l => `[${l.time}] [${l.type}] ${l.summary}\n${l.detail}\n----------------------------------------`).join("\n\n");
       navigator.clipboard.writeText(text).then(() => {
         const msg = document.getElementById("log-msg");
-        msg.innerText = "已复制本次对话抓包日志";
+        const catLabel = currentLogCategory === "mcp" ? "第三方 MCP 调用日志" : "对话代理日志";
+        msg.innerText = `已复制${catLabel}`;
         msg.style.color = "#16a34a";
         setTimeout(() => { msg.innerText = ""; }, 3000);
       }).catch(() => {
@@ -1252,11 +1359,12 @@
           let toolsHtml = "";
           for (let t of s.tools) {
             const isToolEnabled = t.enabled !== false;
+            const displayToolName = t.rawName || t.key;
             toolsHtml += `
               <div class="tool-row ${isToolEnabled ? '' : 'disabled'}">
                 <div class="tool-left">
                   <input type="checkbox" class="tool-checkbox" ${isToolEnabled ? 'checked' : ''} onchange="handleToggleTool('${s.id}', '${t.key}', this.checked)">
-                  <span class="tool-name" title="${t.key}">${t.key}</span>
+                  <span class="tool-name" title="${displayToolName}">${displayToolName}</span>
                 </div>
               </div>
             `;
