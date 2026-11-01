@@ -471,7 +471,7 @@ export function parseRateLimitWaitSeconds(errorText) {
   return 0;
 }
 
-export async function invokeMcpRawTool(serverInfo, rawName, args, onWaitNotice = null) {
+export async function invokeMcpRawTool(serverInfo, rawName, args, onWaitNotice = null, skipLogging = false) {
   const maxRetries = 2;
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
     let res;
@@ -500,7 +500,9 @@ export async function invokeMcpRawTool(serverInfo, rawName, args, onWaitNotice =
         if (typeof onWaitNotice === "function") {
           onWaitNotice(waitSec);
         }
-        addDebugLog("TOOL", `[频控保护] 接口调用触发限制，正在等待 ${waitSec + 1} 秒后自动重试...`);
+        if (!skipLogging) {
+          addDebugLog("TOOL", `[频控保护] 接口调用触发限制，正在等待 ${waitSec + 1} 秒后自动重试...`);
+        }
         await new Promise((resolve) => setTimeout(resolve, (waitSec + 1) * 1000));
         continue;
       }
@@ -515,7 +517,9 @@ export async function invokeMcpRawTool(serverInfo, rawName, args, onWaitNotice =
         if (typeof onWaitNotice === "function") {
           onWaitNotice(waitSec);
         }
-        addDebugLog("TOOL", `[频控保护] 接口调用触发限制，正在等待 ${waitSec + 1} 秒后自动重试...`);
+        if (!skipLogging) {
+          addDebugLog("TOOL", `[频控保护] 接口调用触发限制，正在等待 ${waitSec + 1} 秒后自动重试...`);
+        }
         await new Promise((resolve) => setTimeout(resolve, (waitSec + 1) * 1000));
         continue;
       }
@@ -532,7 +536,9 @@ export async function invokeMcpRawTool(serverInfo, rawName, args, onWaitNotice =
         if (typeof onWaitNotice === "function") {
           onWaitNotice(waitSec);
         }
-        addDebugLog("TOOL", `[频控保护] 工具返回频率限制错误，正在等待 ${waitSec + 1} 秒后自动重试...`);
+        if (!skipLogging) {
+          addDebugLog("TOOL", `[频控保护] 工具返回频率限制错误，正在等待 ${waitSec + 1} 秒后自动重试...`);
+        }
         await new Promise((resolve) => setTimeout(resolve, (waitSec + 1) * 1000));
         continue;
       }
@@ -1044,7 +1050,7 @@ export function applyStringReplacements(content, edits, filePath = "") {
   return updated;
 }
 
-export async function executeGithubEditFile(serverInfo, readToolRawName, writeToolRawName, args, onWaitNotice = null) {
+export async function executeGithubEditFile(serverInfo, readToolRawName, writeToolRawName, args, onWaitNotice = null, skipLogging = false) {
   const { owner, repo, path: filePath, old_str, new_str, edits, message, branch } = args || {};
 
   if (!owner || !repo || !filePath) {
@@ -1065,8 +1071,10 @@ export async function executeGithubEditFile(serverInfo, readToolRawName, writeTo
     getArgs.ref = branch;
   }
 
-  addDebugLog("TOOL", `[局部编辑] 读取文件: ${owner}/${repo}/${filePath} (分支: ${branch || "默认"})`);
-  const getRes = await invokeMcpRawTool(serverInfo, readToolRawName, getArgs, onWaitNotice);
+  if (!skipLogging) {
+    addDebugLog("TOOL", `[局部编辑] 读取文件: ${owner}/${repo}/${filePath} (分支: ${branch || "默认"})`);
+  }
+  const getRes = await invokeMcpRawTool(serverInfo, readToolRawName, getArgs, onWaitNotice, skipLogging);
   if (getRes.isToolError) {
     throw new Error(`读取文件失败: ${getRes.textContent.slice(0, 300)}`);
   }
@@ -1126,7 +1134,7 @@ export async function executeGithubEditFile(serverInfo, readToolRawName, writeTo
     const branchTool = findServerTool(serverInfo, ["list_branches"]);
     if (branchTool) {
       try {
-        const branchRes = await invokeMcpRawTool(serverInfo, branchTool.rawName, { owner, repo }, onWaitNotice);
+        const branchRes = await invokeMcpRawTool(serverInfo, branchTool.rawName, { owner, repo }, onWaitNotice, skipLogging);
         if (!branchRes.isToolError && branchRes.textContent) {
           const names = Array.from(branchRes.textContent.matchAll(/"name"\s*:\s*"([^"]+)"/g), (m) => m[1]);
           if (names.length > 0) {
@@ -1151,8 +1159,10 @@ export async function executeGithubEditFile(serverInfo, readToolRawName, writeTo
     branch: targetBranch
   };
 
-  addDebugLog("TOOL", `[局部编辑] 提交更新到 GitHub: ${owner}/${repo}/${filePath} (SHA: ${fileSha})`);
-  const putRes = await invokeMcpRawTool(serverInfo, writeToolRawName, putArgs, onWaitNotice);
+  if (!skipLogging) {
+    addDebugLog("TOOL", `[局部编辑] 提交更新到 GitHub: ${owner}/${repo}/${filePath} (SHA: ${fileSha})`);
+  }
+  const putRes = await invokeMcpRawTool(serverInfo, writeToolRawName, putArgs, onWaitNotice, skipLogging);
   if (putRes.isToolError) {
     throw new Error(`提交更新失败: ${putRes.textContent.slice(0, 300)}`);
   }
@@ -1275,14 +1285,27 @@ export function registerVirtualTools(serverInfo) {
       serverName: serverInfo.name,
       rawName: virtualRawName,
       isVirtual: true,
-      handler: async (args, onWaitNotice) => {
-        return await executeGithubEditFile(serverInfo, readTool.rawName, writeTool.rawName, args, onWaitNotice);
+      handler: async (args, onWaitNotice, skipLogging = false) => {
+        return await executeGithubEditFile(serverInfo, readTool.rawName, writeTool.rawName, args, onWaitNotice, skipLogging);
       }
     });
   }
 }
 
-export async function callMcpTool(toolKey, args, onWaitNotice = null) {
+export async function callMcpTool(toolKey, args, onWaitNoticeOrOptions = null, maybeSkipLogging = false) {
+  let onWaitNotice = null;
+  let skipLogging = false;
+
+  if (typeof onWaitNoticeOrOptions === "function") {
+    onWaitNotice = onWaitNoticeOrOptions;
+    skipLogging = Boolean(maybeSkipLogging);
+  } else if (onWaitNoticeOrOptions && typeof onWaitNoticeOrOptions === "object") {
+    onWaitNotice = onWaitNoticeOrOptions.onWaitNotice || null;
+    skipLogging = Boolean(onWaitNoticeOrOptions.skipLogging);
+  } else {
+    skipLogging = Boolean(maybeSkipLogging);
+  }
+
   const info = findToolInfo(toolKey);
   if (!info) throw new Error(`未找到工具：${toolKey}`);
 
@@ -1336,25 +1359,29 @@ export async function callMcpTool(toolKey, args, onWaitNotice = null) {
   const startTime = Date.now();
   if (typeof info.handler === "function") {
     try {
-      const res = await info.handler(args, onWaitNotice);
+      const res = await info.handler(args, onWaitNotice, skipLogging);
       const duration = Date.now() - startTime;
       const isError = Boolean(res && res.isError);
       const content = typeof res?.content === "string" ? res.content : JSON.stringify(res || {});
-      addDebugLog(isError ? "ERROR" : "TOOL", `虚拟 MCP 工具 [${toolKey}] 执行${isError ? "失败" : "成功"} - 耗时 ${duration}ms`, {
-        arguments: args,
-        outputPreview: content.slice(0, 500)
-      });
+      if (!skipLogging) {
+        addDebugLog(isError ? "ERROR" : "TOOL", `虚拟 MCP 工具 [${toolKey}] 执行${isError ? "失败" : "成功"} - 耗时 ${duration}ms`, {
+          arguments: args,
+          outputPreview: content.slice(0, 500)
+        });
+      }
       return { isError, content };
     } catch (err) {
       const duration = Date.now() - startTime;
       const msg = err instanceof Error ? err.message : String(err);
-      addDebugLog("ERROR", `虚拟 MCP 工具 [${toolKey}] 异常 - 耗时 ${duration}ms`, msg);
+      if (!skipLogging) {
+        addDebugLog("ERROR", `虚拟 MCP 工具 [${toolKey}] 异常 - 耗时 ${duration}ms`, msg);
+      }
       return { isError: true, content: JSON.stringify({ error: msg }) };
     }
   }
 
   try {
-    const { rawResult, isToolError, textContent } = await invokeMcpRawTool(info, info.rawName, args, onWaitNotice);
+    const { rawResult, isToolError, textContent } = await invokeMcpRawTool(info, info.rawName, args, onWaitNotice, skipLogging);
     const duration = Date.now() - startTime;
     if (isToolError) {
       let refinedContent = textContent;
@@ -1365,16 +1392,20 @@ export async function callMcpTool(toolKey, args, onWaitNotice = null) {
       } else if (isCfExecute && (textContent.includes("is not one of this session's accounts") || textContent.includes("Could not route to /client/v4/accounts"))) {
         refinedContent = `${textContent}\n\n【账户ID诊断指引】account_id 错误！传入的 account_id 必须为 32 位十六进制字符串（如错误提示中给出的可用账户 ID），切勿使用账户邮箱或显示名称。亦可直接使用沙箱内置的全局变量 accountId。`;
       }
-      addDebugLog("ERROR", `MCP 工具 [${toolKey}] 返回错误 - 耗时 ${duration}ms`, {
-        arguments: args,
-        errorOutput: refinedContent.slice(0, 500)
-      });
+      if (!skipLogging) {
+        addDebugLog("ERROR", `MCP 工具 [${toolKey}] 返回错误 - 耗时 ${duration}ms`, {
+          arguments: args,
+          errorOutput: refinedContent.slice(0, 500)
+        });
+      }
       return { isError: true, content: refinedContent };
     }
-    addDebugLog("TOOL", `MCP 工具 [${toolKey}] 执行成功 - 耗时 ${duration}ms, 输出 ${textContent.length} 字符`, {
-      arguments: args,
-      outputPreview: textContent.slice(0, 500)
-    });
+    if (!skipLogging) {
+      addDebugLog("TOOL", `MCP 工具 [${toolKey}] 执行成功 - 耗时 ${duration}ms, 输出 ${textContent.length} 字符`, {
+        arguments: args,
+        outputPreview: textContent.slice(0, 500)
+      });
+    }
     return { isError: false, content: textContent };
   } catch (err) {
     const duration = Date.now() - startTime;
@@ -1386,7 +1417,9 @@ export async function callMcpTool(toolKey, args, onWaitNotice = null) {
     } else if (isCfExecute && (msg.includes("is not one of this session's accounts") || msg.includes("Could not route to /client/v4/accounts"))) {
       msg = `${msg} (账户ID指引: account_id 必须为 32 位十六进制字符串，切勿传入邮箱或名称，建议直接使用全局变量 accountId)`;
     }
-    addDebugLog("ERROR", `MCP 工具 [${toolKey}] 异常 - 耗时 ${duration}ms`, msg);
+    if (!skipLogging) {
+      addDebugLog("ERROR", `MCP 工具 [${toolKey}] 异常 - 耗时 ${duration}ms`, msg);
+    }
     throw (err instanceof Error ? new Error(msg) : new Error(String(msg)));
   }
 }
