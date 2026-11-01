@@ -13,6 +13,8 @@ import {
   saveChannelsToStorage,
   loadChannelsFromStorage,
   upstreamChannels,
+  activeChannelId,
+  setActiveChannelId,
   getActiveChannel,
   upstreamModelsUrl,
   maskApiKey,
@@ -411,8 +413,8 @@ const server = http.createServer(async (request, response) => {
         const newChannel = { id, name, envKey: "自定义", baseUrl, apiKey };
         upstreamChannels.push(newChannel);
 
-        if (!activeChannelId) {
-          activeChannelId = id;
+        const active = getActiveChannel();
+        if (!active) {
           await saveActiveChannelToStorage(id);
         }
         await saveChannelsToStorage();
@@ -462,9 +464,9 @@ const server = http.createServer(async (request, response) => {
         const deletedName = upstreamChannels[idx].name;
         upstreamChannels.splice(idx, 1);
 
-        if (activeChannelId === id) {
-          activeChannelId = upstreamChannels[0].id;
-          await saveActiveChannelToStorage(activeChannelId);
+        const active = getActiveChannel();
+        if (active && active.id === id) {
+          await saveActiveChannelToStorage(upstreamChannels[0].id);
         }
         await saveChannelsToStorage();
 
