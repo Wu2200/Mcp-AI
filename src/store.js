@@ -15,6 +15,7 @@ export const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
 
 export const DATA_FILE = path.join(PROJECT_ROOT, "mcp-config.json");
 export const SETTINGS_FILE = path.join(PROJECT_ROOT, "mcp-settings.json");
+export const CHANNELS_FILE = path.join(PROJECT_ROOT, "mcp-channels.json");
 
 export const mcpServers = new Map();
 export const mcpToolRegistry = new Map();
@@ -418,6 +419,62 @@ export async function saveEnabledModelsToStorage(modelsArray) {
 export async function saveActiveChannelToStorage(channelId) {
   activeChannelId = channelId;
   await saveSettingsToStorage();
+}
+
+export async function saveChannelsToStorage() {
+  const data = upstreamChannels.map((c) => ({
+    id: c.id,
+    name: c.name,
+    envKey: c.envKey || "自定义",
+    baseUrl: c.baseUrl,
+    apiKey: c.apiKey
+  }));
+  try {
+    fs.writeFileSync(CHANNELS_FILE, JSON.stringify(data, null, 2), "utf8");
+  } catch {}
+  if (dbPool) {
+    await setStorageItem("upstream_channels", data);
+  }
+}
+
+export async function loadChannelsFromStorage() {
+  let stored = null;
+  if (dbPool) {
+    stored = await getStorageItem("upstream_channels");
+  }
+  if (!stored && fs.existsSync(CHANNELS_FILE)) {
+    try {
+      const raw = fs.readFileSync(CHANNELS_FILE, "utf8");
+      stored = JSON.parse(raw);
+      if (dbPool && stored) {
+        await setStorageItem("upstream_channels", stored);
+      }
+    } catch {}
+  }
+
+  if (Array.isArray(stored) && stored.length > 0) {
+    for (const sc of stored) {
+      if (sc && sc.id && sc.baseUrl && sc.apiKey) {
+        const existingIdx = upstreamChannels.findIndex((c) => c.id === sc.id);
+        if (existingIdx !== -1) {
+          upstreamChannels[existingIdx] = {
+            ...upstreamChannels[existingIdx],
+            ...sc
+          };
+        } else {
+          upstreamChannels.push(sc);
+        }
+      }
+    }
+  }
+
+  if (upstreamChannels.length > 0) {
+    if (!activeChannelId || !upstreamChannels.some((c) => c.id === activeChannelId)) {
+      activeChannelId = upstreamChannels[0].id;
+    }
+  } else {
+    activeChannelId = "";
+  }
 }
 
 export async function loadSettingsFromStorage() {
