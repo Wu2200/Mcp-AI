@@ -2296,7 +2296,7 @@ export async function runAgent(requestBody, clientResponse, reqMeta, abortSignal
         const resolvedToolKey = toolInfo?.key || toolCallName;
         const displayName = toolInfo?.serverName || "MCP";
         const rawAction = toolInfo?.rawName || toolCallName;
-        const isWrite = isWriteTool(rawAction);
+        const isWrite = isWriteTool(rawAction, args);
         const isActions = /actions_(list|get)/i.test(rawAction);
         const isActionsListMethod = isActions && (args?.method === "list_workflow_runs" || !args?.method);
         const isTrigger = /actions_run_trigger/i.test(rawAction);
