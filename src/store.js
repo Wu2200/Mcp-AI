@@ -33,10 +33,11 @@ export function setLoggingEnabled(enabled) {
 }
 export const MAX_LOGS = 1000;
 export const debugLogs = [];
+export const mcpCallLogs = [];
 export let currentConversationId = "";
 
 export function startNewConversationLog(meta = {}) {
-  // 每次新对话开始时，彻底清空上一次对话的全部历史，确保控制台永远只显示本次完整对话
+  // 每次新对话开始时，仅清空对话代理日志，保留第三方 MCP 调用日志互不干扰
   debugLogs.length = 0;
   currentConversationId = `conv_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   const now = new Date();
@@ -49,6 +50,7 @@ export function startNewConversationLog(meta = {}) {
     id: `log_${Date.now()}_start`,
     time,
     type: "CONVERSATION",
+    category: "chat",
     summary: `【新对话开始】模型: [${meta.model || "default"}] - 渠道: [${meta.channel || "默认"}]`,
     detail: JSON.stringify(
       {
@@ -69,23 +71,32 @@ export function startNewConversationLog(meta = {}) {
   console.log(`[${time}] 模型: ${meta.model || "default"} | 渠道: ${meta.channel || "默认"}`);
 }
 
-export function addDebugLog(type, summary, detail = "") {
+export function addDebugLog(type, summary, detail = "", category = "chat") {
   const now = new Date();
   const time =
     now.toLocaleTimeString("zh-CN", { hour12: false }) +
     "." +
     String(now.getMilliseconds()).padStart(3, "0");
   const detailStr = typeof detail === "object" ? JSON.stringify(detail, null, 2) : String(detail);
+  const resolvedCategory = category === "mcp" ? "mcp" : "chat";
   const entry = {
     id: `log_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
     time,
     type,
+    category: resolvedCategory,
     summary,
     detail: detailStr
   };
 
-  // 控制台精炼输出：仅输出核心关键里程碑，过滤内部冗余中间调用
-  if (type === "ERROR") {
+  // 控制台精炼输出：区分内置对话代理与第三方 MCP 接入调用
+  if (resolvedCategory === "mcp") {
+    if (type === "ERROR") {
+      const briefErr = summary.length > 200 ? `${summary.slice(0, 200)}...` : summary;
+      console.error(`[${time}] [MCP服务-错误] ${briefErr}`);
+    } else {
+      console.log(`[${time}] [MCP服务] ${summary}`);
+    }
+  } else if (type === "ERROR") {
     const briefErr = summary.length > 200 ? `${summary.slice(0, 200)}...` : summary;
     console.error(`[${time}] [错误] ${briefErr}`);
   } else if (type === "DOWNSTREAM") {
@@ -99,9 +110,16 @@ export function addDebugLog(type, summary, detail = "") {
   }
 
   if (!loggingEnabled) return;
-  debugLogs.push(entry);
-  if (debugLogs.length > MAX_LOGS) {
-    debugLogs.shift();
+  if (resolvedCategory === "mcp") {
+    mcpCallLogs.push(entry);
+    if (mcpCallLogs.length > MAX_LOGS) {
+      mcpCallLogs.shift();
+    }
+  } else {
+    debugLogs.push(entry);
+    if (debugLogs.length > MAX_LOGS) {
+      debugLogs.shift();
+    }
   }
 }
 
