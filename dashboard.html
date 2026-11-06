@@ -53,15 +53,6 @@
     </header>
 
     <section class="card">
-      <h2>客户端接入</h2>
-      <div class="field">
-        <label for="endpoint">MCP 接入地址</label>
-        <div class="row"><div id="endpoint" class="endpoint"></div><button id="copy-endpoint" class="secondary">复制</button></div>
-        <p class="hint">将地址添加到支持 Streamable HTTP 的 MCP 客户端。若部署时设置了 PROXY_API_KEY，请在客户端配置 Authorization: Bearer &lt;密钥&gt; 请求头。也可以在地址后添加 /服务名称，仅接入指定服务。</p>
-      </div>
-    </section>
-
-    <section class="card">
       <h2>挂载远程 MCP 服务</h2>
       <form id="connect-form">
         <div class="field"><label for="mcp-name">服务名称</label><input id="mcp-name" value="GitHub" required></div>
@@ -86,13 +77,10 @@
     </section>
   </main>
   <script>
-    const endpointEl = document.getElementById("endpoint");
     const serversEl = document.getElementById("servers");
     const logsEl = document.getElementById("logs");
     const messageEl = document.getElementById("message");
     const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#039;" })[char]);
-
-    endpointEl.textContent = `${window.location.origin}/mcp`;
 
     async function requestJson(url, options = {}) {
       const response = await fetch(url, options);
@@ -217,9 +205,6 @@
       }
     });
 
-    document.getElementById("copy-endpoint").addEventListener("click", async () => {
-      try { await navigator.clipboard.writeText(endpointEl.textContent); } catch { alert("复制失败，请手动复制地址"); }
-    });
     document.getElementById("refresh-servers").addEventListener("click", loadServers);
     document.getElementById("refresh-logs").addEventListener("click", loadLogs);
     document.getElementById("toggle-logs").addEventListener("click", async () => {
