@@ -2,1463 +2,252 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>MCP 控制台</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MCP-AI 控制台</title>
   <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-      background-color: #f8fafc;
-      color: #1e293b;
-      padding: 16px 12px;
-      line-height: 1.5;
-    }
-    .container {
-      max-width: 880px;
-      margin: 0 auto;
-    }
-    .header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 16px;
-      gap: 12px;
-    }
-    .header h1 {
-      font-size: 19px;
-      font-weight: 700;
-      color: #0f172a;
-      letter-spacing: -0.02em;
-    }
-    .header p {
-      font-size: 13px;
-      color: #64748b;
-      margin-top: 2px;
-    }
-    .btn-logout {
-      background: #ffffff;
-      color: #64748b;
-      border: 1px solid #cbd5e1;
-      padding: 6px 12px;
-      font-size: 13px;
-      font-weight: 500;
-      border-radius: 6px;
-      cursor: pointer;
-      white-space: nowrap;
-      flex-shrink: 0;
-      transition: all 0.15s;
-    }
-    .btn-logout:hover {
-      background: #fee2e2;
-      color: #dc2626;
-      border-color: #fca5a5;
-    }
-    .card {
-      background: #ffffff;
-      border: 1px solid #e2e8f0;
-      border-radius: 12px;
-      padding: 16px;
-      margin-bottom: 14px;
-      box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05);
-    }
-    .card-title {
-      font-size: 15px;
-      font-weight: 600;
-      color: #0f172a;
-      margin-bottom: 12px;
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-    }
-    .card-title-left {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      flex: 1 1 200px;
-      min-width: 0;
-    }
-    .card-title-left span {
-      white-space: normal;
-      word-break: break-word;
-    }
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      font-size: 12px;
-      font-weight: 500;
-      padding: 2px 8px;
-      border-radius: 9999px;
-      white-space: nowrap;
-      flex-shrink: 0;
-    }
-    .badge-blue { background: #e0f2fe; color: #0369a1; }
-    .badge-green { background: #dcfce7; color: #15803d; }
-    .badge-red { background: #fee2e2; color: #b91c1c; }
-    .badge-gray { background: #f1f5f9; color: #64748b; border: 1px solid #e2e8f0; }
-
-    .group {
-      margin-bottom: 14px;
-    }
-    .group:last-child {
-      margin-bottom: 0;
-    }
-    label {
-      display: block;
-      font-size: 13px;
-      font-weight: 500;
-      color: #475569;
-      margin-bottom: 6px;
-    }
-    .box {
-      background: #f1f5f9;
-      border: 1px solid #e2e8f0;
-      padding: 10px 12px;
-      border-radius: 8px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-      font-size: 13px;
-      color: #0f172a;
-      word-break: break-all;
-      user-select: all;
-    }
-    input {
-      width: 100%;
-      background: #ffffff;
-      border: 1px solid #cbd5e1;
-      padding: 10px 12px;
-      border-radius: 8px;
-      color: #0f172a;
-      font-size: 14px;
-      outline: none;
-      transition: border-color 0.15s, box-shadow 0.15s;
-    }
-    input:focus {
-      border-color: #2563eb;
-      box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
-    }
-    .btn {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      background: #2563eb;
-      color: #ffffff;
-      border: none;
-      font-weight: 600;
-      font-size: 14px;
-      padding: 10px 20px;
-      border-radius: 8px;
-      cursor: pointer;
-      white-space: nowrap;
-      flex-shrink: 0;
-      transition: background-color 0.15s;
-    }
-    .btn:hover {
-      background: #1d4ed8;
-    }
-    .btn-secondary {
-      background: #f1f5f9;
-      color: #334155;
-      border: 1px solid #cbd5e1;
-      padding: 8px 14px;
-      font-size: 13px;
-    }
-    .btn-secondary:hover {
-      background: #e2e8f0;
-      color: #0f172a;
-    }
-
-    .action-group {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-      align-items: center;
-    }
-    .btn-action {
-      border: none;
-      padding: 5px 10px;
-      font-size: 12px;
-      font-weight: 600;
-      border-radius: 6px;
-      cursor: pointer;
-      white-space: nowrap;
-      transition: all 0.15s;
-    }
-    .btn-edit {
-      background: #eff6ff;
-      color: #1d4ed8;
-      border: 1px solid #bfdbfe;
-    }
-    .btn-edit:hover {
-      background: #2563eb;
-      color: #ffffff;
-      border-color: #2563eb;
-    }
-    .btn-start {
-      background: #dcfce7;
-      color: #166534;
-      border: 1px solid #bbf7d0;
-    }
-    .btn-start:hover {
-      background: #16a34a;
-      color: #ffffff;
-      border-color: #16a34a;
-    }
-    .btn-active-channel {
-      background: #2563eb;
-      color: #ffffff;
-      border: 1px solid #2563eb;
-      cursor: default;
-    }
-    .btn-stop {
-      background: #fef3c7;
-      color: #92400e;
-      border: 1px solid #fde68a;
-    }
-    .btn-stop:hover {
-      background: #d97706;
-      color: #ffffff;
-      border-color: #d97706;
-    }
-    .btn-del {
-      background: #fee2e2;
-      color: #991b1b;
-      border: 1px solid #fecaca;
-    }
-    .btn-del:hover {
-      background: #dc2626;
-      color: #ffffff;
-      border-color: #dc2626;
-    }
-
-    .channel-item {
-      background: #f8fafc;
-      border: 1px solid #e2e8f0;
-      padding: 12px;
-      border-radius: 10px;
-      margin-bottom: 10px;
-      transition: all 0.15s;
-    }
-    .channel-item:last-child {
-      margin-bottom: 0;
-    }
-    .channel-item.active {
-      background: #eff6ff;
-      border-color: #93c5fd;
-    }
-    .channel-meta {
-      font-size: 12px;
-      color: #64748b;
-      font-family: monospace;
-      word-break: break-all;
-      display: flex;
-      flex-wrap: wrap;
-      gap: 12px;
-      margin-top: 4px;
-    }
-
-    .server-item {
-      background: #f8fafc;
-      border: 1px solid #e2e8f0;
-      padding: 12px;
-      border-radius: 10px;
-      margin-bottom: 10px;
-    }
-    .server-item:last-child {
-      margin-bottom: 0;
-    }
-    .server-item.disabled {
-      opacity: 0.7;
-      background: #f1f5f9;
-    }
-    .server-item-head {
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 6px;
-      gap: 8px;
-    }
-    .server-item-title {
-      font-size: 14px;
-      font-weight: 600;
-      color: #0f172a;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      min-width: 0;
-    }
-    .server-name-text {
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .server-item-url {
-      font-size: 12px;
-      color: #64748b;
-      margin-bottom: 6px;
-      font-family: monospace;
-      word-break: break-all;
-    }
-    .tool-toggle-bar {
-      font-size: 12px;
-      color: #475569;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      margin-top: 4px;
-    }
-    .tool-toggle-btn {
-      background: none;
-      border: none;
-      color: #2563eb;
-      font-size: 12px;
-      cursor: pointer;
-      padding: 0;
-      font-weight: 500;
-      white-space: nowrap;
-    }
-    .tool-toggle-btn:hover {
-      text-decoration: underline;
-    }
-    .tools-container {
-      margin-top: 8px;
-      padding-top: 8px;
-      border-top: 1px dashed #cbd5e1;
-      display: none;
-    }
-    .tool-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 6px 8px;
-      background: #ffffff;
-      border: 1px solid #e2e8f0;
-      border-radius: 6px;
-      margin-bottom: 5px;
-      font-size: 12px;
-      gap: 8px;
-    }
-    .tool-row.disabled {
-      opacity: 0.6;
-      background: #f8fafc;
-    }
-    .tool-left {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      min-width: 0;
-      flex: 1;
-    }
-    .tool-checkbox {
-      width: 15px;
-      height: 15px;
-      cursor: pointer;
-      accent-color: #2563eb;
-      flex-shrink: 0;
-    }
-    .tool-name {
-      font-family: monospace;
-      font-weight: 500;
-      color: #0f172a;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .model-tag {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      background: #dcfce7;
-      color: #166534;
-      border: 1px solid #bbf7d0;
-      font-size: 12px;
-      font-family: monospace;
-      padding: 3px 8px;
-      border-radius: 6px;
-      margin: 3px 4px 3px 0;
-    }
-    .model-tag-del {
-      cursor: pointer;
-      font-weight: 700;
-      color: #16a34a;
-      border: none;
-      background: none;
-      padding: 0;
-      line-height: 1;
-    }
-    .model-tag-del:hover {
-      color: #dc2626;
-    }
-    .candidate-tag {
-      display: inline-block;
-      background: #f1f5f9;
-      color: #475569;
-      border: 1px solid #cbd5e1;
-      font-size: 12px;
-      font-family: monospace;
-      padding: 3px 6px;
-      border-radius: 5px;
-      margin: 2px 3px;
-      cursor: pointer;
-      user-select: none;
-      transition: all 0.15s;
-    }
-    .candidate-tag:hover {
-      background: #dcfce7;
-      color: #166534;
-      border-color: #86efac;
-    }
-    #conn-msg, #enable-msg, #log-msg, #channel-msg {
-      margin-left: 10px;
-      font-size: 12px;
-      font-weight: 500;
-    }
-    .empty-state {
-      text-align: center;
-      padding: 24px 10px;
-      color: #94a3b8;
-      font-size: 13px;
-    }
-
-    .log-panel-container {
-      background: #0f172a;
-      border: 1px solid #334155;
-      border-radius: 8px;
-      padding: 10px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-      font-size: 11px;
-      color: #f1f5f9;
-      max-height: 480px;
-      overflow-y: auto;
-    }
-    .log-item {
-      border-bottom: 1px solid #1e293b;
-      padding: 7px 0;
-    }
-    .log-item:last-child {
-      border-bottom: none;
-    }
-    .log-header {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      gap: 6px;
-      cursor: pointer;
-      user-select: none;
-    }
-    .log-header:hover {
-      color: #38bdf8;
-    }
-    .log-time {
-      color: #64748b;
-      font-size: 10px;
-      white-space: nowrap;
-    }
-    .log-type-tag {
-      padding: 1px 5px;
-      border-radius: 3px;
-      font-size: 10px;
-      font-weight: 600;
-      white-space: nowrap;
-    }
-    .tag-conv { background: #2563eb; color: #ffffff; }
-    .tag-downstream { background: #0284c7; color: #ffffff; }
-    .tag-upstream { background: #d97706; color: #ffffff; }
-    .tag-agent { background: #7c3aed; color: #ffffff; }
-    .tag-tool { background: #059669; color: #ffffff; }
-    .tag-mcp { background: #0d9488; color: #ffffff; }
-    .tag-error { background: #dc2626; color: #ffffff; }
-
-    .log-tabs {
-      display: flex;
-      gap: 8px;
-      margin-bottom: 10px;
-      border-bottom: 1px solid #e2e8f0;
-      padding-bottom: 10px;
-    }
-    .log-tab-btn {
-      flex: 1;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      gap: 6px;
-      padding: 8px 10px;
-      border-radius: 8px;
-      font-size: 13px;
-      font-weight: 600;
-      cursor: pointer;
-      border: 1px solid #cbd5e1;
-      background: #f8fafc;
-      color: #475569;
-      white-space: nowrap;
-      transition: all 0.15s;
-    }
-    .log-tab-btn:hover {
-      background: #f1f5f9;
-      color: #0f172a;
-    }
-    .log-tab-btn.active {
-      background: #2563eb;
-      color: #ffffff;
-      border-color: #2563eb;
-    }
-    .log-tab-count {
-      font-size: 11px;
-      padding: 1px 6px;
-      border-radius: 999px;
-      background: rgba(15, 23, 42, 0.12);
-      color: inherit;
-    }
-    .log-tab-btn.active .log-tab-count {
-      background: rgba(255, 255, 255, 0.22);
-      color: #ffffff;
-    }
-    .log-summary {
-      flex: 1 1 160px;
-      min-width: 0;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      font-weight: 500;
-    }
-    .log-expand-icon {
-      color: #64748b;
-      font-size: 10px;
-      width: 12px;
-    }
-    .log-body {
-      display: none;
-      background: #020617;
-      border: 1px solid #1e293b;
-      border-radius: 6px;
-      padding: 8px 10px;
-      margin-top: 6px;
-      white-space: pre-wrap;
-      word-break: break-all;
-      color: #cbd5e1;
-      max-height: 280px;
-      overflow-y: auto;
-      font-size: 11px;
-    }
-
-    .modal-overlay {
-      display: none;
-      position: fixed;
-      top: 0;
-      left: 0;
-      right: 0;
-      bottom: 0;
-      background: rgba(15, 23, 42, 0.5);
-      backdrop-filter: blur(2px);
-      z-index: 1000;
-      align-items: center;
-      justify-content: center;
-      padding: 16px;
-    }
-    .modal-overlay.open {
-      display: flex;
-    }
-    .modal-box {
-      background: #ffffff;
-      border: 1px solid #e2e8f0;
-      border-radius: 12px;
-      padding: 24px 20px;
-      width: 100%;
-      max-width: 440px;
-      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.05);
-    }
-    .modal-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 16px;
-    }
-    .modal-header h3 {
-      font-size: 16px;
-      font-weight: 700;
-      color: #0f172a;
-    }
-    .modal-close {
-      border: none;
-      background: none;
-      font-size: 22px;
-      color: #94a3b8;
-      cursor: pointer;
-      padding: 0 4px;
-      line-height: 1;
-    }
-    .modal-close:hover {
-      color: #0f172a;
-    }
-
-    @media (max-width: 640px) {
-      body { padding: 10px 8px; }
-      .card { padding: 14px 12px; }
-      .card-title { margin-bottom: 10px; }
-      .action-group { width: 100%; justify-content: flex-start; }
-      .action-group .btn-action { flex: 1 1 calc(25% - 6px); text-align: center; padding: 6px 4px; }
-    }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 24px 14px; background: #f1f5f9; color: #0f172a; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.5; }
+    main { max-width: 850px; margin: 0 auto; }
+    header { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 18px; }
+    h1 { margin: 0; font-size: 22px; }
+    h2 { margin: 0 0 12px; font-size: 16px; }
+    p { color: #64748b; font-size: 13px; }
+    .card { padding: 18px; margin-bottom: 14px; background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; box-shadow: 0 1px 3px #0f172a0a; }
+    .field { margin-bottom: 12px; }
+    label { display: block; margin-bottom: 5px; color: #475569; font-size: 13px; font-weight: 600; }
+    input { width: 100%; padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 8px; font: inherit; }
+    input:focus { outline: 2px solid #bfdbfe; border-color: #2563eb; }
+    button { padding: 8px 12px; border: 0; border-radius: 7px; background: #2563eb; color: white; font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
+    button:hover { background: #1d4ed8; }
+    button:disabled { opacity: .55; cursor: wait; }
+    button.secondary { background: #e2e8f0; color: #334155; }
+    button.danger { background: #fee2e2; color: #991b1b; }
+    button.neutral { background: #fef3c7; color: #92400e; }
+    .row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+    .endpoint { overflow-wrap: anywhere; padding: 10px 12px; border: 1px solid #e2e8f0; border-radius: 8px; background: #f8fafc; font-family: ui-monospace, monospace; user-select: all; }
+    .hint { margin: 7px 0 0; }
+    .server { margin-top: 10px; padding: 13px; border: 1px solid #e2e8f0; border-radius: 10px; background: #f8fafc; }
+    .server-head { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+    .server-name { font-weight: 700; overflow-wrap: anywhere; }
+    .server-url { margin-top: 4px; color: #64748b; font: 12px ui-monospace, monospace; overflow-wrap: anywhere; }
+    .tools { margin-top: 10px; padding-top: 8px; border-top: 1px dashed #cbd5e1; }
+    .tool { display: flex; align-items: center; gap: 8px; padding: 5px 0; font: 12px ui-monospace, monospace; overflow-wrap: anywhere; }
+    .tool input { width: 16px; height: 16px; }
+    .badge { padding: 2px 8px; border-radius: 999px; background: #dcfce7; color: #166534; font-size: 11px; }
+    .badge.off { background: #e2e8f0; color: #475569; }
+    #logs { max-height: 440px; overflow: auto; padding: 10px; border-radius: 8px; background: #0f172a; color: #e2e8f0; font: 12px ui-monospace, monospace; }
+    .log { padding: 7px 0; border-bottom: 1px solid #334155; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .empty { padding: 20px 8px; text-align: center; color: #94a3b8; font-size: 13px; }
+    #message { min-height: 20px; margin-top: 8px; font-size: 13px; }
+    @media (max-width: 520px) { body { padding: 14px 9px; } .card { padding: 14px; } header { align-items: flex-start; } }
   </style>
 </head>
 <body>
-  <div class="container">
-    <div class="header">
+  <main>
+    <header>
       <div>
-        <h1>MCP 代理控制台</h1>
-        <p>多渠道自由切换与 MCP 工具精准调度</p>
+        <h1>MCP-AI 反向代理</h1>
+        <p>聚合并转发已挂载 MCP 服务的原生工具，不需要配置 AI 模型或 AI 上游接口。</p>
       </div>
-      <button class="btn-logout" onclick="handleLogout()">退出登录</button>
-    </div>
+      <button class="secondary" id="logout">退出登录</button>
+    </header>
 
-    <div class="card">
-      <div class="card-title">
-        <div class="card-title-left">
-          <span>上游渠道切换</span>
-          <span id="active-channel-badge" class="badge badge-blue">加载中</span>
-        </div>
-        <div class="action-group">
-          <button class="btn-action btn-start" onclick="handleOpenAddChannel()">+ 添加渠道</button>
-        </div>
+    <section class="card">
+      <h2>客户端接入</h2>
+      <div class="field">
+        <label for="endpoint">MCP 接入地址</label>
+        <div class="row"><div id="endpoint" class="endpoint"></div><button id="copy-endpoint" class="secondary">复制</button></div>
+        <p class="hint">将地址添加到支持 Streamable HTTP 的 MCP 客户端。若部署时设置了 PROXY_API_KEY，请在客户端配置 Authorization: Bearer &lt;密钥&gt; 请求头。也可以在地址后添加 /服务名称，仅接入指定服务。</p>
       </div>
-      <p style="font-size: 12px; color: #64748b; margin-bottom: 12px;">
-        支持在此直接添加、编辑和删除上游渠道（自动同步至数据库持久化保存），亦支持通过环境变量 UPSTREAM_1 等配置。点击切换按钮随时切换当前生效渠道。
-      </p>
-      <div id="channel-list">
-        <div class="empty-state">正在加载上游渠道...</div>
-      </div>
-      <span id="channel-msg"></span>
-    </div>
+    </section>
 
-    <div class="card">
-      <div class="card-title">
-        <div class="card-title-left">
-          <span>客户端连接配置</span>
-        </div>
-      </div>
-      <div class="group">
-        <label>API 基础地址 (Chat 客户端接入)</label>
-        <div class="box" id="proxy-url"></div>
-      </div>
-      <div class="group">
-        <label>第三方 MCP 服务接入地址 (默认 100% 原生工具名，支持按服务名或挂载全部)</label>
-        <div class="box" id="mcp-endpoint-url"></div>
-        <p style="font-size: 12px; color: #64748b; margin-top: 4px;">
-          在手机客户端、Cursor、Claude Desktop 等第三方平台填入此 URL 即可原生挂载全部工具；亦可追加服务名后缀（如 <code>/mcp/github</code> 或 <code>/mcp/cloudflare</code>）按需接入。第三方调用过程会实时输出至控制台，并可在下方日志面板切换至「第三方 MCP 调用」独立查看。
-        </p>
-      </div>
-      <div class="group">
-        <label>支持模型</label>
-        <div class="box">跟随当前所选上游渠道支持的模型，例如 gpt-4o、claude-3-5-sonnet、gemini-2.5-flash</div>
-      </div>
-    </div>
+    <section class="card">
+      <h2>挂载远程 MCP 服务</h2>
+      <form id="connect-form">
+        <div class="field"><label for="mcp-name">服务名称</label><input id="mcp-name" value="GitHub" required></div>
+        <div class="field"><label for="mcp-url">MCP 服务地址</label><input id="mcp-url" placeholder="https://example.com/mcp" required></div>
+        <div class="field"><label for="mcp-token">上游 MCP 认证令牌（可选）</label><input id="mcp-token" type="password" autocomplete="off" placeholder="Bearer token"></div>
+        <button id="connect-button" type="submit">连接并挂载</button>
+        <div id="message" role="status"></div>
+      </form>
+    </section>
 
-    <div class="card">
-      <div class="card-title">
-        <div class="card-title-left">
-          <span>全链路调试抓包日志</span>
-          <span id="log-status-badge" class="badge badge-green">抓取中</span>
-        </div>
-        <div class="action-group">
-          <button id="btn-toggle-log" class="btn-action btn-stop" onclick="toggleLogging()">关闭日志</button>
-          <button class="btn-action btn-start" onclick="copyAllLogs()">复制日志</button>
-          <button class="btn-action btn-del" onclick="clearAllLogs()">清空日志</button>
-          <button class="btn-action btn-start" onclick="loadLogs()">刷新</button>
-        </div>
-      </div>
-      <div class="log-tabs">
-        <button id="tab-log-chat" class="log-tab-btn active" onclick="switchLogCategory('chat')">
-          <span>对话代理日志</span>
-          <span id="count-log-chat" class="log-tab-count">0</span>
-        </button>
-        <button id="tab-log-mcp" class="log-tab-btn" onclick="switchLogCategory('mcp')">
-          <span>第三方MCP调用</span>
-          <span id="count-log-mcp" class="log-tab-count">0</span>
-        </button>
-      </div>
-      <p id="log-desc-text" style="font-size: 12px; color: #64748b; margin-bottom: 10px;">
-        当前展示「对话代理日志」：记录通过 /v1 或 Gemini 接口发起的最新一次完整对话（涵盖 Agent 轮次、工具调用、深度思考及最终响应）。
-      </p>
-      <div id="log-panel" class="log-panel-container">
-        <div class="empty-state" style="color: #64748b;">暂无抓包记录。在客户端发起对话即可在此实时查看本次完整对话。</div>
-      </div>
-      <span id="log-msg"></span>
-    </div>
+    <section class="card">
+      <div class="row" style="justify-content:space-between"><h2>已挂载服务</h2><button id="refresh-servers" class="secondary">刷新</button></div>
+      <div id="servers"><div class="empty">正在加载 MCP 服务...</div></div>
+    </section>
 
-    <div class="card">
-      <div class="card-title">
-        <div class="card-title-left">
-          <span>启用 MCP 的模型设置</span>
-        </div>
+    <section class="card">
+      <div class="row" style="justify-content:space-between; margin-bottom:10px">
+        <h2 style="margin:0">MCP 调用日志</h2>
+        <div class="row"><span id="log-status" class="badge">日志开启</span><button id="toggle-logs" class="neutral">关闭日志</button><button id="copy-logs" class="secondary">复制</button><button id="clear-logs" class="danger">清空</button><button id="refresh-logs" class="secondary">刷新</button></div>
       </div>
-      <p style="font-size: 12px; color: #64748b; margin-bottom: 12px;">
-        只有加入此列表的模型才会挂载 MCP 工具。未在此列表中的其他所有模型将完全纯净直通当前上游渠道。
-      </p>
-
-      <div class="group">
-        <label>当前支持 MCP 的模型列表：</label>
-        <div id="enabled-tags" style="min-height: 34px; padding: 4px 0;">
-          <span style="font-size: 12px; color: #94a3b8;">暂未启用任何模型，所有请求默认直通上游网关。</span>
-        </div>
-      </div>
-
-      <div class="group" style="display: flex; gap: 8px; margin-top: 8px;">
-        <input id="custom-model-input" placeholder="输入模型名称后回车添加" onkeydown="if(event.key==='Enter')addCustomModel()">
-        <button class="btn btn-secondary" onclick="addCustomModel()">添加</button>
-      </div>
-
-      <div class="group" style="margin-top: 12px;">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-          <label style="margin: 0;">从当前上游渠道所有模型中选择：</label>
-          <button class="btn-action btn-start" onclick="fetchUpstreamModels()">刷新上游模型</button>
-        </div>
-        <div id="upstream-candidates" style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px; max-height: 120px; overflow-y: auto;">
-          <span style="font-size: 12px; color: #94a3b8;">点击上方刷新上游模型按钮获取可用模型</span>
-        </div>
-      </div>
-
-      <div style="display: flex; align-items: center; margin-top: 14px;">
-        <button class="btn" onclick="saveEnabledModels()">保存启用配置</button>
-        <span id="enable-msg"></span>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="card-title">
-        <div class="card-title-left">
-          <span>手动挂载 MCP 服务</span>
-        </div>
-      </div>
-      <div class="group">
-        <label>服务前缀名称</label>
-        <input id="mcp-name" value="Github" placeholder="输入唯一标识名称">
-      </div>
-      <div class="group">
-        <label>MCP 服务地址</label>
-        <input id="mcp-url" value="https://api.githubcopilot.com/mcp/" placeholder="https://...">
-      </div>
-      <div class="group">
-        <label>认证令牌</label>
-        <input id="mcp-token" type="password" placeholder="粘贴令牌">
-      </div>
-      <div style="display: flex; align-items: center; margin-top: 14px;">
-        <button id="btn-conn" class="btn" onclick="handleConnect()">添加服务</button>
-        <span id="conn-msg"></span>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="card-title">
-        <div class="card-title-left">
-          <span>已挂载 MCP 服务列表</span>
-        </div>
-      </div>
-      <div id="mcp-list">
-        <div class="empty-state">正在加载服务列表...</div>
-      </div>
-    </div>
-  </div>
-
-  <div id="channel-modal" class="modal-overlay" onclick="if(event.target===this)closeChannelModal()">
-    <div class="modal-box">
-      <div class="modal-header">
-        <h3 id="channel-modal-title">添加上游渠道</h3>
-        <button class="modal-close" onclick="closeChannelModal()">×</button>
-      </div>
-      <input type="hidden" id="channel-modal-id">
-      <div class="group">
-        <label>渠道名称</label>
-        <input id="channel-modal-name" placeholder="例如：第1组 或 DeepSeek官方">
-      </div>
-      <div class="group">
-        <label>API 基础地址 (Base URL)</label>
-        <input id="channel-modal-url" placeholder="例如：https://api.openai.com 或 https://api.deepseek.com">
-      </div>
-      <div class="group">
-        <label>API 密钥 (API Key)</label>
-        <input id="channel-modal-key" type="password" placeholder="sk-...">
-      </div>
-      <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; align-items: center;">
-        <span id="channel-modal-msg" style="margin-right: auto; font-size: 12px; font-weight: 500;"></span>
-        <button class="btn btn-secondary" onclick="closeChannelModal()">取消</button>
-        <button id="btn-save-channel" class="btn" onclick="handleSaveChannel()">保存并应用</button>
-      </div>
-    </div>
-  </div>
-
-  <div id="edit-modal" class="modal-overlay" onclick="if(event.target===this)closeEditModal()">
-    <div class="modal-box">
-      <div class="modal-header">
-        <h3>编辑 MCP 服务配置</h3>
-        <button class="modal-close" onclick="closeEditModal()">×</button>
-      </div>
-      <input type="hidden" id="edit-mcp-id">
-      <div class="group">
-        <label>服务前缀名称</label>
-        <input id="edit-mcp-name" placeholder="服务前缀名称">
-      </div>
-      <div class="group">
-        <label>MCP 服务地址</label>
-        <input id="edit-mcp-url" placeholder="https://...">
-      </div>
-      <div class="group">
-        <label>认证令牌 (Token)</label>
-        <input id="edit-mcp-token" type="password" placeholder="留空则保持现有令牌不变">
-      </div>
-      <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; align-items: center;">
-        <span id="edit-msg" style="margin-right: auto; font-size: 12px; font-weight: 500;"></span>
-        <button class="btn btn-secondary" onclick="closeEditModal()">取消</button>
-        <button id="btn-save-edit" class="btn" onclick="handleSaveEdit()">保存并重新连接</button>
-      </div>
-    </div>
-  </div>
-
+      <div id="logs"><div class="empty">暂无 MCP 调用记录</div></div>
+    </section>
+  </main>
   <script>
-    document.getElementById("proxy-url").innerText = window.location.origin + "/v1";
-    document.getElementById("mcp-endpoint-url").innerText = window.location.origin + "/mcp";
+    const endpointEl = document.getElementById("endpoint");
+    const serversEl = document.getElementById("servers");
+    const logsEl = document.getElementById("logs");
+    const messageEl = document.getElementById("message");
+    const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#039;" })[char]);
 
-    let currentEnabledList = [];
-    let isLoggingActive = true;
-    let currentLogCategory = "chat";
-    let cachedChatLogs = [];
-    let cachedMcpLogs = [];
-    let expandedLogIds = new Set();
-    let cachedServers = [];
-    let cachedChannels = [];
+    endpointEl.textContent = `${window.location.origin}/mcp`;
 
-    async function handleLogout() {
-      await fetch("/api/panel/logout", { method: "POST" });
-      location.reload();
-    }
-
-    async function loadChannels() {
-      const container = document.getElementById("channel-list");
-      const badge = document.getElementById("active-channel-badge");
-      try {
-        const res = await fetch("/api/upstream/channels");
-        if (!res.ok) throw new Error("获取渠道失败");
-        const data = await res.json();
-        const channels = data.channels || [];
-        cachedChannels = channels;
-
-        if (channels.length === 0) {
-          badge.className = "badge badge-red";
-          badge.innerText = "未配置";
-          container.innerHTML = '<div class="empty-state">尚未配置任何上游渠道。请点击右上角“+ 添加渠道”或在环境变量中配置 UPSTREAM_1。</div>';
-          return;
-        }
-
-        const activeItem = channels.find(c => c.active) || channels[0];
-        badge.className = "badge badge-green";
-        badge.innerText = activeItem.name;
-
-        container.innerHTML = channels.map(c => {
-          const statusBadge = c.active
-            ? '<span class="badge badge-green">当前使用</span>'
-            : '';
-
-          const switchBtn = c.active
-            ? '<button class="btn-action btn-active-channel" disabled>当前使用</button>'
-            : `<button class="btn-action btn-start" onclick="switchChannel('${c.id}')">切换至此</button>`;
-
-          const deleteBtn = `<button class="btn-action btn-del" onclick="handleDeleteChannel('${c.id}', '${escapeHtml(c.name)}')">删除</button>`;
-
-          return `
-            <div class="channel-item ${c.active ? 'active' : ''}">
-              <div class="server-item-head">
-                <div class="server-item-title">
-                  <span class="server-name-text">${escapeHtml(c.name)}</span>
-                  <span class="badge badge-blue">${escapeHtml(c.envKey || '自定义')}</span>
-                  ${statusBadge}
-                </div>
-                <div class="action-group">
-                  <button class="btn-action btn-edit" onclick="handleOpenEditChannel('${c.id}')">编辑</button>
-                  ${switchBtn}
-                  ${deleteBtn}
-                </div>
-              </div>
-              <div class="channel-meta">
-                <span>地址: ${escapeHtml(c.baseUrl)}</span>
-                <span>密钥: ${escapeHtml(c.maskedKey)}</span>
-              </div>
-            </div>
-          `;
-        }).join("");
-      } catch (e) {
-        badge.className = "badge badge-red";
-        badge.innerText = "异常";
-        container.innerHTML = `<div class="empty-state" style="color: #ef4444;">加载失败: ${escapeHtml(e.message)}</div>`;
-      }
-    }
-
-    async function switchChannel(id) {
-      const msg = document.getElementById("channel-msg");
-      try {
-        const res = await fetch("/api/upstream/channels/switch", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ id })
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || "切换失败");
-        msg.innerText = `已切换至 ${data.name}`;
-        msg.style.color = "#16a34a";
-        setTimeout(() => { msg.innerText = ""; }, 3000);
-        await loadChannels();
-        await loadLogs();
-      } catch (e) {
-        msg.innerText = e.message;
-        msg.style.color = "#dc2626";
-      }
-    }
-
-    function handleOpenAddChannel() {
-      document.getElementById("channel-modal-title").innerText = "添加上游渠道";
-      document.getElementById("channel-modal-id").value = "";
-      document.getElementById("channel-modal-name").value = "";
-      document.getElementById("channel-modal-url").value = "";
-      document.getElementById("channel-modal-key").value = "";
-      document.getElementById("channel-modal-key").placeholder = "粘贴 API 密钥 (sk-...)";
-      document.getElementById("channel-modal-msg").innerText = "";
-      document.getElementById("channel-modal").classList.add("open");
-    }
-
-    function handleOpenEditChannel(id) {
-      const c = cachedChannels.find(item => item.id === id);
-      if (!c) return;
-      document.getElementById("channel-modal-title").innerText = "编辑上游渠道";
-      document.getElementById("channel-modal-id").value = c.id;
-      document.getElementById("channel-modal-name").value = c.name || "";
-      document.getElementById("channel-modal-url").value = c.baseUrl || "";
-      document.getElementById("channel-modal-key").value = "";
-      document.getElementById("channel-modal-key").placeholder = "留空则保持现有密钥不变";
-      document.getElementById("channel-modal-msg").innerText = "";
-      document.getElementById("channel-modal").classList.add("open");
-    }
-
-    function closeChannelModal() {
-      document.getElementById("channel-modal").classList.remove("open");
-    }
-
-    async function handleSaveChannel() {
-      const id = document.getElementById("channel-modal-id").value.trim();
-      const name = document.getElementById("channel-modal-name").value.trim();
-      const baseUrl = document.getElementById("channel-modal-url").value.trim();
-      const apiKey = document.getElementById("channel-modal-key").value.trim();
-      const msg = document.getElementById("channel-modal-msg");
-      const btn = document.getElementById("btn-save-channel");
-
-      if (!name || !baseUrl) {
-        msg.innerText = "渠道名称与 API 链接不能为空";
-        msg.style.color = "#dc2626";
-        return;
-      }
-      if (!id && !apiKey) {
-        msg.innerText = "新添加渠道必须提供 API 密钥";
-        msg.style.color = "#dc2626";
-        return;
-      }
-
-      msg.innerText = "正在保存到数据库...";
-      msg.style.color = "#2563eb";
-      btn.disabled = true;
-
-      try {
-        const url = id ? "/api/upstream/channels/update" : "/api/upstream/channels/add";
-        const res = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ id, name, baseUrl, apiKey })
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || "保存失败");
-        msg.innerText = "保存成功";
-        msg.style.color = "#16a34a";
-        setTimeout(() => {
-          closeChannelModal();
-          loadChannels();
-        }, 500);
-      } catch (e) {
-        msg.innerText = e.message;
-        msg.style.color = "#dc2626";
-      } finally {
-        btn.disabled = false;
-      }
-    }
-
-    async function handleDeleteChannel(id, name) {
-      if (!confirm(`确认删除上游渠道 [${name}]？`)) return;
-      try {
-        const res = await fetch(`/api/upstream/channels/${encodeURIComponent(id)}`, { method: "DELETE" });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || "删除失败");
-        loadChannels();
-      } catch (e) {
-        alert(e.message);
-      }
-    }
-
-    function renderEnabledTags() {
-      const container = document.getElementById("enabled-tags");
-      if (!currentEnabledList || currentEnabledList.length === 0) {
-        container.innerHTML = '<span style="font-size: 12px; color: #94a3b8;">暂未启用任何模型，所有请求默认直通上游网关。</span>';
-        return;
-      }
-      container.innerHTML = currentEnabledList.map((m, idx) => `
-        <span class="model-tag">
-          <span>✓ ${m}</span>
-          <button class="model-tag-del" onclick="removeEnabledModel(${idx})">×</button>
-        </span>
-      `).join("");
-    }
-
-    function addCustomModel() {
-      const input = document.getElementById("custom-model-input");
-      const val = input.value.trim();
-      if (!val) return;
-      if (!currentEnabledList.includes(val)) {
-        currentEnabledList.push(val);
-        renderEnabledTags();
-      }
-      input.value = "";
-    }
-
-    function removeEnabledModel(idx) {
-      currentEnabledList.splice(idx, 1);
-      renderEnabledTags();
-    }
-
-    async function loadEnabledSettings() {
-      try {
-        const res = await fetch("/api/settings/enabled-models");
-        if (res.ok) {
-          const data = await res.json();
-          currentEnabledList = data.enabledModels || [];
-          renderEnabledTags();
-        }
-      } catch {}
-    }
-
-    async function saveEnabledModels() {
-      const msg = document.getElementById("enable-msg");
-      msg.innerText = "正在保存...";
-      msg.style.color = "#2563eb";
-      try {
-        const res = await fetch("/api/settings/enabled-models", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ models: currentEnabledList })
-        });
-        if (res.ok) {
-          msg.innerText = "配置保存成功";
-          msg.style.color = "#16a34a";
-        } else {
-          throw new Error("保存失败");
-        }
-      } catch (e) {
-        msg.innerText = e.message;
-        msg.style.color = "#dc2626";
-      }
-    }
-
-    async function fetchUpstreamModels() {
-      const container = document.getElementById("upstream-candidates");
-      container.innerHTML = '<span style="font-size: 12px; color: #64748b;">正在拉取当前渠道所有模型...</span>';
-      try {
-        const res = await fetch("/api/upstream/models");
-        const data = await res.json();
-        const list = data.models || [];
-        if (list.length === 0) {
-          container.innerHTML = '<span style="font-size: 12px; color: #94a3b8;">未获取到模型，请检查当前上游渠道配置或切换到其他渠道。</span>';
-          return;
-        }
-        container.innerHTML = list.map(m => `
-          <span class="candidate-tag" onclick="selectCandidate('${m}')">+ ${m}</span>
-        `).join("");
-      } catch (e) {
-        container.innerHTML = `<span style="font-size: 12px; color: #dc2626;">拉取失败: ${e.message}</span>`;
-      }
-    }
-
-    function selectCandidate(name) {
-      if (!currentEnabledList.includes(name)) {
-        currentEnabledList.push(name);
-        renderEnabledTags();
-      }
-    }
-
-    function toggleTools(id) {
-      const el = document.getElementById("tools-" + id);
-      const btn = document.getElementById("toggle-btn-" + id);
-      if (!el || !btn) return;
-      if (el.style.display === "block") {
-        el.style.display = "none";
-        btn.innerText = "展开查看";
-      } else {
-        el.style.display = "block";
-        btn.innerText = "点击收起";
-      }
-    }
-
-    function toggleLogDetail(id) {
-      const bodyEl = document.getElementById("log-detail-" + id);
-      const iconEl = document.getElementById("log-icon-" + id);
-      if (!bodyEl) return;
-      if (bodyEl.style.display === "block") {
-        bodyEl.style.display = "none";
-        expandedLogIds.delete(id);
-        if (iconEl) iconEl.innerText = "▶";
-      } else {
-        bodyEl.style.display = "block";
-        expandedLogIds.add(id);
-        if (iconEl) iconEl.innerText = "▼";
-      }
-    }
-
-    function getTagClass(type) {
-      if (type.startsWith("CONVERSATION")) return "tag-conv";
-      if (type.startsWith("MCP_")) return "tag-mcp";
-      if (type.startsWith("DOWNSTREAM")) return "tag-downstream";
-      if (type.startsWith("UPSTREAM")) return "tag-upstream";
-      if (type.startsWith("AGENT")) return "tag-agent";
-      if (type.startsWith("TOOL")) return "tag-tool";
-      if (type.startsWith("ERROR")) return "tag-error";
-      return "tag-downstream";
-    }
-
-    function switchLogCategory(cat) {
-      currentLogCategory = cat === "mcp" ? "mcp" : "chat";
-      const chatBtn = document.getElementById("tab-log-chat");
-      const mcpBtn = document.getElementById("tab-log-mcp");
-      const descEl = document.getElementById("log-desc-text");
-
-      if (currentLogCategory === "mcp") {
-        chatBtn.classList.remove("active");
-        mcpBtn.classList.add("active");
-        descEl.innerText = "当前展示「第三方 MCP 调用日志」：记录本项目作为原生 MCP 服务（/mcp）被外部客户端握手、拉取工具列表及调用执行工具的全链路日志。";
-      } else {
-        mcpBtn.classList.remove("active");
-        chatBtn.classList.add("active");
-        descEl.innerText = "当前展示「对话代理日志」：记录通过 /v1 或 Gemini 接口发起的最新一次完整对话（涵盖 Agent 轮次、工具调用、深度思考及最终响应）。";
-      }
-      renderCurrentCategoryLogs();
-    }
-
-    function getActiveLogsArray() {
-      return currentLogCategory === "mcp" ? cachedMcpLogs : cachedChatLogs;
-    }
-
-    function renderCurrentCategoryLogs() {
-      const chatCountEl = document.getElementById("count-log-chat");
-      const mcpCountEl = document.getElementById("count-log-mcp");
-      if (chatCountEl) chatCountEl.innerText = String(cachedChatLogs.length);
-      if (mcpCountEl) mcpCountEl.innerText = String(cachedMcpLogs.length);
-
-      const panel = document.getElementById("log-panel");
-      const activeLogs = getActiveLogsArray();
-
-      if (activeLogs.length === 0) {
-        const emptyHint = currentLogCategory === "mcp"
-          ? "暂无第三方 MCP 调用记录。在手机客户端、Cursor 等平台接入 /mcp 并调用工具后将在此实时显示。"
-          : "暂无对话代理抓包记录。在客户端发起对话即可在此实时查看本次完整对话。";
-        panel.innerHTML = `<div class="empty-state" style="color: #64748b;">${emptyHint}</div>`;
-        return;
-      }
-
-      const list = [...activeLogs].reverse();
-      panel.innerHTML = list.map(item => {
-        const isExpanded = expandedLogIds.has(item.id);
-        return `
-          <div class="log-item">
-            <div class="log-header" onclick="toggleLogDetail('${item.id}')">
-              <span class="log-expand-icon" id="log-icon-${item.id}">${isExpanded ? "▼" : "▶"}</span>
-              <span class="log-time">${item.time}</span>
-              <span class="log-type-tag ${getTagClass(item.type)}">${item.type}</span>
-              <span class="log-summary" title="${escapeHtml(item.summary)}">${escapeHtml(item.summary)}</span>
-            </div>
-            <div class="log-body" id="log-detail-${item.id}" style="display: ${isExpanded ? "block" : "none"};">${escapeHtml(item.detail)}</div>
-          </div>
-        `;
-      }).join("");
-    }
-
-    async function loadLogs() {
-      try {
-        const res = await fetch("/api/logs");
-        if (!res.ok) return;
-        const data = await res.json();
-        isLoggingActive = !!data.enabled;
-        cachedChatLogs = data.logs || [];
-        cachedMcpLogs = data.mcpLogs || [];
-
-        const badge = document.getElementById("log-status-badge");
-        const toggleBtn = document.getElementById("btn-toggle-log");
-        if (isLoggingActive) {
-          badge.className = "badge badge-green";
-          badge.innerText = "抓取中";
-          toggleBtn.className = "btn-action btn-stop";
-          toggleBtn.innerText = "关闭日志";
-        } else {
-          badge.className = "badge badge-gray";
-          badge.innerText = "已暂停";
-          toggleBtn.className = "btn-action btn-start";
-          toggleBtn.innerText = "开启日志";
-        }
-
-        renderCurrentCategoryLogs();
-      } catch {}
-    }
-
-    function escapeHtml(str) {
-      if (!str) return "";
-      return String(str)
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#039;");
-    }
-
-    async function toggleLogging() {
-      try {
-        const nextState = !isLoggingActive;
-        const res = await fetch("/api/logs/toggle", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ enabled: nextState })
-        });
-        if (res.ok) {
-          loadLogs();
-        }
-      } catch {}
-    }
-
-    async function clearAllLogs() {
-      const catLabel = currentLogCategory === "mcp" ? "第三方 MCP 调用" : "对话代理";
-      if (!confirm(`确认清空「${catLabel}」抓包日志？`)) return;
-      try {
-        const res = await fetch("/api/logs/clear", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ category: currentLogCategory })
-        });
-        if (res.ok) {
-          loadLogs();
-        }
-      } catch {}
-    }
-
-    function copyAllLogs() {
-      const activeLogs = getActiveLogsArray();
-      if (!activeLogs || activeLogs.length === 0) {
-        alert("当前分类暂无日志可复制");
-        return;
-      }
-      const text = activeLogs.map(l => `[${l.time}] [${l.type}] ${l.summary}\n${l.detail}\n----------------------------------------`).join("\n\n");
-      navigator.clipboard.writeText(text).then(() => {
-        const msg = document.getElementById("log-msg");
-        const catLabel = currentLogCategory === "mcp" ? "第三方 MCP 调用日志" : "对话代理日志";
-        msg.innerText = `已复制${catLabel}`;
-        msg.style.color = "#16a34a";
-        setTimeout(() => { msg.innerText = ""; }, 3000);
-      }).catch(() => {
-        alert("复制失败，请手动在控制台查看");
-      });
-    }
-
-    async function handleToggleTool(serverId, toolKey, isChecked) {
-      try {
-        await fetch(`/api/mcp/servers/${encodeURIComponent(serverId)}/tools/${encodeURIComponent(toolKey)}/toggle`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ enabled: isChecked })
-        });
-        loadServers();
-      } catch {}
-    }
-
-    function handleOpenEdit(id) {
-      const s = cachedServers.find(item => item.id === id);
-      if (!s) return;
-      document.getElementById("edit-mcp-id").value = s.id;
-      document.getElementById("edit-mcp-name").value = s.name || "";
-      document.getElementById("edit-mcp-url").value = s.url || "";
-      document.getElementById("edit-mcp-token").value = "";
-      const msg = document.getElementById("edit-msg");
-      msg.innerText = "";
-      document.getElementById("edit-modal").classList.add("open");
-    }
-
-    function closeEditModal() {
-      document.getElementById("edit-modal").classList.remove("open");
-    }
-
-    async function handleSaveEdit() {
-      const id = document.getElementById("edit-mcp-id").value;
-      const name = document.getElementById("edit-mcp-name").value.trim();
-      const url = document.getElementById("edit-mcp-url").value.trim();
-      const token = document.getElementById("edit-mcp-token").value.trim();
-      const msg = document.getElementById("edit-msg");
-      const saveBtn = document.getElementById("btn-save-edit");
-
-      if (!name || !url) {
-        msg.innerText = "名称与 URL 不能为空";
-        msg.style.color = "#dc2626";
-        return;
-      }
-
-      msg.innerText = "正在握手验证并同步工具...";
-      msg.style.color = "#2563eb";
-      saveBtn.disabled = true;
-
-      try {
-        const res = await fetch(`/api/mcp/servers/${encodeURIComponent(id)}/update`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name, url, token })
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || "更新失败");
-        msg.innerText = `更新成功，已载入 ${data.toolCount} 个工具`;
-        msg.style.color = "#16a34a";
-        setTimeout(() => {
-          closeEditModal();
-          loadServers();
-        }, 600);
-      } catch (err) {
-        msg.innerText = err.message;
-        msg.style.color = "#dc2626";
-      } finally {
-        saveBtn.disabled = false;
-      }
+    async function requestJson(url, options = {}) {
+      const response = await fetch(url, options);
+      let data = {};
+      try { data = await response.json(); } catch {}
+      if (response.status === 401 && url.startsWith("/api/")) location.reload();
+      if (!response.ok) throw new Error(data.error || `请求失败 (${response.status})`);
+      return data;
     }
 
     async function loadServers() {
       try {
-        const res = await fetch("/api/mcp/servers");
-        if (res.status === 401) {
-          location.reload();
+        const data = await requestJson("/api/mcp/servers");
+        const servers = data.servers || [];
+        if (!servers.length) {
+          serversEl.innerHTML = '<div class="empty">尚未挂载 MCP 服务。添加远程 MCP 服务后，其工具将通过上方地址提供。</div>';
           return;
         }
-        const data = await res.json();
-        cachedServers = data.servers || [];
-        const el = document.getElementById("mcp-list");
-        if (!cachedServers || cachedServers.length === 0) {
-          el.innerHTML = '<div class="empty-state">尚未挂载任何远程 MCP 服务。未启用的模型将直接透传上游联网搜索。</div>';
-          return;
-        }
-        let html = "";
-        for (let s of cachedServers) {
-          const isActive = s.status !== "disabled";
-          const statusBadge = isActive
-            ? '<span class="badge badge-green">运行中</span>'
-            : '<span class="badge badge-gray">已断开</span>';
-
-          const toggleActionBtn = isActive
-            ? `<button class="btn-action btn-stop" onclick="handleStop('${s.id}')">断开</button>`
-            : `<button class="btn-action btn-start" onclick="handleStart('${s.id}')">启动</button>`;
-
-          let toolsHtml = "";
-          for (let t of s.tools) {
-            const isToolEnabled = t.enabled !== false;
-            const displayToolName = t.rawName || t.key;
-            toolsHtml += `
-              <div class="tool-row ${isToolEnabled ? '' : 'disabled'}">
-                <div class="tool-left">
-                  <input type="checkbox" class="tool-checkbox" ${isToolEnabled ? 'checked' : ''} onchange="handleToggleTool('${s.id}', '${t.key}', this.checked)">
-                  <span class="tool-name" title="${displayToolName}">${displayToolName}</span>
+        serversEl.innerHTML = servers.map((server) => {
+          const active = server.status !== "disabled";
+          const tools = (server.tools || []).map((tool) => `
+            <label class="tool"><input type="checkbox" data-toggle-tool data-server-id="${escapeHtml(server.id)}" data-tool-key="${escapeHtml(tool.key)}" ${tool.enabled === false ? "" : "checked"}><span>${escapeHtml(tool.rawName || tool.key)}</span></label>
+          `).join("");
+          return `
+            <article class="server">
+              <div class="server-head">
+                <div class="row"><span class="server-name">${escapeHtml(server.name)}</span><span class="badge ${active ? "" : "off"}">${active ? "运行中" : "已断开"}</span></div>
+                <div class="row">
+                  <button class="secondary" data-action="edit" data-id="${escapeHtml(server.id)}">编辑</button>
+                  <button class="${active ? "neutral" : ""}" data-action="${active ? "stop" : "start"}" data-id="${escapeHtml(server.id)}">${active ? "断开" : "启动"}</button>
+                  <button class="danger" data-action="delete" data-id="${escapeHtml(server.id)}">删除</button>
                 </div>
               </div>
-            `;
-          }
-
-          const existingDisplay = document.getElementById("tools-" + s.id)?.style.display || "none";
-          const btnText = existingDisplay === "block" ? "点击收起" : "展开查看";
-
-          html += `
-            <div class="server-item ${isActive ? '' : 'disabled'}">
-              <div class="server-item-head">
-                <div class="server-item-title">
-                  <span class="server-name-text">${s.name}</span>
-                  ${statusBadge}
-                </div>
-                <div class="action-group">
-                  <button class="btn-action btn-edit" onclick="handleOpenEdit('${s.id}')">编辑</button>
-                  ${toggleActionBtn}
-                  <button class="btn-action btn-del" onclick="handleDelete('${s.id}')">删除</button>
-                </div>
-              </div>
-              <div class="server-item-url">${s.url}</div>
-              <div class="tool-toggle-bar">
-                <span>工具清单 ${s.toolCount}</span>
-                <button id="toggle-btn-${s.id}" class="tool-toggle-btn" onclick="toggleTools('${s.id}')">${btnText}</button>
-              </div>
-              <div id="tools-${s.id}" class="tools-container" style="display: ${existingDisplay};">
-                ${toolsHtml}
-              </div>
-            </div>
+              <div class="server-url">${escapeHtml(server.url)}</div>
+              <div class="tools"><div style="color:#64748b">工具 ${Number(server.toolCount) || 0} 个</div>${tools}</div>
+            </article>
           `;
-        }
-        el.innerHTML = html;
-      } catch (e) {
-        document.getElementById("mcp-list").innerHTML = '<div class="empty-state" style="color: #ef4444;">获取失败: ' + e.message + '</div>';
+        }).join("");
+      } catch (error) {
+        serversEl.innerHTML = `<div class="empty">加载失败：${escapeHtml(error.message)}</div>`;
       }
     }
 
-    async function handleConnect() {
-      const name = document.getElementById("mcp-name").value.trim();
-      const url = document.getElementById("mcp-url").value.trim();
-      const token = document.getElementById("mcp-token").value.trim();
-      const msg = document.getElementById("conn-msg");
-
-      if (!name || !url) {
-        msg.innerText = "名称与 URL 不能为空";
-        msg.style.color = "#dc2626";
-        return;
-      }
-
-      msg.innerText = "正在握手连接...";
-      msg.style.color = "#2563eb";
-
+    async function loadLogs() {
       try {
-        const res = await fetch("/api/mcp/connect", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name, url, token })
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || "连接失败");
-        msg.innerText = "成功载入 " + data.toolCount + " 个工具";
-        msg.style.color = "#16a34a";
-        document.getElementById("mcp-token").value = "";
-        loadServers();
-      } catch (err) {
-        msg.innerText = err.message;
-        msg.style.color = "#dc2626";
+        const data = await requestJson("/api/logs");
+        const entries = data.mcpLogs || [];
+        const status = document.getElementById("log-status");
+        const toggle = document.getElementById("toggle-logs");
+        status.textContent = data.enabled ? "日志开启" : "日志暂停";
+        status.className = `badge${data.enabled ? "" : " off"}`;
+        toggle.textContent = data.enabled ? "关闭日志" : "开启日志";
+        toggle.className = data.enabled ? "neutral" : "";
+        logsEl.innerHTML = entries.length ? [...entries].reverse().map((entry) => `<div class="log">[${escapeHtml(entry.time)}] [${escapeHtml(entry.type)}] ${escapeHtml(entry.summary)}${entry.detail ? `\n${escapeHtml(entry.detail)}` : ""}</div>`).join("") : '<div class="empty">暂无 MCP 调用记录</div>';
+      } catch (error) {
+        logsEl.innerHTML = `<div class="empty">加载失败：${escapeHtml(error.message)}</div>`;
       }
     }
 
-    async function handleStart(id) {
-      await fetch('/api/mcp/servers/' + id + '/start', { method: "POST" });
-      loadServers();
-    }
+    document.getElementById("connect-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const button = document.getElementById("connect-button");
+      const payload = {
+        name: document.getElementById("mcp-name").value.trim(),
+        url: document.getElementById("mcp-url").value.trim(),
+        token: document.getElementById("mcp-token").value.trim()
+      };
+      button.disabled = true;
+      messageEl.textContent = "正在连接并读取工具列表...";
+      messageEl.style.color = "#2563eb";
+      try {
+        const data = await requestJson("/api/mcp/connect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+        messageEl.textContent = `已挂载，读取到 ${data.toolCount} 个工具。`;
+        messageEl.style.color = "#15803d";
+        document.getElementById("mcp-token").value = "";
+        await loadServers();
+      } catch (error) {
+        messageEl.textContent = error.message;
+        messageEl.style.color = "#dc2626";
+      } finally {
+        button.disabled = false;
+      }
+    });
 
-    async function handleStop(id) {
-      await fetch('/api/mcp/servers/' + id + '/stop', { method: "POST" });
-      loadServers();
-    }
+    serversEl.addEventListener("click", async (event) => {
+      const button = event.target.closest("[data-action]");
+      if (!button) return;
+      const id = button.dataset.id;
+      const action = button.dataset.action;
+      try {
+        if (action === "delete" && !confirm("确认删除该 MCP 服务？")) return;
+        if (action === "edit") {
+          const server = (await requestJson("/api/mcp/servers")).servers.find((item) => item.id === id);
+          if (!server) throw new Error("未找到 MCP 服务");
+          const name = prompt("服务名称", server.name);
+          if (name === null) return;
+          const url = prompt("MCP 服务地址", server.url);
+          if (url === null) return;
+          const token = prompt("新认证令牌（留空保留当前令牌）", "");
+          if (token === null) return;
+          await requestJson(`/api/mcp/servers/${encodeURIComponent(id)}/update`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, url, token }) });
+        } else if (action === "delete") {
+          await requestJson(`/api/mcp/servers/${encodeURIComponent(id)}`, { method: "DELETE" });
+        } else {
+          await requestJson(`/api/mcp/servers/${encodeURIComponent(id)}/${action}`, { method: "POST" });
+        }
+        await loadServers();
+      } catch (error) {
+        alert(error.message);
+      }
+    });
 
-    async function handleDelete(id) {
-      if (!confirm("确认彻底删除该 MCP 服务？")) return;
-      await fetch('/api/mcp/servers/' + id, { method: "DELETE" });
-      loadServers();
-    }
+    serversEl.addEventListener("change", async (event) => {
+      const checkbox = event.target.closest("[data-toggle-tool]");
+      if (!checkbox) return;
+      try {
+        await requestJson(`/api/mcp/servers/${encodeURIComponent(checkbox.dataset.serverId)}/tools/${encodeURIComponent(checkbox.dataset.toolKey)}/toggle`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: checkbox.checked }) });
+        await loadServers();
+      } catch (error) {
+        alert(error.message);
+        await loadServers();
+      }
+    });
 
-    loadChannels();
-    loadEnabledSettings();
+    document.getElementById("copy-endpoint").addEventListener("click", async () => {
+      try { await navigator.clipboard.writeText(endpointEl.textContent); } catch { alert("复制失败，请手动复制地址"); }
+    });
+    document.getElementById("refresh-servers").addEventListener("click", loadServers);
+    document.getElementById("refresh-logs").addEventListener("click", loadLogs);
+    document.getElementById("toggle-logs").addEventListener("click", async () => {
+      try {
+        await requestJson("/api/logs/toggle", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: document.getElementById("log-status").textContent !== "日志开启" }) });
+        await loadLogs();
+      } catch (error) { alert(error.message); }
+    });
+    document.getElementById("clear-logs").addEventListener("click", async () => {
+      if (!confirm("确认清空全部 MCP 调用日志？")) return;
+      try {
+        await requestJson("/api/logs/clear", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ category: "mcp" }) });
+        await loadLogs();
+      } catch (error) { alert(error.message); }
+    });
+    document.getElementById("copy-logs").addEventListener("click", async () => {
+      const text = [...logsEl.querySelectorAll(".log")].map((item) => item.textContent).join("\n\n");
+      if (!text) { alert("暂无日志可复制"); return; }
+      try { await navigator.clipboard.writeText(text); } catch { alert("复制失败"); }
+    });
+    document.getElementById("logout").addEventListener("click", async () => {
+      await fetch("/api/panel/logout", { method: "POST" });
+      location.reload();
+    });
+
     loadServers();
     loadLogs();
-    setInterval(loadLogs, 2500);
+    setInterval(loadLogs, 5000);
   </script>
 </body>
 </html>
