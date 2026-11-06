@@ -163,11 +163,9 @@ function getLoginHtml() {
 </html>`;
 }
 
-loadUpstreamChannelsFromEnv();
 if (dbPool) {
   await initDatabase();
 }
-await loadChannelsFromStorage();
 await loadMcpServersFromStorage();
 await loadSettingsFromStorage();
 
@@ -637,6 +635,15 @@ const server = http.createServer(async (request, response) => {
         return;
       }
 
+      if (
+        reqUrl.pathname.startsWith("/api/upstream/") ||
+        reqUrl.pathname.startsWith("/api/settings/") ||
+        reqUrl.pathname === "/api/mcp/check-tools"
+      ) {
+        sendJson(response, 404, { error: "此服务仅提供 MCP 反向代理功能" });
+        return;
+      }
+
       if (request.method === "GET" && reqUrl.pathname === "/api/upstream/channels") {
         const active = getActiveChannel();
         sendJson(response, 200, {
@@ -993,6 +1000,11 @@ const server = http.createServer(async (request, response) => {
         sendJson(response, 200, { success: true });
         return;
       }
+    }
+
+    if (reqUrl.pathname.startsWith("/v1/") || reqUrl.pathname.startsWith("/v1beta/")) {
+      sendJson(response, 404, { error: "此服务仅提供 MCP 反向代理功能" });
+      return;
     }
 
     const geminiMatch = reqUrl.pathname.match(/^\/(?:v1|v1beta)\/models\/(.+):(generateContent|streamGenerateContent)$/);
