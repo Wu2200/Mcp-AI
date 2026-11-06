@@ -160,38 +160,6 @@
 
     <div class="card">
       <div class="card-title">
-        <div class="card-title-left"><span>手动挂载 MCP 服务</span></div>
-      </div>
-      <form id="connect-form">
-        <div class="group">
-          <label for="mcp-name">服务前缀名称</label>
-          <input id="mcp-name" value="Github" placeholder="输入唯一标识名称" required>
-        </div>
-        <div class="group">
-          <label for="mcp-url">MCP 服务地址</label>
-          <input id="mcp-url" placeholder="https://..." required>
-        </div>
-        <div class="group">
-          <label for="mcp-token">认证令牌（可选）</label>
-          <input id="mcp-token" type="password" autocomplete="off" placeholder="粘贴令牌">
-        </div>
-        <div style="display:flex;align-items:center;margin-top:14px;">
-          <button id="btn-conn" class="btn" type="submit">添加服务</button>
-          <span id="conn-msg" role="status"></span>
-        </div>
-      </form>
-    </div>
-
-    <div class="card">
-      <div class="card-title">
-        <div class="card-title-left"><span>已挂载 MCP 服务列表</span></div>
-        <div class="action-group"><button id="refresh-servers" class="btn-action btn-start" type="button">刷新</button></div>
-      </div>
-      <div id="mcp-list"><div class="empty-state">正在加载服务列表...</div></div>
-    </div>
-
-    <div class="card">
-      <div class="card-title">
         <div class="card-title-left">
           <span>MCP 调用日志</span>
           <span id="log-status-badge" class="badge badge-green">记录中</span>
@@ -208,6 +176,36 @@
       </div>
       <span id="log-msg"></span>
     </div>
+
+    <div class="card">
+      <div class="card-title">
+        <div class="card-title-left"><span>已挂载 MCP 服务列表</span></div>
+        <div class="server-toolbar" style="display:flex;justify-content:space-between;align-items:center;width:100%;gap:8px;">
+          <button id="btn-show-connect" class="btn-action btn-start" type="button" aria-expanded="false">添加</button>
+          <button id="refresh-servers" class="btn-action btn-start" type="button" title="重新读取已挂载服务列表和当前状态，不会重新连接上游">刷新</button>
+        </div>
+      </div>
+      <form id="connect-form" hidden style="margin-bottom:14px;">
+        <div class="group">
+          <label for="mcp-name">服务前缀名称</label>
+          <input id="mcp-name" value="Github" placeholder="输入唯一标识名称" required>
+        </div>
+        <div class="group">
+          <label for="mcp-url">MCP 服务地址</label>
+          <input id="mcp-url" placeholder="https://..." required>
+        </div>
+        <div class="group">
+          <label for="mcp-token">认证令牌（可选）</label>
+          <input id="mcp-token" type="password" autocomplete="off" placeholder="粘贴令牌">
+        </div>
+        <div style="display:flex;align-items:center;margin-top:14px;">
+          <button id="btn-conn" class="btn" type="submit">连接并挂载</button>
+          <span id="conn-msg" role="status"></span>
+        </div>
+      </form>
+      <div id="mcp-list"><div class="empty-state">正在加载服务列表...</div></div>
+    </div>
+
   </div>
 
   <div id="edit-modal" class="modal-overlay">
@@ -375,6 +373,14 @@
       editModal.classList.remove("open");
     }
 
+    document.getElementById("btn-show-connect").addEventListener("click", () => {
+      const form = document.getElementById("connect-form");
+      const open = form.hidden;
+      form.hidden = !open;
+      document.getElementById("btn-show-connect").setAttribute("aria-expanded", String(open));
+      if (open) document.getElementById("mcp-name").focus();
+    });
+
     document.getElementById("connect-form").addEventListener("submit", async (event) => {
       event.preventDefault();
       const button = document.getElementById("btn-conn");
@@ -400,6 +406,8 @@
         connectMessage.textContent = `成功载入 ${data.toolCount} 个工具`;
         connectMessage.style.color = "#16a34a";
         document.getElementById("mcp-token").value = "";
+        document.getElementById("connect-form").hidden = true;
+        document.getElementById("btn-show-connect").setAttribute("aria-expanded", "false");
         await loadServers();
       } catch (error) {
         connectMessage.textContent = error.message;
