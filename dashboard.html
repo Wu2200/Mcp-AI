@@ -2,91 +2,265 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>MCP-AI 控制台</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>MCP 控制台</title>
   <style>
-    * { box-sizing: border-box; }
-    body { margin: 0; padding: 24px 14px; background: #f1f5f9; color: #0f172a; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.5; }
-    main { max-width: 850px; margin: 0 auto; }
-    header { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 18px; }
-    h1 { margin: 0; font-size: 22px; }
-    h2 { margin: 0 0 12px; font-size: 16px; }
-    p { color: #64748b; font-size: 13px; }
-    .card { padding: 18px; margin-bottom: 14px; background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; box-shadow: 0 1px 3px #0f172a0a; }
-    .field { margin-bottom: 12px; }
-    label { display: block; margin-bottom: 5px; color: #475569; font-size: 13px; font-weight: 600; }
-    input { width: 100%; padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 8px; font: inherit; }
-    input:focus { outline: 2px solid #bfdbfe; border-color: #2563eb; }
-    button { padding: 8px 12px; border: 0; border-radius: 7px; background: #2563eb; color: white; font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
-    button:hover { background: #1d4ed8; }
-    button:disabled { opacity: .55; cursor: wait; }
-    button.secondary { background: #e2e8f0; color: #334155; }
-    button.danger { background: #fee2e2; color: #991b1b; }
-    button.neutral { background: #fef3c7; color: #92400e; }
-    .row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
-    .endpoint { overflow-wrap: anywhere; padding: 10px 12px; border: 1px solid #e2e8f0; border-radius: 8px; background: #f8fafc; font-family: ui-monospace, monospace; user-select: all; }
-    .hint { margin: 7px 0 0; }
-    .server { margin-top: 10px; padding: 13px; border: 1px solid #e2e8f0; border-radius: 10px; background: #f8fafc; }
-    .server-head { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
-    .server-name { font-weight: 700; overflow-wrap: anywhere; }
-    .server-url { margin-top: 4px; color: #64748b; font: 12px ui-monospace, monospace; overflow-wrap: anywhere; }
-    .tools { margin-top: 10px; padding-top: 8px; border-top: 1px dashed #cbd5e1; }
-    .tool { display: flex; align-items: center; gap: 8px; padding: 5px 0; font: 12px ui-monospace, monospace; overflow-wrap: anywhere; }
-    .tool input { width: 16px; height: 16px; }
-    .badge { padding: 2px 8px; border-radius: 999px; background: #dcfce7; color: #166534; font-size: 11px; }
-    .badge.off { background: #e2e8f0; color: #475569; }
-    #logs { max-height: 440px; overflow: auto; padding: 10px; border-radius: 8px; background: #0f172a; color: #e2e8f0; font: 12px ui-monospace, monospace; }
-    .log { padding: 7px 0; border-bottom: 1px solid #334155; white-space: pre-wrap; overflow-wrap: anywhere; }
-    .empty { padding: 20px 8px; text-align: center; color: #94a3b8; font-size: 13px; }
-    #message { min-height: 20px; margin-top: 8px; font-size: 13px; }
-    @media (max-width: 520px) { body { padding: 14px 9px; } .card { padding: 14px; } header { align-items: flex-start; } }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background-color: #f8fafc;
+      color: #1e293b;
+      padding: 16px 12px;
+      line-height: 1.5;
+    }
+    .container { max-width: 880px; margin: 0 auto; }
+    .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; gap: 12px; }
+    .header h1 { font-size: 19px; font-weight: 700; color: #0f172a; letter-spacing: -0.02em; }
+    .header p { font-size: 13px; color: #64748b; margin-top: 2px; }
+    .btn-logout {
+      background: #ffffff; color: #64748b; border: 1px solid #cbd5e1; padding: 6px 12px;
+      font-size: 13px; font-weight: 500; border-radius: 6px; cursor: pointer; white-space: nowrap;
+      flex-shrink: 0; transition: all 0.15s;
+    }
+    .btn-logout:hover { background: #fee2e2; color: #dc2626; border-color: #fca5a5; }
+    .card {
+      background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 16px;
+      margin-bottom: 14px; box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05);
+    }
+    .card-title {
+      font-size: 15px; font-weight: 600; color: #0f172a; margin-bottom: 12px; display: flex;
+      flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px;
+    }
+    .card-title-left { display: flex; align-items: center; gap: 8px; flex: 1 1 200px; min-width: 0; }
+    .card-title-left span { white-space: normal; word-break: break-word; }
+    .badge {
+      display: inline-flex; align-items: center; font-size: 12px; font-weight: 500; padding: 2px 8px;
+      border-radius: 9999px; white-space: nowrap; flex-shrink: 0;
+    }
+    .badge-blue { background: #e0f2fe; color: #0369a1; }
+    .badge-green { background: #dcfce7; color: #15803d; }
+    .badge-red { background: #fee2e2; color: #b91c1c; }
+    .badge-gray { background: #f1f5f9; color: #64748b; border: 1px solid #e2e8f0; }
+    .group { margin-bottom: 14px; }
+    .group:last-child { margin-bottom: 0; }
+    label { display: block; font-size: 13px; font-weight: 500; color: #475569; margin-bottom: 6px; }
+    input {
+      width: 100%; background: #ffffff; border: 1px solid #cbd5e1; padding: 10px 12px; border-radius: 8px;
+      color: #0f172a; font-size: 14px; outline: none; transition: border-color 0.15s, box-shadow 0.15s;
+    }
+    input:focus { border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1); }
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center; background: #2563eb; color: #ffffff;
+      border: none; font-weight: 600; font-size: 14px; padding: 10px 20px; border-radius: 8px; cursor: pointer;
+      white-space: nowrap; flex-shrink: 0; transition: background-color 0.15s;
+    }
+    .btn:hover { background: #1d4ed8; }
+    .btn:disabled { opacity: .55; cursor: wait; }
+    .btn-secondary {
+      background: #f1f5f9; color: #334155; border: 1px solid #cbd5e1; padding: 8px 14px; font-size: 13px;
+    }
+    .btn-secondary:hover { background: #e2e8f0; color: #0f172a; }
+    .action-group { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .btn-action {
+      border: none; padding: 5px 10px; font-size: 12px; font-weight: 600; border-radius: 6px;
+      cursor: pointer; white-space: nowrap; transition: all 0.15s;
+    }
+    .btn-edit { background: #eff6ff; color: #1d4ed8; border: 1px solid #bfdbfe; }
+    .btn-edit:hover { background: #2563eb; color: #ffffff; border-color: #2563eb; }
+    .btn-start { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
+    .btn-start:hover { background: #16a34a; color: #ffffff; border-color: #16a34a; }
+    .btn-stop { background: #fef3c7; color: #92400e; border: 1px solid #fde68a; }
+    .btn-stop:hover { background: #d97706; color: #ffffff; border-color: #d97706; }
+    .btn-del { background: #fee2e2; color: #991b1b; border: 1px solid #fecaca; }
+    .btn-del:hover { background: #dc2626; color: #ffffff; border-color: #dc2626; }
+    .server-item {
+      background: #f8fafc; border: 1px solid #e2e8f0; padding: 12px; border-radius: 10px; margin-bottom: 10px;
+    }
+    .server-item:last-child { margin-bottom: 0; }
+    .server-item.disabled { opacity: 0.7; background: #f1f5f9; }
+    .server-item-head {
+      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; margin-bottom: 6px; gap: 8px;
+    }
+    .server-item-title {
+      font-size: 14px; font-weight: 600; color: #0f172a; display: flex; align-items: center; gap: 8px; min-width: 0;
+    }
+    .server-name-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .server-item-url { font-size: 12px; color: #64748b; margin-bottom: 6px; font-family: monospace; word-break: break-all; }
+    .tool-toggle-bar { font-size: 12px; color: #475569; display: flex; align-items: center; gap: 6px; margin-top: 4px; }
+    .tool-toggle-btn {
+      background: none; border: none; color: #2563eb; font-size: 12px; cursor: pointer; padding: 0;
+      font-weight: 500; white-space: nowrap;
+    }
+    .tool-toggle-btn:hover { text-decoration: underline; }
+    .tools-container { margin-top: 8px; padding-top: 8px; border-top: 1px dashed #cbd5e1; display: none; }
+    .tool-row {
+      display: flex; align-items: center; justify-content: space-between; padding: 6px 8px; background: #ffffff;
+      border: 1px solid #e2e8f0; border-radius: 6px; margin-bottom: 5px; font-size: 12px; gap: 8px;
+    }
+    .tool-row:last-child { margin-bottom: 0; }
+    .tool-row.disabled { opacity: 0.6; background: #f8fafc; }
+    .tool-left { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1; }
+    .tool-checkbox { width: 15px; height: 15px; cursor: pointer; accent-color: #2563eb; flex-shrink: 0; }
+    .tool-name { font-family: monospace; font-weight: 500; color: #0f172a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #conn-msg, #log-msg { margin-left: 10px; font-size: 12px; font-weight: 500; }
+    .empty-state { text-align: center; padding: 24px 10px; color: #94a3b8; font-size: 13px; }
+    .log-panel-container {
+      background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 10px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px;
+      color: #f1f5f9; max-height: 480px; overflow-y: auto;
+    }
+    .log-item { border-bottom: 1px solid #1e293b; padding: 7px 0; }
+    .log-item:last-child { border-bottom: none; }
+    .log-header { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+    .log-header:hover { color: #38bdf8; }
+    .log-time { color: #64748b; font-size: 10px; white-space: nowrap; }
+    .log-type-tag { padding: 1px 5px; border-radius: 3px; font-size: 10px; font-weight: 600; white-space: nowrap; }
+    .tag-mcp { background: #0d9488; color: #ffffff; }
+    .tag-tool { background: #059669; color: #ffffff; }
+    .tag-error { background: #dc2626; color: #ffffff; }
+    .tag-default { background: #0284c7; color: #ffffff; }
+    .log-summary { flex: 1 1 160px; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 500; }
+    .log-expand-icon { color: #64748b; font-size: 10px; width: 12px; }
+    .log-body {
+      display: none; background: #020617; border: 1px solid #1e293b; border-radius: 6px; padding: 8px 10px;
+      margin-top: 6px; white-space: pre-wrap; word-break: break-all; color: #cbd5e1; max-height: 280px;
+      overflow-y: auto; font-size: 11px;
+    }
+    .modal-overlay {
+      display: none; position: fixed; inset: 0; background: rgba(15, 23, 42, 0.5); backdrop-filter: blur(2px);
+      z-index: 1000; align-items: center; justify-content: center; padding: 16px;
+    }
+    .modal-overlay.open { display: flex; }
+    .modal-box {
+      background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 24px 20px;
+      width: 100%; max-width: 440px; box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.05);
+    }
+    .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+    .modal-header h3 { font-size: 16px; font-weight: 700; color: #0f172a; }
+    .modal-close { border: none; background: none; font-size: 22px; color: #94a3b8; cursor: pointer; padding: 0 4px; line-height: 1; }
+    .modal-close:hover { color: #0f172a; }
+    @media (max-width: 640px) {
+      body { padding: 10px 8px; }
+      .card { padding: 14px 12px; }
+      .card-title { margin-bottom: 10px; }
+      .action-group { width: 100%; justify-content: flex-start; }
+      .action-group .btn-action { flex: 1 1 calc(25% - 6px); text-align: center; padding: 6px 4px; }
+    }
   </style>
 </head>
 <body>
-  <main>
-    <header>
+  <div class="container">
+    <div class="header">
       <div>
-        <h1>MCP-AI 反向代理</h1>
-        <p>聚合并转发已挂载 MCP 服务的原生工具，不需要配置 AI 模型或 AI 上游接口。</p>
+        <h1>MCP 代理控制台</h1>
+        <p>远程 MCP 服务聚合与工具管理</p>
       </div>
-      <button class="secondary" id="logout">退出登录</button>
-    </header>
+      <button class="btn-logout" id="logout">退出登录</button>
+    </div>
 
-    <section class="card">
-      <h2>挂载远程 MCP 服务</h2>
+    <div class="card">
+      <div class="card-title">
+        <div class="card-title-left"><span>手动挂载 MCP 服务</span></div>
+      </div>
       <form id="connect-form">
-        <div class="field"><label for="mcp-name">服务名称</label><input id="mcp-name" value="GitHub" required></div>
-        <div class="field"><label for="mcp-url">MCP 服务地址</label><input id="mcp-url" placeholder="https://example.com/mcp" required></div>
-        <div class="field"><label for="mcp-token">上游 MCP 认证令牌（可选）</label><input id="mcp-token" type="password" autocomplete="off" placeholder="Bearer token"></div>
-        <button id="connect-button" type="submit">连接并挂载</button>
-        <div id="message" role="status"></div>
+        <div class="group">
+          <label for="mcp-name">服务前缀名称</label>
+          <input id="mcp-name" value="Github" placeholder="输入唯一标识名称" required>
+        </div>
+        <div class="group">
+          <label for="mcp-url">MCP 服务地址</label>
+          <input id="mcp-url" placeholder="https://..." required>
+        </div>
+        <div class="group">
+          <label for="mcp-token">认证令牌（可选）</label>
+          <input id="mcp-token" type="password" autocomplete="off" placeholder="粘贴令牌">
+        </div>
+        <div style="display:flex;align-items:center;margin-top:14px;">
+          <button id="btn-conn" class="btn" type="submit">添加服务</button>
+          <span id="conn-msg" role="status"></span>
+        </div>
       </form>
-    </section>
+    </div>
 
-    <section class="card">
-      <div class="row" style="justify-content:space-between"><h2>已挂载服务</h2><button id="refresh-servers" class="secondary">刷新</button></div>
-      <div id="servers"><div class="empty">正在加载 MCP 服务...</div></div>
-    </section>
-
-    <section class="card">
-      <div class="row" style="justify-content:space-between; margin-bottom:10px">
-        <h2 style="margin:0">MCP 调用日志</h2>
-        <div class="row"><span id="log-status" class="badge">日志开启</span><button id="toggle-logs" class="neutral">关闭日志</button><button id="copy-logs" class="secondary">复制</button><button id="clear-logs" class="danger">清空</button><button id="refresh-logs" class="secondary">刷新</button></div>
+    <div class="card">
+      <div class="card-title">
+        <div class="card-title-left"><span>已挂载 MCP 服务列表</span></div>
+        <div class="action-group"><button id="refresh-servers" class="btn-action btn-start" type="button">刷新</button></div>
       </div>
-      <div id="logs"><div class="empty">暂无 MCP 调用记录</div></div>
-    </section>
-  </main>
+      <div id="mcp-list"><div class="empty-state">正在加载服务列表...</div></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">
+        <div class="card-title-left">
+          <span>MCP 调用日志</span>
+          <span id="log-status-badge" class="badge badge-green">记录中</span>
+        </div>
+        <div class="action-group">
+          <button id="btn-toggle-log" class="btn-action btn-stop" type="button">关闭日志</button>
+          <button id="btn-copy-logs" class="btn-action btn-start" type="button">复制日志</button>
+          <button id="btn-clear-logs" class="btn-action btn-del" type="button">清空日志</button>
+          <button id="refresh-logs" class="btn-action btn-start" type="button">刷新</button>
+        </div>
+      </div>
+      <div id="log-panel" class="log-panel-container">
+        <div class="empty-state" style="color:#64748b;">暂无 MCP 调用记录。通过客户端调用已挂载服务后将在此显示。</div>
+      </div>
+      <span id="log-msg"></span>
+    </div>
+  </div>
+
+  <div id="edit-modal" class="modal-overlay">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3>编辑 MCP 服务配置</h3>
+        <button class="modal-close" id="close-edit" type="button">×</button>
+      </div>
+      <input type="hidden" id="edit-mcp-id">
+      <div class="group">
+        <label for="edit-mcp-name">服务前缀名称</label>
+        <input id="edit-mcp-name" placeholder="服务前缀名称">
+      </div>
+      <div class="group">
+        <label for="edit-mcp-url">MCP 服务地址</label>
+        <input id="edit-mcp-url" placeholder="https://...">
+      </div>
+      <div class="group">
+        <label for="edit-mcp-token">认证令牌（Token）</label>
+        <input id="edit-mcp-token" type="password" autocomplete="off" placeholder="留空则保持现有令牌不变">
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:18px;align-items:center;">
+        <span id="edit-msg" style="margin-right:auto;font-size:12px;font-weight:500;"></span>
+        <button class="btn btn-secondary" id="cancel-edit" type="button">取消</button>
+        <button id="btn-save-edit" class="btn" type="button">保存并重新连接</button>
+      </div>
+    </div>
+  </div>
+
   <script>
-    const serversEl = document.getElementById("servers");
-    const logsEl = document.getElementById("logs");
-    const messageEl = document.getElementById("message");
-    const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#039;" })[char]);
+    const serverList = document.getElementById("mcp-list");
+    const logPanel = document.getElementById("log-panel");
+    const connectMessage = document.getElementById("conn-msg");
+    const editModal = document.getElementById("edit-modal");
+    let cachedServers = [];
+    let cachedMcpLogs = [];
+    let isLoggingActive = true;
+    const expandedLogIds = new Set();
+
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"']/g, (char) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#039;"
+      })[char]);
+    }
 
     async function requestJson(url, options = {}) {
       const response = await fetch(url, options);
       let data = {};
       try { data = await response.json(); } catch {}
-      if (response.status === 401 && url.startsWith("/api/")) location.reload();
+      if (response.status === 401 && url.startsWith("/api/")) {
+        location.reload();
+        throw new Error("控制台未授权");
+      }
       if (!response.ok) throw new Error(data.error || `请求失败 (${response.status})`);
       return data;
     }
@@ -94,145 +268,298 @@
     async function loadServers() {
       try {
         const data = await requestJson("/api/mcp/servers");
-        const servers = data.servers || [];
-        if (!servers.length) {
-          serversEl.innerHTML = '<div class="empty">尚未挂载 MCP 服务。添加远程 MCP 服务后，其工具将通过上方地址提供。</div>';
+        cachedServers = data.servers || [];
+        if (cachedServers.length === 0) {
+          serverList.innerHTML = '<div class="empty-state">尚未挂载任何远程 MCP 服务。请填写上方服务地址并添加。</div>';
           return;
         }
-        serversEl.innerHTML = servers.map((server) => {
+        serverList.innerHTML = cachedServers.map((server) => {
           const active = server.status !== "disabled";
-          const tools = (server.tools || []).map((tool) => `
-            <label class="tool"><input type="checkbox" data-toggle-tool data-server-id="${escapeHtml(server.id)}" data-tool-key="${escapeHtml(tool.key)}" ${tool.enabled === false ? "" : "checked"}><span>${escapeHtml(tool.rawName || tool.key)}</span></label>
-          `).join("");
-          return `
-            <article class="server">
-              <div class="server-head">
-                <div class="row"><span class="server-name">${escapeHtml(server.name)}</span><span class="badge ${active ? "" : "off"}">${active ? "运行中" : "已断开"}</span></div>
-                <div class="row">
-                  <button class="secondary" data-action="edit" data-id="${escapeHtml(server.id)}">编辑</button>
-                  <button class="${active ? "neutral" : ""}" data-action="${active ? "stop" : "start"}" data-id="${escapeHtml(server.id)}">${active ? "断开" : "启动"}</button>
-                  <button class="danger" data-action="delete" data-id="${escapeHtml(server.id)}">删除</button>
+          const tools = (server.tools || []).map((tool) => {
+            const enabled = tool.enabled !== false;
+            return `
+              <div class="tool-row ${enabled ? "" : "disabled"}">
+                <div class="tool-left">
+                  <input type="checkbox" class="tool-checkbox" data-action="toggle-tool" data-server-id="${escapeHtml(server.id)}" data-tool-key="${escapeHtml(tool.key)}" ${enabled ? "checked" : ""}>
+                  <span class="tool-name" title="${escapeHtml(tool.rawName || tool.key)}">${escapeHtml(tool.rawName || tool.key)}</span>
                 </div>
               </div>
-              <div class="server-url">${escapeHtml(server.url)}</div>
-              <div class="tools"><div style="color:#64748b">工具 ${Number(server.toolCount) || 0} 个</div>${tools}</div>
-            </article>
+            `;
+          }).join("");
+          const expanded = document.getElementById(`tools-${server.id}`)?.style.display === "block";
+          return `
+            <div class="server-item ${active ? "" : "disabled"}">
+              <div class="server-item-head">
+                <div class="server-item-title">
+                  <span class="server-name-text">${escapeHtml(server.name)}</span>
+                  <span class="badge ${active ? "badge-green" : "badge-gray"}">${active ? "运行中" : "已断开"}</span>
+                </div>
+                <div class="action-group">
+                  <button class="btn-action btn-edit" data-action="edit" data-id="${escapeHtml(server.id)}" type="button">编辑</button>
+                  <button class="btn-action ${active ? "btn-stop" : "btn-start"}" data-action="${active ? "stop" : "start"}" data-id="${escapeHtml(server.id)}" type="button">${active ? "断开" : "启动"}</button>
+                  <button class="btn-action btn-del" data-action="delete" data-id="${escapeHtml(server.id)}" type="button">删除</button>
+                </div>
+              </div>
+              <div class="server-item-url">${escapeHtml(server.url)}</div>
+              <div class="tool-toggle-bar">
+                <span>工具清单 ${Number(server.toolCount) || 0}</span>
+                <button class="tool-toggle-btn" data-action="toggle-list" data-id="${escapeHtml(server.id)}" type="button">${expanded ? "点击收起" : "展开查看"}</button>
+              </div>
+              <div id="tools-${escapeHtml(server.id)}" class="tools-container" style="display:${expanded ? "block" : "none"};">${tools}</div>
+            </div>
           `;
         }).join("");
       } catch (error) {
-        serversEl.innerHTML = `<div class="empty">加载失败：${escapeHtml(error.message)}</div>`;
+        serverList.innerHTML = `<div class="empty-state" style="color:#ef4444;">获取失败：${escapeHtml(error.message)}</div>`;
       }
+    }
+
+    function getLogTagClass(type) {
+      if (String(type).startsWith("MCP_")) return "tag-mcp";
+      if (String(type).startsWith("TOOL")) return "tag-tool";
+      if (String(type).startsWith("ERROR")) return "tag-error";
+      return "tag-default";
+    }
+
+    function renderLogs() {
+      if (!cachedMcpLogs.length) {
+        logPanel.innerHTML = '<div class="empty-state" style="color:#64748b;">暂无 MCP 调用记录。通过客户端调用已挂载服务后将在此显示。</div>';
+        return;
+      }
+      logPanel.innerHTML = [...cachedMcpLogs].reverse().map((log) => {
+        const id = String(log.id || `${log.time}-${log.type}`);
+        const expanded = expandedLogIds.has(id);
+        return `
+          <div class="log-item">
+            <div class="log-header" data-log-id="${escapeHtml(id)}">
+              <span class="log-expand-icon">${expanded ? "▼" : "▶"}</span>
+              <span class="log-time">${escapeHtml(log.time)}</span>
+              <span class="log-type-tag ${getLogTagClass(log.type)}">${escapeHtml(log.type)}</span>
+              <span class="log-summary" title="${escapeHtml(log.summary)}">${escapeHtml(log.summary)}</span>
+            </div>
+            <div class="log-body" style="display:${expanded ? "block" : "none"};">${escapeHtml(log.detail)}</div>
+          </div>
+        `;
+      }).join("");
     }
 
     async function loadLogs() {
       try {
         const data = await requestJson("/api/logs");
-        const entries = data.mcpLogs || [];
-        const status = document.getElementById("log-status");
-        const toggle = document.getElementById("toggle-logs");
-        status.textContent = data.enabled ? "日志开启" : "日志暂停";
-        status.className = `badge${data.enabled ? "" : " off"}`;
-        toggle.textContent = data.enabled ? "关闭日志" : "开启日志";
-        toggle.className = data.enabled ? "neutral" : "";
-        logsEl.innerHTML = entries.length ? [...entries].reverse().map((entry) => `<div class="log">[${escapeHtml(entry.time)}] [${escapeHtml(entry.type)}] ${escapeHtml(entry.summary)}${entry.detail ? `\n${escapeHtml(entry.detail)}` : ""}</div>`).join("") : '<div class="empty">暂无 MCP 调用记录</div>';
+        cachedMcpLogs = data.mcpLogs || [];
+        isLoggingActive = data.enabled === true;
+        const badge = document.getElementById("log-status-badge");
+        const toggle = document.getElementById("btn-toggle-log");
+        badge.className = `badge ${isLoggingActive ? "badge-green" : "badge-gray"}`;
+        badge.textContent = isLoggingActive ? "记录中" : "已暂停";
+        toggle.className = `btn-action ${isLoggingActive ? "btn-stop" : "btn-start"}`;
+        toggle.textContent = isLoggingActive ? "关闭日志" : "开启日志";
+        renderLogs();
       } catch (error) {
-        logsEl.innerHTML = `<div class="empty">加载失败：${escapeHtml(error.message)}</div>`;
+        logPanel.innerHTML = `<div class="empty-state" style="color:#ef4444;">加载失败：${escapeHtml(error.message)}</div>`;
       }
+    }
+
+    function openEditModal(id) {
+      const server = cachedServers.find((item) => item.id === id);
+      if (!server) return;
+      document.getElementById("edit-mcp-id").value = server.id;
+      document.getElementById("edit-mcp-name").value = server.name || "";
+      document.getElementById("edit-mcp-url").value = server.url || "";
+      document.getElementById("edit-mcp-token").value = "";
+      document.getElementById("edit-msg").textContent = "";
+      editModal.classList.add("open");
+    }
+
+    function closeEditModal() {
+      editModal.classList.remove("open");
     }
 
     document.getElementById("connect-form").addEventListener("submit", async (event) => {
       event.preventDefault();
-      const button = document.getElementById("connect-button");
+      const button = document.getElementById("btn-conn");
       const payload = {
         name: document.getElementById("mcp-name").value.trim(),
         url: document.getElementById("mcp-url").value.trim(),
         token: document.getElementById("mcp-token").value.trim()
       };
+      if (!payload.name || !payload.url) {
+        connectMessage.textContent = "名称与 URL 不能为空";
+        connectMessage.style.color = "#dc2626";
+        return;
+      }
       button.disabled = true;
-      messageEl.textContent = "正在连接并读取工具列表...";
-      messageEl.style.color = "#2563eb";
+      connectMessage.textContent = "正在握手连接...";
+      connectMessage.style.color = "#2563eb";
       try {
-        const data = await requestJson("/api/mcp/connect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-        messageEl.textContent = `已挂载，读取到 ${data.toolCount} 个工具。`;
-        messageEl.style.color = "#15803d";
+        const data = await requestJson("/api/mcp/connect", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        connectMessage.textContent = `成功载入 ${data.toolCount} 个工具`;
+        connectMessage.style.color = "#16a34a";
         document.getElementById("mcp-token").value = "";
         await loadServers();
       } catch (error) {
-        messageEl.textContent = error.message;
-        messageEl.style.color = "#dc2626";
+        connectMessage.textContent = error.message;
+        connectMessage.style.color = "#dc2626";
       } finally {
         button.disabled = false;
       }
     });
 
-    serversEl.addEventListener("click", async (event) => {
+    serverList.addEventListener("click", async (event) => {
       const button = event.target.closest("[data-action]");
-      if (!button) return;
-      const id = button.dataset.id;
-      const action = button.dataset.action;
+      if (!button || button.dataset.action === "toggle-tool") return;
+      const { action, id } = button.dataset;
+      if (action === "toggle-list") {
+        const tools = document.getElementById(`tools-${id}`);
+        if (!tools) return;
+        const open = tools.style.display !== "block";
+        tools.style.display = open ? "block" : "none";
+        button.textContent = open ? "点击收起" : "展开查看";
+        return;
+      }
       try {
-        if (action === "delete" && !confirm("确认删除该 MCP 服务？")) return;
         if (action === "edit") {
-          const server = (await requestJson("/api/mcp/servers")).servers.find((item) => item.id === id);
-          if (!server) throw new Error("未找到 MCP 服务");
-          const name = prompt("服务名称", server.name);
-          if (name === null) return;
-          const url = prompt("MCP 服务地址", server.url);
-          if (url === null) return;
-          const token = prompt("新认证令牌（留空保留当前令牌）", "");
-          if (token === null) return;
-          await requestJson(`/api/mcp/servers/${encodeURIComponent(id)}/update`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, url, token }) });
+          openEditModal(id);
         } else if (action === "delete") {
+          if (!confirm("确认彻底删除该 MCP 服务？")) return;
           await requestJson(`/api/mcp/servers/${encodeURIComponent(id)}`, { method: "DELETE" });
-        } else {
+          await loadServers();
+        } else if (action === "start" || action === "stop") {
           await requestJson(`/api/mcp/servers/${encodeURIComponent(id)}/${action}`, { method: "POST" });
+          await loadServers();
         }
-        await loadServers();
       } catch (error) {
         alert(error.message);
       }
     });
 
-    serversEl.addEventListener("change", async (event) => {
-      const checkbox = event.target.closest("[data-toggle-tool]");
+    serverList.addEventListener("change", async (event) => {
+      const checkbox = event.target.closest('[data-action="toggle-tool"]');
       if (!checkbox) return;
       try {
-        await requestJson(`/api/mcp/servers/${encodeURIComponent(checkbox.dataset.serverId)}/tools/${encodeURIComponent(checkbox.dataset.toolKey)}/toggle`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: checkbox.checked }) });
+        await requestJson(`/api/mcp/servers/${encodeURIComponent(checkbox.dataset.serverId)}/tools/${encodeURIComponent(checkbox.dataset.toolKey)}/toggle`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: checkbox.checked })
+        });
         await loadServers();
       } catch (error) {
         alert(error.message);
         await loadServers();
       }
+    });
+
+    document.getElementById("btn-save-edit").addEventListener("click", async () => {
+      const id = document.getElementById("edit-mcp-id").value;
+      const name = document.getElementById("edit-mcp-name").value.trim();
+      const url = document.getElementById("edit-mcp-url").value.trim();
+      const token = document.getElementById("edit-mcp-token").value.trim();
+      const message = document.getElementById("edit-msg");
+      const button = document.getElementById("btn-save-edit");
+      if (!name || !url) {
+        message.textContent = "名称与 URL 不能为空";
+        message.style.color = "#dc2626";
+        return;
+      }
+      button.disabled = true;
+      message.textContent = "正在握手验证并同步工具...";
+      message.style.color = "#2563eb";
+      try {
+        const data = await requestJson(`/api/mcp/servers/${encodeURIComponent(id)}/update`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name, url, token })
+        });
+        message.textContent = `更新成功，已载入 ${data.toolCount} 个工具`;
+        message.style.color = "#16a34a";
+        await loadServers();
+        setTimeout(closeEditModal, 600);
+      } catch (error) {
+        message.textContent = error.message;
+        message.style.color = "#dc2626";
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    document.getElementById("btn-toggle-log").addEventListener("click", async () => {
+      try {
+        await requestJson("/api/logs/toggle", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: !isLoggingActive })
+        });
+        await loadLogs();
+      } catch (error) {
+        alert(error.message);
+      }
+    });
+
+    document.getElementById("btn-clear-logs").addEventListener("click", async () => {
+      if (!confirm("确认清空全部 MCP 调用日志？")) return;
+      try {
+        await requestJson("/api/logs/clear", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ category: "mcp" })
+        });
+        expandedLogIds.clear();
+        await loadLogs();
+      } catch (error) {
+        alert(error.message);
+      }
+    });
+
+    document.getElementById("btn-copy-logs").addEventListener("click", async () => {
+      const text = cachedMcpLogs.map((log) => `[${log.time}] [${log.type}] ${log.summary}\n${log.detail}`).join("\n\n");
+      if (!text) {
+        alert("暂无 MCP 日志可复制");
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(text);
+        const message = document.getElementById("log-msg");
+        message.textContent = "已复制 MCP 调用日志";
+        message.style.color = "#16a34a";
+        setTimeout(() => { message.textContent = ""; }, 3000);
+      } catch {
+        alert("复制失败，请检查浏览器剪贴板权限");
+      }
+    });
+
+    logPanel.addEventListener("click", (event) => {
+      const header = event.target.closest("[data-log-id]");
+      if (!header) return;
+      const item = header.closest(".log-item");
+      const body = item?.querySelector(".log-body");
+      const icon = header.querySelector(".log-expand-icon");
+      if (!body) return;
+      const open = body.style.display !== "block";
+      body.style.display = open ? "block" : "none";
+      icon.textContent = open ? "▼" : "▶";
+      if (open) expandedLogIds.add(header.dataset.logId);
+      else expandedLogIds.delete(header.dataset.logId);
     });
 
     document.getElementById("refresh-servers").addEventListener("click", loadServers);
     document.getElementById("refresh-logs").addEventListener("click", loadLogs);
-    document.getElementById("toggle-logs").addEventListener("click", async () => {
-      try {
-        await requestJson("/api/logs/toggle", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: document.getElementById("log-status").textContent !== "日志开启" }) });
-        await loadLogs();
-      } catch (error) { alert(error.message); }
-    });
-    document.getElementById("clear-logs").addEventListener("click", async () => {
-      if (!confirm("确认清空全部 MCP 调用日志？")) return;
-      try {
-        await requestJson("/api/logs/clear", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ category: "mcp" }) });
-        await loadLogs();
-      } catch (error) { alert(error.message); }
-    });
-    document.getElementById("copy-logs").addEventListener("click", async () => {
-      const text = [...logsEl.querySelectorAll(".log")].map((item) => item.textContent).join("\n\n");
-      if (!text) { alert("暂无日志可复制"); return; }
-      try { await navigator.clipboard.writeText(text); } catch { alert("复制失败"); }
-    });
     document.getElementById("logout").addEventListener("click", async () => {
       await fetch("/api/panel/logout", { method: "POST" });
       location.reload();
     });
+    document.getElementById("close-edit").addEventListener("click", closeEditModal);
+    document.getElementById("cancel-edit").addEventListener("click", closeEditModal);
+    editModal.addEventListener("click", (event) => {
+      if (event.target === editModal) closeEditModal();
+    });
 
     loadServers();
     loadLogs();
-    setInterval(loadLogs, 5000);
+    setInterval(loadLogs, 2500);
   </script>
 </body>
 </html>
