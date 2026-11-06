@@ -1243,6 +1243,6 @@ process.on("SIGINT", () => {
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  const ch = getActiveChannel()?.name || "未配置";
-  console.log(`[MCP-AI] 服务就绪 (端口: ${PORT} | 生效渠道: ${ch} | MCP工具: ${mcpToolRegistry.size}个)`);
+  const activeMcpServers = Array.from(mcpServers.values()).filter((item) => item.status === "active").length;
+  console.log(`[MCP-AI] MCP 反向代理就绪 (端口: ${PORT} | 已挂载服务: ${activeMcpServers}个 | 工具索引: ${mcpToolRegistry.size}个)`);
 });
