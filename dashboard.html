@@ -65,6 +65,8 @@
       border: none; padding: 5px 10px; font-size: 12px; font-weight: 600; border-radius: 6px;
       cursor: pointer; white-space: nowrap; transition: all 0.15s;
     }
+    .server-toolbar { display: flex; align-items: center; gap: 8px; }
+    .server-toolbar .btn-action { padding: 8px 18px; font-size: 14px; }
     .btn-edit { background: #eff6ff; color: #1d4ed8; border: 1px solid #bfdbfe; }
     .btn-edit:hover { background: #2563eb; color: #ffffff; border-color: #2563eb; }
     .btn-start { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
@@ -180,9 +182,9 @@
     <div class="card">
       <div class="card-title">
         <div class="card-title-left"><span>已挂载 MCP 服务列表</span></div>
-        <div class="server-toolbar" style="display:flex;justify-content:space-between;align-items:center;width:100%;gap:8px;">
-          <button id="btn-show-connect" class="btn-action btn-start" type="button" aria-expanded="false">添加</button>
+        <div class="server-toolbar">
           <button id="refresh-servers" class="btn-action btn-start" type="button" title="重新读取已挂载服务列表和当前状态，不会重新连接上游">刷新</button>
+          <button id="btn-show-connect" class="btn-action btn-start" type="button" aria-expanded="false">添加</button>
         </div>
       </div>
       <form id="connect-form" hidden style="margin-bottom:14px;">
