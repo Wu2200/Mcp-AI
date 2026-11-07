@@ -2,1825 +2,296 @@ import crypto from "node:crypto";
 import {
   mcpServers,
   mcpToolRegistry,
-  enabledModels,
   addDebugLog,
-  getActiveChannel,
-  upstreamChatCompletionsUrl,
   getStoredServers,
   saveServerToStorage
 } from "./store.js";
 
 export { mcpServers, mcpToolRegistry };
 
-export async function parseMcpResponse(res) {
-  const contentType = res.headers.get("Content-Type") || "";
+export async function parseMcpResponse(response) {
+  const contentType = response.headers.get("Content-Type") || "";
+  const text = await response.text();
   if (contentType.includes("text/event-stream")) {
-    const text = await res.text();
-    for (const line of text.split("\n")) {
+    for (const line of text.split(/\r?\n/)) {
       const trimmed = line.trim();
-      if (trimmed.startsWith("data:")) {
-        try {
-          return JSON.parse(trimmed.slice(5).trim());
-        } catch {}
-      }
+      if (!trimmed.startsWith("data:")) continue;
+      try {
+        return JSON.parse(trimmed.slice(5).trim());
+      } catch {}
     }
+    throw new Error("MCP 服务返回了无法解析的事件流");
   }
-  return await res.json();
+  try {
+    return text ? JSON.parse(text) : {};
+  } catch {
+    throw new Error("MCP 服务返回了无效 JSON");
+  }
 }
 
-export function findToolInfo(toolKey) {
-  if (!toolKey || typeof toolKey !== "string") return null;
-  const rawTarget = toolKey.trim();
+export function sanitizeToolSchema(schema) {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return { type: "object", properties: {} };
+  return schema;
+}
 
-  // 1. 精确匹配
-  let info = mcpToolRegistry.get(rawTarget);
-  if (info) return info;
-
-  // 2. 忽略大小写匹配
-  const lowerTarget = rawTarget.toLowerCase();
-  for (const [k, v] of mcpToolRegistry.entries()) {
-    if (k.toLowerCase() === lowerTarget) return v;
-  }
-
-  // 3. 归一化名称（去除常见前缀和后缀，去除下划线与中划线差异）
-  const normalize = (name) => {
-    return String(name || "")
-      .toLowerCase()
-      .replace(/^(?:github_|mcp_|copilot_|tool_|default_api_)+/g, "")
-      .replace(/(?:_mcp_github|_mcp|_tool|_server|_github)+$/g, "")
-      .replace(/[^a-z0-9]/g, "");
+function normalizeTool(serverName, tool) {
+  const rawName = String(tool?.name || "").trim();
+  if (!rawName) return null;
+  const safePrefix = String(serverName || "mcp").toLowerCase().replace(/[^a-z0-9_]/g, "_");
+  const safeName = rawName.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const key = safeName.startsWith(`${safePrefix}_`) ? safeName : `${safePrefix}_${safeName}`;
+  return {
+    key,
+    rawName,
+    description: typeof tool.description === "string" ? tool.description : rawName,
+    inputSchema: sanitizeToolSchema(tool.inputSchema),
+    enabled: true
   };
-
-  const normTarget = normalize(rawTarget);
-  if (normTarget) {
-    // 3.1 归一化全等匹配
-    for (const [k, v] of mcpToolRegistry.entries()) {
-      if (normalize(k) === normTarget || normalize(v.rawName) === normTarget) {
-        return v;
-      }
-    }
-
-    // 4. 后缀模糊包含匹配
-    for (const [k, v] of mcpToolRegistry.entries()) {
-      const normK = normalize(k);
-      const normRaw = normalize(v.rawName);
-      if (
-        (normRaw && normTarget.endsWith(normRaw)) ||
-        (normK && normTarget.endsWith(normK)) ||
-        (normTarget && normK.endsWith(normTarget)) ||
-        (normTarget && normRaw.endsWith(normTarget))
-      ) {
-        return v;
-      }
-    }
-
-    // 5. 常见标准动作别名映射
-    const aliasMap = {
-      readfile: "get_file_contents",
-      getfile: "get_file_contents",
-      viewfile: "get_file_contents",
-      catfile: "get_file_contents",
-      writefile: "create_or_update_file",
-      createfile: "create_or_update_file",
-      updatefile: "create_or_update_file",
-      editfile: "github_edit_file",
-      modifyfile: "github_edit_file",
-      patchfile: "github_edit_file"
-    };
-
-    const mappedAlias = aliasMap[normTarget];
-    if (mappedAlias) {
-      const normMapped = normalize(mappedAlias);
-      for (const [k, v] of mcpToolRegistry.entries()) {
-        if (normalize(k) === normMapped || normalize(v.rawName) === normMapped) {
-          return v;
-        }
-      }
-    }
-  }
-
-  return null;
 }
 
-export async function connectToMcpServer({ name, url, token }) {
-  const serverId = crypto.randomUUID();
-  const cleanUrl = url.trim().replace(/\/+$/, "");
+function registerServer(server) {
+  if (server.status !== "active") return;
+  for (const tool of server.tools || []) {
+    if (tool.enabled === false) continue;
+    const registryItem = {
+      serverId: server.id,
+      serverName: server.name,
+      rawName: tool.rawName,
+      postEndpoint: server.postEndpoint,
+      headers: server.headers
+    };
+    mcpToolRegistry.set(tool.key, registryItem);
+    if (!mcpToolRegistry.has(tool.rawName)) mcpToolRegistry.set(tool.rawName, registryItem);
+  }
+}
+
+export function rebuildMcpToolRegistry() {
+  mcpToolRegistry.clear();
+  for (const server of mcpServers.values()) registerServer(server);
+}
+
+async function connectRemote({ id = crypto.randomUUID(), name, url, token, previousTools = [], status = "active" }) {
+  const cleanName = String(name || "").trim();
+  const cleanUrl = String(url || "").trim().replace(/\/+$/, "");
+  if (!cleanName || !cleanUrl) throw new Error("名称与 MCP 服务地址不能为空");
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(cleanUrl);
+  } catch {
+    throw new Error("MCP 服务地址格式无效");
+  }
+  if (!["http:", "https:"].includes(parsedUrl.protocol)) throw new Error("MCP 服务地址必须使用 HTTP 或 HTTPS");
+
   const headers = {
     Accept: "application/json, text/event-stream",
     "Content-Type": "application/json",
-    "User-Agent": "mcp-agent-proxy/1.0.0"
+    "User-Agent": "mcp-proxy/1.0.0"
   };
+  const normalizedToken = String(token || "").trim();
+  if (normalizedToken) headers.Authorization = /^Bearer\s/i.test(normalizedToken) ? normalizedToken : `Bearer ${normalizedToken}`;
 
-  if (token) {
-    const rawToken = token.trim();
-    headers["Authorization"] = rawToken.startsWith("Bearer ") ? rawToken : `Bearer ${rawToken}`;
-  }
-
-  const initPayload = {
-    jsonrpc: "2.0",
-    id: 1,
-    method: "initialize",
-    params: {
-      protocolVersion: "2024-11-05",
-      capabilities: {},
-      clientInfo: { name: "mcp-agent-proxy", version: "1.0.0" }
-    }
-  };
-
-  try {
-    await fetch(cleanUrl, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(initPayload),
-      signal: AbortSignal.timeout(20000)
-    });
-
-    await fetch(cleanUrl, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        method: "notifications/initialized"
-      }),
-      signal: AbortSignal.timeout(20000)
-    }).catch(() => {});
-  } catch {}
-
-  const listPayload = { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} };
-  const listRes = await fetch(cleanUrl, {
+  const initResponse = await fetch(cleanUrl, {
     method: "POST",
     headers,
-    body: JSON.stringify(listPayload),
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "mcp-proxy", version: "1.0.0" } }
+    }),
     signal: AbortSignal.timeout(20000)
   });
-
-  if (!listRes.ok) {
-    const err = await listRes.text();
-    throw new Error(`MCP 响应错误 (${listRes.status}): ${err.slice(0, 300)}`);
+  if (!initResponse.ok) {
+    const text = await initResponse.text();
+    throw new Error(`MCP 初始化失败 (${initResponse.status}): ${text.slice(0, 300)}`);
   }
+  const initData = await parseMcpResponse(initResponse);
+  if (initData.error) throw new Error(initData.error.message || "MCP 初始化失败");
+  const sessionId = initResponse.headers.get("MCP-Session-Id") || "";
+  const protocolVersion = initData.result?.protocolVersion || "2024-11-05";
+  headers["MCP-Protocol-Version"] = protocolVersion;
+  if (sessionId) headers["MCP-Session-Id"] = sessionId;
 
-  const listData = await parseMcpResponse(listRes);
-  if (listData.error) {
-    throw new Error(listData.error.message || JSON.stringify(listData.error));
+  await fetch(cleanUrl, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+    signal: AbortSignal.timeout(20000)
+  }).catch(() => {});
+
+  const listResponse = await fetch(cleanUrl, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
+    signal: AbortSignal.timeout(20000)
+  });
+  if (!listResponse.ok) {
+    const text = await listResponse.text();
+    throw new Error(`获取 MCP 工具列表失败 (${listResponse.status}): ${text.slice(0, 300)}`);
   }
-  const rawTools = listData.result?.tools || [];
+  const listData = await parseMcpResponse(listResponse);
+  if (listData.error) throw new Error(listData.error.message || "获取 MCP 工具列表失败");
+  const preferences = new Map((previousTools || []).map((tool) => [tool.rawName, tool.enabled !== false]));
+  const tools = (Array.isArray(listData.result?.tools) ? listData.result.tools : [])
+    .map((tool) => {
+      const normalized = normalizeTool(cleanName, tool);
+      if (normalized && preferences.has(normalized.rawName)) normalized.enabled = preferences.get(normalized.rawName);
+      return normalized;
+    })
+    .filter(Boolean);
+  if (tools.length === 0) throw new Error("该 MCP 服务未返回任何工具，请检查认证权限或服务地址。");
 
-  if (rawTools.length === 0) {
-    throw new Error("该 MCP 未返回任何工具，请检查 Token 权限或服务地址。");
-  }
-
-  const registeredTools = [];
-  for (const t of rawTools) {
-    const safePrefix = name.toLowerCase().replace(/[^a-z0-9_]/g, "_");
-    const sanitizedToolName = t.name.replace(/[^a-zA-Z0-9_-]/g, "_");
-    const toolKey = sanitizedToolName.startsWith(`${safePrefix}_`)
-      ? sanitizedToolName
-      : `${safePrefix}_${sanitizedToolName}`;
-
-    registeredTools.push({
-      key: toolKey,
-      rawName: t.name,
-      description: t.description || t.name,
-      inputSchema: t.inputSchema || { type: "object", properties: {} },
-      enabled: true,
-      status: "unchecked",
-      statusMessage: "",
-      openAiTool: {
-        type: "function",
-        function: {
-          name: t.name,
-          description: t.description || t.name,
-          parameters: t.inputSchema || { type: "object", properties: {} }
-        }
-      }
-    });
-
-    const registryItem = {
-      serverId,
-      serverName: name,
-      rawName: t.name,
-      postEndpoint: cleanUrl,
-      headers
-    };
-    mcpToolRegistry.set(toolKey, registryItem);
-    // 默认双向原生注册：使原生名直接在底层 O(1) 索引，无需前缀或映射查找
-    if (!mcpToolRegistry.has(t.name)) {
-      mcpToolRegistry.set(t.name, registryItem);
-    }
-  }
-
-  const serverInfo = {
-    id: serverId,
-    name,
+  const server = {
+    id,
+    name: cleanName,
     url: cleanUrl,
-    rawToken: token,
-    status: "active",
+    status,
     postEndpoint: cleanUrl,
     headers,
-    toolCount: registeredTools.length,
-    tools: registeredTools
+    toolCount: tools.length,
+    tools
   };
-
-  registerVirtualTools(serverInfo);
-  mcpServers.set(serverId, serverInfo);
+  mcpServers.set(id, server);
+  rebuildMcpToolRegistry();
   await saveServerToStorage();
-  addDebugLog("TOOL", `成功挂载 MCP 服务: ${name}`, { serverId, url: cleanUrl, toolCount: serverInfo.tools.length });
-  return serverInfo;
+  addDebugLog("MCP_SERVER", `MCP 服务已连接: ${cleanName}`, { serverId: id, url: cleanUrl, toolCount: tools.length }, "mcp");
+  return server;
+}
+
+export async function connectToMcpServer(config) {
+  return connectRemote(config || {});
 }
 
 export async function updateMcpServer({ id, name, url, token }) {
   const existing = mcpServers.get(id);
-  if (!existing) {
-    throw new Error("未找到要更新的 MCP 服务");
-  }
-
-  const targetName = (name || "").trim() || existing.name;
-  const targetUrl = (url || "").trim() || existing.url;
-  const cleanUrl = targetUrl.replace(/\/+$/, "");
-
-  const hasNewToken = token !== undefined && token !== null && String(token).trim() !== "";
-  const finalToken = hasNewToken ? String(token).trim() : (existing.rawToken || "");
-
-  const headers = {
-    Accept: "application/json, text/event-stream",
-    "Content-Type": "application/json",
-    "User-Agent": "mcp-agent-proxy/1.0.0"
-  };
-
-  if (finalToken) {
-    headers["Authorization"] = finalToken.startsWith("Bearer ") ? finalToken : `Bearer ${finalToken}`;
-  }
-
-  // 1. 初始化握手
-  const initPayload = {
-    jsonrpc: "2.0",
-    id: 1,
-    method: "initialize",
-    params: {
-      protocolVersion: "2024-11-05",
-      capabilities: {},
-      clientInfo: { name: "mcp-agent-proxy", version: "1.0.0" }
-    }
-  };
-
-  try {
-    await fetch(cleanUrl, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(initPayload),
-      signal: AbortSignal.timeout(20000)
-    });
-
-    await fetch(cleanUrl, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        method: "notifications/initialized"
-      }),
-      signal: AbortSignal.timeout(20000)
-    }).catch(() => {});
-  } catch {}
-
-  // 2. 拉取工具列表
-  const listPayload = { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} };
-  const listRes = await fetch(cleanUrl, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(listPayload),
-    signal: AbortSignal.timeout(20000)
+  if (!existing) throw new Error("未找到要更新的 MCP 服务");
+  const oldToken = existing.headers?.Authorization || "";
+  const updated = await connectRemote({
+    id,
+    name: String(name || "").trim() || existing.name,
+    url: String(url || "").trim() || existing.url,
+    token: String(token || "").trim() || oldToken,
+    previousTools: existing.tools,
+    status: existing.status
   });
-
-  if (!listRes.ok) {
-    const err = await listRes.text();
-    throw new Error(`MCP 响应错误 (${listRes.status}): ${err.slice(0, 300)}`);
-  }
-
-  const listData = await parseMcpResponse(listRes);
-  if (listData.error) {
-    throw new Error(listData.error.message || JSON.stringify(listData.error));
-  }
-  const rawTools = listData.result?.tools || [];
-
-  if (rawTools.length === 0) {
-    throw new Error("该 MCP 未返回任何工具，请检查 Token 权限或服务地址。");
-  }
-
-  // 3. 记录已存在工具的启用与检测状态
-  const oldToolPref = new Map();
-  if (Array.isArray(existing.tools)) {
-    for (const ot of existing.tools) {
-      if (ot.rawName) {
-        oldToolPref.set(ot.rawName, {
-          enabled: ot.enabled !== false,
-          status: ot.status || "unchecked",
-          statusMessage: ot.statusMessage || ""
-        });
-      }
-    }
-  }
-
-  // 4. 清理旧注册项
-  for (const [key, val] of mcpToolRegistry.entries()) {
-    if (val.serverId === id) {
-      mcpToolRegistry.delete(key);
-    }
-  }
-
-  // 5. 注册新工具并恢复偏好
-  const registeredTools = [];
-  for (const t of rawTools) {
-    const safePrefix = targetName.toLowerCase().replace(/[^a-z0-9_]/g, "_");
-    const sanitizedToolName = t.name.replace(/[^a-zA-Z0-9_-]/g, "_");
-    const toolKey = sanitizedToolName.startsWith(`${safePrefix}_`)
-      ? sanitizedToolName
-      : `${safePrefix}_${sanitizedToolName}`;
-
-    const prev = oldToolPref.get(t.name);
-    const isEnabled = prev ? prev.enabled : true;
-    const status = prev ? prev.status : "unchecked";
-    const statusMessage = prev ? prev.statusMessage : "";
-
-    registeredTools.push({
-      key: toolKey,
-      rawName: t.name,
-      description: t.description || t.name,
-      inputSchema: t.inputSchema || { type: "object", properties: {} },
-      enabled: isEnabled,
-      status,
-      statusMessage,
-      openAiTool: {
-        type: "function",
-        function: {
-          name: t.name,
-          description: t.description || t.name,
-          parameters: t.inputSchema || { type: "object", properties: {} }
-        }
-      }
-    });
-
-    if (existing.status !== "disabled" && isEnabled) {
-      const registryItem = {
-        serverId: id,
-        serverName: targetName,
-        rawName: t.name,
-        postEndpoint: cleanUrl,
-        headers
-      };
-      mcpToolRegistry.set(toolKey, registryItem);
-      if (!mcpToolRegistry.has(t.name)) {
-        mcpToolRegistry.set(t.name, registryItem);
-      }
-    }
-  }
-
-  existing.name = targetName;
-  existing.url = cleanUrl;
-  existing.rawToken = finalToken;
-  existing.postEndpoint = cleanUrl;
-  existing.headers = headers;
-  existing.toolCount = registeredTools.length;
-  existing.tools = registeredTools;
-
-  registerVirtualTools(existing);
-  await saveServerToStorage();
-  addDebugLog("TOOL", `成功更新 MCP 服务: ${targetName}`, { serverId: id, url: cleanUrl, toolCount: existing.tools.length });
-  return existing;
-}
-
-export function extractMcpResultContent(data) {
-  if (!data) return "{}";
-  let contentStr = "";
-
-  const rawResult = data.result !== undefined ? data.result : data;
-  if (!rawResult) return "{}";
-
-  if (Array.isArray(rawResult.content)) {
-    const pieces = [];
-    for (const item of rawResult.content) {
-      if (!item) continue;
-      if (item.type === "text" && item.text) {
-        pieces.push(item.text);
-      } else if ((item.type === "resource" || item.type === "embedded_resource") && item.resource) {
-        if (item.resource.text) {
-          pieces.push(item.resource.text);
-        } else if (item.resource.blob) {
-          try {
-            const decoded = Buffer.from(item.resource.blob, "base64").toString("utf8");
-            pieces.push(decoded);
-          } catch {
-            pieces.push(item.resource.blob);
-          }
-        }
-      } else if (item.text) {
-        pieces.push(item.text);
-      }
-    }
-    if (pieces.length > 0) {
-      contentStr = pieces.join("\n\n");
-    }
-  }
-
-  if (!contentStr && rawResult.content && rawResult.encoding === "base64" && typeof rawResult.content === "string") {
-    try {
-      contentStr = Buffer.from(rawResult.content, "base64").toString("utf8");
-    } catch {}
-  }
-
-  if (!contentStr) {
-    contentStr = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult, null, 2);
-  }
-
-  return contentStr;
-}
-
-export function buildCompatibleMcpContent(data, fallbackText = "") {
-  const rawResult = data?.result !== undefined ? data.result : data;
-  if (Array.isArray(rawResult?.content) && rawResult.content.length > 0) {
-    const blocks = [];
-    for (const item of rawResult.content) {
-      if (!item) continue;
-      if (item.type === "image" || item.type === "audio") {
-        blocks.push(item);
-      } else if (item.type === "text" && typeof item.text === "string") {
-        blocks.push({ type: "text", text: item.text });
-      } else if ((item.type === "resource" || item.type === "embedded_resource") && item.resource) {
-        if (typeof item.resource.text === "string") {
-          blocks.push({ type: "text", text: item.resource.text });
-        } else if (item.resource.blob) {
-          try {
-            const decoded = Buffer.from(item.resource.blob, "base64").toString("utf8");
-            blocks.push({ type: "text", text: decoded });
-          } catch {
-            blocks.push(item);
-          }
-        } else {
-          blocks.push(item);
-        }
-      } else if (typeof item.text === "string") {
-        blocks.push({ type: "text", text: item.text });
-      } else {
-        blocks.push(item);
-      }
-    }
-    if (blocks.length > 0) return blocks;
-  }
-  return [{ type: "text", text: String(fallbackText ?? "") }];
-}
-
-export function sanitizeToolSchema(schema) {
-  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
-    return { type: "object", properties: {} };
-  }
-  const copy = { ...schema };
-  delete copy.$schema;
-  if (!copy.type) {
-    copy.type = "object";
-  }
-  if (copy.type === "object" && (!copy.properties || typeof copy.properties !== "object")) {
-    copy.properties = {};
-  }
-  if (copy.properties && Object.keys(copy.properties).length > 0) {
-    delete copy.anyOf;
-    delete copy.oneOf;
-    delete copy.allOf;
-  }
-  return copy;
-}
-
-export function extractErrorMessage(text) {
-  if (!text) return "";
-  if (typeof text === "object") {
-    if (typeof text.error === "string") return text.error;
-    if (text.error?.message) return text.error.message;
-    if (typeof text.message === "string") return text.message;
-    return JSON.stringify(text).slice(0, 300);
-  }
-  let str = String(text).trim();
-  str = str.replace(/^(?:执行失败\s*[:：]?\s*)+/i, "");
-  try {
-    const parsed = JSON.parse(str);
-    return extractErrorMessage(parsed);
-  } catch {}
-  const jsonMatch = str.match(/\{[\s\S]*\}/);
-  if (jsonMatch) {
-    try {
-      const parsed = JSON.parse(jsonMatch[0]);
-      const inner = parsed.error?.message || parsed.message || parsed.error;
-      if (typeof inner === "string") {
-        const prefix = str.slice(0, jsonMatch.index).replace(/^(?:执行失败\s*[:：]?\s*)+/i, "").trim();
-        return prefix ? `${prefix} ${inner}` : inner;
-      }
-    } catch {}
-  }
-  const singleLine = str.replace(/[\r\n\t]+/g, " ").trim();
-  return singleLine.length > 350 ? `${singleLine.slice(0, 350)}...` : singleLine;
-}
-
-export function parseRateLimitWaitSeconds(errorText) {
-  if (!errorText || typeof errorText !== "string") return 0;
-  const match =
-    errorText.match(/retry after\s+(\d+)\s*s/i) ||
-    errorText.match(/retry after\s+(\d+)\s*seconds?/i) ||
-    errorText.match(/wait\s+(\d+)\s*s/i) ||
-    errorText.match(/wait\s+(\d+)\s*seconds?/i);
-  if (match) {
-    const sec = parseInt(match[1], 10);
-    if (!isNaN(sec) && sec > 0 && sec <= 120) {
-      return sec;
-    }
-  }
-  if (/rate limit exceeded|secondary rate limit|too many requests/i.test(errorText)) {
-    return 35;
-  }
-  return 0;
-}
-
-export async function invokeMcpRawTool(serverInfo, rawName, args, onWaitNotice = null, skipLogging = false, logCategory = "chat") {
-  const maxRetries = 2;
-  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
-    let res;
-    try {
-      res = await fetch(serverInfo.postEndpoint, {
-        method: "POST",
-        headers: serverInfo.headers,
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: Date.now(),
-          method: "tools/call",
-          params: { name: rawName, arguments: args }
-        }),
-        signal: AbortSignal.timeout(120000)
-      });
-    } catch (err) {
-      if (attempt === maxRetries) throw err;
-      await new Promise((resolve) => setTimeout(resolve, 2000));
-      continue;
-    }
-
-    if (!res.ok) {
-      const txt = await res.text();
-      const waitSec = parseRateLimitWaitSeconds(txt);
-      if (waitSec > 0 && attempt < maxRetries) {
-        if (typeof onWaitNotice === "function") {
-          onWaitNotice(waitSec);
-        }
-        if (!skipLogging) {
-          addDebugLog("TOOL", `[频控保护] 接口调用触发限制，正在等待 ${waitSec + 1} 秒后自动重试...`, "", logCategory);
-        }
-        await new Promise((resolve) => setTimeout(resolve, (waitSec + 1) * 1000));
-        continue;
-      }
-      throw new Error(`MCP HTTP ${res.status}: ${txt.slice(0, 300)}`);
-    }
-
-    const data = await parseMcpResponse(res);
-    if (data.error) {
-      const errMsg = data.error.message || JSON.stringify(data.error);
-      const waitSec = parseRateLimitWaitSeconds(errMsg);
-      if (waitSec > 0 && attempt < maxRetries) {
-        if (typeof onWaitNotice === "function") {
-          onWaitNotice(waitSec);
-        }
-        if (!skipLogging) {
-          addDebugLog("TOOL", `[频控保护] 接口调用触发限制，正在等待 ${waitSec + 1} 秒后自动重试...`, "", logCategory);
-        }
-        await new Promise((resolve) => setTimeout(resolve, (waitSec + 1) * 1000));
-        continue;
-      }
-      throw new Error(errMsg);
-    }
-
-    const rawResult = data.result !== undefined ? data.result : data;
-    const isToolError = Boolean(rawResult && (rawResult.isError === true || rawResult.is_error === true));
-    const textContent = extractMcpResultContent(data);
-    const rawContent = buildCompatibleMcpContent(data, textContent);
-
-    if (isToolError) {
-      const waitSec = parseRateLimitWaitSeconds(textContent);
-      if (waitSec > 0 && attempt < maxRetries) {
-        if (typeof onWaitNotice === "function") {
-          onWaitNotice(waitSec);
-        }
-        if (!skipLogging) {
-          addDebugLog("TOOL", `[频控保护] 工具返回频率限制错误，正在等待 ${waitSec + 1} 秒后自动重试...`, "", logCategory);
-        }
-        await new Promise((resolve) => setTimeout(resolve, (waitSec + 1) * 1000));
-        continue;
-      }
-    }
-
-    return { data, rawResult, isToolError, textContent, rawContent };
-  }
-}
-
-export function extractFileContentAndSha(mcpRes) {
-  const { rawResult, textContent } = mcpRes;
-  let fileContent = "";
-  let fileSha = "";
-  let fileBranch = "";
-
-  if (rawResult && Array.isArray(rawResult.content)) {
-    for (const item of rawResult.content) {
-      if (!item) continue;
-      if (item.type === "text" && item.text) {
-        const shaMatch = item.text.match(/SHA:\s*([0-9a-f]{40})/i);
-        if (shaMatch) {
-          fileSha = shaMatch[1];
-        }
-        try {
-          const parsed = JSON.parse(item.text);
-          if (parsed && typeof parsed === "object" && typeof parsed.url === "string") {
-            const refMatch = parsed.url.match(/[?&]ref=([^&#"\s]+)/i);
-            if (refMatch && !fileBranch) {
-              fileBranch = decodeURIComponent(refMatch[1]);
-            }
-          }
-        } catch {}
-      }
-      if ((item.type === "resource" || item.type === "embedded_resource") && item.resource) {
-        if (typeof item.resource.text === "string") {
-          fileContent = item.resource.text;
-        } else if (item.resource.blob) {
-          try {
-            fileContent = Buffer.from(item.resource.blob, "base64").toString("utf8");
-          } catch {
-            fileContent = item.resource.blob;
-          }
-        }
-        if (typeof item.resource.uri === "string" && !fileBranch) {
-          const uriBranchMatch = item.resource.uri.match(/\/refs\/heads\/([^/]+)\/contents\//i);
-          if (uriBranchMatch) {
-            fileBranch = decodeURIComponent(uriBranchMatch[1]);
-          }
-        }
-      }
-    }
-  }
-
-  if (!fileContent && textContent) {
-    const shaMatch = textContent.match(/SHA:\s*([0-9a-f]{40})/i);
-    if (shaMatch && !fileSha) {
-      fileSha = shaMatch[1];
-    }
-    fileContent = textContent.replace(/^successfully downloaded[^\n]*\r?\n+/, "");
-  }
-
-  if (fileContent) {
-    const resourceMatch = fileContent.match(/^Resource Text:\s*([\s\S]*?)(?:\r?\nResource URI:|\r?\nResource MIME Type:|$)/);
-    if (resourceMatch) {
-      fileContent = resourceMatch[1];
-    }
-  }
-
-  if (!fileSha && textContent) {
-    const firstLine = textContent.split("\n")[0] || "";
-    const shaMatch = firstLine.match(/\b([0-9a-f]{40})\b/i);
-    if (shaMatch) {
-      fileSha = shaMatch[1];
-    }
-  }
-
-  return { fileContent, fileSha, fileBranch };
-}
-
-function getOccurrenceIndices(str, target) {
-  const indices = [];
-  let pos = 0;
-  while ((pos = str.indexOf(target, pos)) !== -1) {
-    indices.push(pos);
-    pos += Math.max(1, target.length);
-  }
-  return indices;
-}
-
-function mapLfIndexToCrlf(crlfStr, lfIndex) {
-  let lfCount = 0;
-  let crlfIndex = 0;
-  while (lfCount < lfIndex && crlfIndex < crlfStr.length) {
-    if (crlfStr[crlfIndex] === "\r" && crlfStr[crlfIndex + 1] === "\n") {
-      crlfIndex += 2;
-      lfCount += 1;
-    } else {
-      crlfIndex += 1;
-      lfCount += 1;
-    }
-  }
-  return crlfIndex;
-}
-
-// 词法单元提取：将代码分割为独立 token 并记录在原字符串中的起始与结束偏移
-function tokenizeWithPositions(str) {
-  const tokens = [];
-  const regex = /[A-Za-z0-9_\u4e00-\u9fa5]+|[^\s\w]/g;
-  let match;
-  while ((match = regex.exec(str)) !== null) {
-    tokens.push({
-      text: match[0],
-      start: match.index,
-      end: match.index + match[0].length
-    });
-  }
-  return tokens;
-}
-
-// 精确语法 Token-Stream 匹配：100% 顺序匹配每个语法符号，仅忽略多余空白、空行与缩进差异
-function findTokenStreamMatch(content, oldStr, newStr, searchOffset = 0) {
-  const contentTokens = tokenizeWithPositions(content);
-  const oldTokens = tokenizeWithPositions(oldStr);
-
-  if (oldTokens.length === 0 || oldTokens.length > contentTokens.length) {
-    return null;
-  }
-
-  const matches = [];
-  const firstText = oldTokens[0].text;
-  const mLen = oldTokens.length;
-
-  for (let i = 0; i <= contentTokens.length - mLen; i += 1) {
-    if (contentTokens[i].text !== firstText) continue;
-
-    let match = true;
-    for (let j = 1; j < mLen; j += 1) {
-      if (contentTokens[i + j].text !== oldTokens[j].text) {
-        match = false;
-        break;
-      }
-    }
-    if (match) {
-      matches.push(i);
-    }
-  }
-
-  if (matches.length === 0) return null;
-
-  let chosenTokenIdx = matches[0];
-  if (matches.length > 1) {
-    const afterOffset = matches.filter((idx) => contentTokens[idx].start >= searchOffset);
-    if (afterOffset.length === 1) {
-      chosenTokenIdx = afterOffset[0];
-    } else if (afterOffset.length > 1) {
-      const lineNumbers = afterOffset.map((idx) => content.slice(0, contentTokens[idx].start).split("\n").length);
-      return { multiple: true, lineNumbers };
-    } else {
-      const lineNumbers = matches.map((idx) => content.slice(0, contentTokens[idx].start).split("\n").length);
-      return { multiple: true, lineNumbers };
-    }
-  }
-
-  const startToken = contentTokens[chosenTokenIdx];
-  const endToken = contentTokens[chosenTokenIdx + mLen - 1];
-
-  let startChar = startToken.start;
-  let endChar = endToken.end;
-
-  // 检查首行缩进对齐
-  const lineStart = content.lastIndexOf("\n", startChar - 1) + 1;
-  const leadingInContent = content.slice(lineStart, startChar);
-
-  let replacement = newStr;
-  if (/^[ \t]+$/.test(leadingInContent)) {
-    const oldLeading = oldStr.match(/^[ \t]+/)?.[0] || "";
-    const newLeading = newStr.match(/^[ \t]+/)?.[0] || "";
-
-    if (newLeading.startsWith(leadingInContent) || oldLeading.startsWith(leadingInContent)) {
-      startChar = lineStart;
-    } else if (newLeading !== leadingInContent) {
-      const newLines = newStr.replace(/\r\n/g, "\n").split("\n");
-      const aligned = newLines.map((line, idx) => {
-        if (!line.trim()) return line;
-        if (idx === 0) return line;
-        if (line.startsWith(newLeading)) {
-          return leadingInContent + line.slice(newLeading.length);
-        }
-        return leadingInContent + line;
-      });
-      replacement = content.includes("\r\n") ? aligned.join("\r\n") : aligned.join("\n");
-    }
-  }
-
-  if (content.includes("\r\n") && !replacement.includes("\r\n")) {
-    replacement = replacement.replace(/\n/g, "\r\n");
-  }
-
-  return { start: startChar, end: endChar, replacement };
-}
-
-// 安全通配断片匹配：仅识别独立行的 MISMATCH 或 // ... 注释（绝不误伤 Swift 的 1...6 闭区间操作符）
-function findWildcardMatch(content, oldStr, newStr, searchOffset = 0) {
-  const wildcardPattern = /(?:^\s*MISMATCH\s*$|^\s*\/\/\s*\.{3,}.*$|^\s*\/\*\s*\.{3,}\s*\*\/\s*$)/m;
-  if (!wildcardPattern.test(oldStr)) return null;
-
-  const rawSegments = oldStr.split(wildcardPattern);
-  const segments = rawSegments.map((s) => s.trim()).filter((s) => s.length >= 20);
-  if (segments.length < 2) return null;
-
-  const headSegment = segments[0];
-  const tailSegment = segments[segments.length - 1];
-
-  const headMatch =
-    findTokenStreamMatch(content, headSegment, "", searchOffset) ||
-    findLineBasedMatch(content.replace(/\r\n/g, "\n"), headSegment.replace(/\r\n/g, "\n"), "");
-  if (!headMatch || headMatch.multiple) return null;
-
-  const tailMatch =
-    findTokenStreamMatch(content, tailSegment, "", headMatch.end) ||
-    findLineBasedMatch(content.replace(/\r\n/g, "\n"), tailSegment.replace(/\r\n/g, "\n"), "");
-  if (!tailMatch || tailMatch.multiple || tailMatch.end <= headMatch.start) return null;
-
-  // 限制跨度不超过 60 行，防止跨函数误删代码
-  const spannedLines = content.slice(headMatch.start, tailMatch.end).split("\n").length;
-  if (spannedLines > 60) return null;
-
-  return {
-    start: headMatch.start,
-    end: tailMatch.end,
-    replacement: newStr
-  };
-}
-
-// 精准上下文诊断：当匹配失败时，向大模型直接展示文件最接近位置的前后 25 行真实代码（带行号），让模型无需重新调工具即可立即自愈
-function findNearMatchDiagnostic(content, oldStr) {
-  const contentLines = content.replace(/\r\n/g, "\n").split("\n");
-  const oldLines = oldStr.replace(/\r\n/g, "\n").split("\n").map((l) => l.trim()).filter((l) => l.length > 4);
-  if (oldLines.length === 0 || contentLines.length === 0) return "";
-
-  // 1. 尝试寻找首行或特征最明显的行在文件中的精确位置
-  let anchorLineIdx = -1;
-  for (const cand of oldLines) {
-    if (/^(?:struct|class|enum|func|private\s+var|var|let)\s+/.test(cand) || cand.length >= 12) {
-      const idx = contentLines.findIndex((cl) => cl.trim() === cand || cl.includes(cand));
-      if (idx !== -1) {
-        anchorLineIdx = idx;
-        break;
-      }
-    }
-  }
-
-  // 2. 如果未找到单行匹配，使用词法滑窗寻找最接近行
-  if (anchorLineIdx === -1) {
-    const contentTokens = tokenizeWithPositions(content);
-    const oldTokens = tokenizeWithPositions(oldStr);
-    if (oldTokens.length >= 4 && contentTokens.length >= 4) {
-      const mLen = oldTokens.length;
-      let bestScore = 0;
-      let bestIdx = -1;
-      const step = Math.max(1, Math.floor(mLen / 10));
-      const sampleTexts = [];
-      for (let s = 0; s < mLen; s += step) sampleTexts.push(oldTokens[s].text);
-
-      const windowSize = Math.min(contentTokens.length, Math.floor(mLen * 1.4) + 5);
-      for (let i = 0; i <= contentTokens.length - windowSize; i += Math.max(1, Math.floor(step / 2))) {
-        const windowSet = new Set(contentTokens.slice(i, i + windowSize).map((t) => t.text));
-        let score = 0;
-        for (const t of sampleTexts) {
-          if (windowSet.has(t)) score += 1;
-        }
-        if (score > bestScore) {
-          bestScore = score;
-          bestIdx = i;
-        }
-      }
-      if (bestIdx >= 0 && bestScore / sampleTexts.length >= 0.5) {
-        anchorLineIdx = content.slice(0, contentTokens[bestIdx].start).split("\n").length - 1;
-      }
-    }
-  }
-
-  if (anchorLineIdx !== -1) {
-    const startLine = Math.max(0, anchorLineIdx - 5);
-    const endLine = Math.min(contentLines.length, anchorLineIdx + 25);
-    const snippetWithLines = contentLines
-      .slice(startLine, endLine)
-      .map((line, idx) => `${startLine + idx + 1}: ${line}`)
-      .join("\n");
-    return `在文件第 ${anchorLineIdx + 1} 行附近定位到相关代码区域，当前文件的真实代码如下（第 ${startLine + 1}~${endLine} 行）：\n\`\`\`\n${snippetWithLines}\n\`\`\`\n请直接复制上述真实代码（不含行号前缀）作为 old_str 重新调用！`;
-  }
-
-  return "";
-}
-
-function findLineBasedMatch(contentLf, oldStrLf, newStrLf, originalContentWithCrlf = null) {
-  const contentLines = contentLf.split("\n");
-  const oldLines = oldStrLf.split("\n");
-  const isCrlf = Boolean(originalContentWithCrlf);
-
-  if (oldLines.length === 0) return null;
-
-  // 1. 去除行尾不可见字符精确匹配
-  let matchedIndices = [];
-  for (let i = 0; i <= contentLines.length - oldLines.length; i += 1) {
-    let match = true;
-    for (let j = 0; j < oldLines.length; j += 1) {
-      if (contentLines[i + j].trimEnd() !== oldLines[j].trimEnd()) {
-        match = false;
-        break;
-      }
-    }
-    if (match) {
-      matchedIndices.push(i);
-    }
-  }
-
-  // 2. 去除首尾空格匹配
-  let isFullTrim = false;
-  if (matchedIndices.length === 0) {
-    for (let i = 0; i <= contentLines.length - oldLines.length; i += 1) {
-      let match = true;
-      for (let j = 0; j < oldLines.length; j += 1) {
-        if (contentLines[i + j].trim() !== oldLines[j].trim()) {
-          match = false;
-          break;
-        }
-      }
-      if (match) {
-        matchedIndices.push(i);
-      }
-    }
-    isFullTrim = matchedIndices.length > 0;
-  }
-
-  if (matchedIndices.length === 1) {
-    const lineStart = matchedIndices[0];
-    const lineEnd = lineStart + oldLines.length;
-    const charStartLf = contentLines.slice(0, lineStart).join("\n").length + (lineStart > 0 ? 1 : 0);
-    const matchedBlockLf = contentLines.slice(lineStart, lineEnd).join("\n");
-    const charEndLf = charStartLf + matchedBlockLf.length;
-
-    let replacementLf = newStrLf;
-    if (isFullTrim && oldLines.length > 0) {
-      const origFirstIndent = (contentLines[lineStart].match(/^(\s*)/) || ["", ""])[1];
-      const modelFirstIndent = (oldLines[0].match(/^(\s*)/) || ["", ""])[1];
-      if (origFirstIndent !== modelFirstIndent) {
-        const newLines = newStrLf.split("\n");
-        replacementLf = newLines
-          .map((line) => {
-            if (!line.trim()) return line;
-            if (line.startsWith(modelFirstIndent)) {
-              return origFirstIndent + line.slice(modelFirstIndent.length);
-            }
-            return origFirstIndent + line;
-          })
-          .join("\n");
-      }
-    }
-
-    if (isCrlf) {
-      const realStart = mapLfIndexToCrlf(originalContentWithCrlf, charStartLf);
-      const realMatched = matchedBlockLf.replace(/\n/g, "\r\n");
-      const realEnd = realStart + realMatched.length;
-      return {
-        start: realStart,
-        end: realEnd,
-        replacement: replacementLf.replace(/\n/g, "\r\n")
-      };
-    }
-
-    return {
-      start: charStartLf,
-      end: charEndLf,
-      replacement: replacementLf
-    };
-  }
-
-  if (matchedIndices.length > 1) {
-    return { multiple: true, lineNumbers: matchedIndices.map((idx) => idx + 1) };
-  }
-
-  return null;
-}
-
-function findBestSnippetMatch(content, oldStr, newStr, filePath, editIndex, searchOffset = 0) {
-  const isCrlf = content.includes("\r\n");
-
-  // 1. 原生精确匹配
-  let idx = content.indexOf(oldStr, searchOffset);
-  if (idx === -1 && searchOffset > 0) {
-    idx = content.indexOf(oldStr);
-  }
-  if (idx !== -1) {
-    const occurrences = getOccurrenceIndices(content, oldStr);
-    if (occurrences.length === 1) {
-      return { start: idx, end: idx + oldStr.length, replacement: newStr };
-    }
-    const afterOffset = occurrences.filter((o) => o >= searchOffset);
-    if (afterOffset.length === 1) {
-      const chosen = afterOffset[0];
-      return { start: chosen, end: chosen + oldStr.length, replacement: newStr };
-    }
-    const lineNumbers = occurrences.map((o) => content.slice(0, o).split("\n").length);
-    throw new Error(
-      `在文件 ${filePath} 中第 ${editIndex} 处找到多处 (${occurrences.length} 处) 完全相同的待替换片段 (位于第 ${lineNumbers.join(", ")} 行)。为防止误替换，请在 old_str 中包含周围 1~2 行上下文代码以确保唯一性。待查找代码: ${oldStr.slice(0, 100)}`
-    );
-  }
-
-  // 2. 换行符 LF 归一化匹配
-  const contentLf = content.replace(/\r\n/g, "\n");
-  const oldStrLf = oldStr.replace(/\r\n/g, "\n");
-  const newStrLf = newStr.replace(/\r\n/g, "\n");
-
-  let lfIdx = contentLf.indexOf(oldStrLf);
-  if (lfIdx !== -1) {
-    const occurrences = getOccurrenceIndices(contentLf, oldStrLf);
-    if (occurrences.length === 1) {
-      const realStart = isCrlf ? mapLfIndexToCrlf(content, lfIdx) : lfIdx;
-      const matchedText = isCrlf ? oldStrLf.replace(/\n/g, "\r\n") : oldStrLf;
-      return {
-        start: realStart,
-        end: realStart + matchedText.length,
-        replacement: isCrlf ? newStrLf.replace(/\n/g, "\r\n") : newStrLf
-      };
-    }
-    const lineNumbers = occurrences.map((o) => contentLf.slice(0, o).split("\n").length);
-    throw new Error(
-      `在文件 ${filePath} 中第 ${editIndex} 处找到多处 (${occurrences.length} 处) 完全相同的待替换片段 (位于第 ${lineNumbers.join(", ")} 行)。为防止误替换，请在 old_str 中包含周围 1~2 行上下文代码以确保唯一性。待查找代码: ${oldStr.slice(0, 100)}`
-    );
-  }
-
-  // 3. 去除首尾空白后匹配
-  const trimmedOld = oldStrLf.trim();
-  if (trimmedOld) {
-    const trimmedOccurrences = getOccurrenceIndices(contentLf, trimmedOld);
-    if (trimmedOccurrences.length === 1) {
-      const tIdx = trimmedOccurrences[0];
-      const realStart = isCrlf ? mapLfIndexToCrlf(content, tIdx) : tIdx;
-      const matchedText = isCrlf ? trimmedOld.replace(/\n/g, "\r\n") : trimmedOld;
-      return {
-        start: realStart,
-        end: realStart + matchedText.length,
-        replacement: isCrlf ? newStr.replace(/\r?\n/g, "\r\n") : newStr.replace(/\r\n/g, "\n")
-      };
-    }
-  }
-
-  // 4. 行级修剪容错匹配
-  const lineMatch = findLineBasedMatch(contentLf, oldStrLf, newStrLf, isCrlf ? content : null);
-  if (lineMatch) {
-    if (lineMatch.multiple) {
-      throw new Error(
-        `在文件 ${filePath} 中第 ${editIndex} 处行级匹配到多处 (${lineMatch.lineNumbers.length} 处) 相似片段 (位于第 ${lineMatch.lineNumbers.join(", ")} 行)。请在 old_str 中包含周围上下文代码以唯一确定修改位置。`
-      );
-    }
-    return lineMatch;
-  }
-
-  // 5. 安全通配断片匹配
-  const wildcardMatch = findWildcardMatch(content, oldStr, newStr, searchOffset);
-  if (wildcardMatch) {
-    addDebugLog("TOOL", `[通配自愈] 成功根据省略通配符匹配并完成代码块替换: ${filePath}`);
-    return wildcardMatch;
-  }
-
-  // 6. 精确 Token-Stream 语法流匹配（100% 顺序匹配语法单元，兼容任意空行与缩进差异）
-  const tokenMatch = findTokenStreamMatch(content, oldStr, newStr, searchOffset);
-  if (tokenMatch) {
-    if (tokenMatch.multiple) {
-      throw new Error(
-        `在文件 ${filePath} 中第 ${editIndex} 处语法匹配到多处 (${tokenMatch.lineNumbers.length} 处) 相似片段 (位于第 ${tokenMatch.lineNumbers.join(", ")} 行)。请在 old_str 中包含更多上下文代码以确保唯一性。`
-      );
-    }
-    return tokenMatch;
-  }
-
-  // 7. 精准定位诊断（返回实际文件对应位置的 30 行真实代码）
-  const diagnostic = findNearMatchDiagnostic(content, oldStr);
-  throw new Error(
-    `在文件 ${filePath} 中未找到第 ${editIndex} 处待替换片段 (old_str)。${diagnostic ? `\n【真实代码定位】${diagnostic}\n` : ""}待查找片段预览:\n${oldStr.slice(0, 200)}`
-  );
-}
-
-export function applyStringReplacements(content, edits, filePath = "") {
-  let updated = content;
-  let lastEnd = 0;
-
-  for (let i = 0; i < edits.length; i += 1) {
-    const { old_str, new_str } = edits[i];
-    if (typeof old_str !== "string" || typeof new_str !== "string") {
-      throw new Error(`第 ${i + 1} 处修改参数错误：old_str 与 new_str 必须为字符串`);
-    }
-    if (old_str === new_str) {
-      throw new Error(`第 ${i + 1} 处修改无效：old_str 与 new_str 完全相同`);
-    }
-
-    const match = findBestSnippetMatch(updated, old_str, new_str, filePath, i + 1, lastEnd);
-    if (!match) {
-      throw new Error(
-        `在文件 ${filePath} 中未找到第 ${i + 1} 处待替换片段 (old_str)。请核对代码内容、空格缩进及换行是否准确。待查找片段预览:\n${old_str.slice(0, 200)}`
-      );
-    }
-
-    updated = updated.slice(0, match.start) + match.replacement + updated.slice(match.end);
-    lastEnd = match.start + match.replacement.length;
-  }
-
+  addDebugLog("MCP_SERVER", `MCP 服务配置已更新: ${updated.name}`, { serverId: id, url: updated.url, toolCount: updated.toolCount }, "mcp");
   return updated;
 }
 
-export async function executeGithubEditFile(serverInfo, readToolRawName, writeToolRawName, args, onWaitNotice = null, skipLogging = false, logCategory = "chat") {
-  const { owner, repo, path: filePath, old_str, new_str, edits, message, branch } = args || {};
-
-  if (!owner || !repo || !filePath) {
-    throw new Error("缺少必需参数：owner, repo, path");
-  }
-
-  let editList = [];
-  if (Array.isArray(edits) && edits.length > 0) {
-    editList = edits;
-  } else if (typeof old_str === "string" && typeof new_str === "string") {
-    editList = [{ old_str, new_str }];
-  } else {
-    throw new Error("必须提供 old_str 与 new_str，或 edits 数组");
-  }
-
-  const getArgs = { owner, repo, path: filePath };
-  if (branch) {
-    getArgs.ref = branch;
-  }
-
-  if (!skipLogging) {
-    addDebugLog("TOOL", `[局部编辑] 读取文件: ${owner}/${repo}/${filePath} (分支: ${branch || "默认"})`, getArgs, logCategory);
-  }
-  const getRes = await invokeMcpRawTool(serverInfo, readToolRawName, getArgs, onWaitNotice, skipLogging, logCategory);
-  if (getRes.isToolError) {
-    throw new Error(`读取文件失败: ${getRes.textContent.slice(0, 300)}`);
-  }
-
-  const { fileContent, fileSha, fileBranch } = extractFileContentAndSha(getRes);
-  if (!fileSha) {
-    throw new Error(`未能获取到文件 SHA，请确认文件是否存在: ${filePath}`);
-  }
-
-  // 支持批量渐进式应用：若多处独立修改中前几处成功、个别失败，且成功部分保持括号平衡，则先保存成功部分并仅报告失败项
-  let updatedContent = fileContent;
-  let lastEnd = 0;
-  const appliedIndices = [];
-  const failedErrors = [];
-
-  for (let i = 0; i < editList.length; i += 1) {
-    const { old_str: oStr, new_str: nStr } = editList[i];
-    if (typeof oStr !== "string" || typeof nStr !== "string") {
-      failedErrors.push(`第 ${i + 1} 处修改参数错误：old_str 与 new_str 必须为字符串`);
-      continue;
-    }
-    if (oStr === nStr) {
-      continue;
-    }
-
-    try {
-      const match = findBestSnippetMatch(updatedContent, oStr, nStr, filePath, i + 1, lastEnd);
-      if (match) {
-        // 检查该处独立修改是否破坏大括号平衡
-        const oldBraces = (oStr.match(/\{/g) || []).length - (oStr.match(/\}/g) || []).length;
-        const newBraces = (nStr.match(/\{/g) || []).length - (nStr.match(/\}/g) || []).length;
-        updatedContent = updatedContent.slice(0, match.start) + match.replacement + updatedContent.slice(match.end);
-        lastEnd = match.start + match.replacement.length;
-        appliedIndices.push({ index: i + 1, balanced: oldBraces === newBraces });
-      }
-    } catch (err) {
-      failedErrors.push(err.message);
-    }
-  }
-
-  if (appliedIndices.length === 0) {
-    throw new Error(failedErrors.join("\n\n") || "替换前后文件内容未发生任何改变");
-  }
-
-  // 如果存在部分失败且已应用的部分大括号不平衡（说明多处修改之间有跨块的括号依赖），则安全起见整体报错回滚
-  const allAppliedBalanced = appliedIndices.every((item) => item.balanced);
-  if (failedErrors.length > 0 && !allAppliedBalanced) {
-    throw new Error(failedErrors.join("\n\n"));
-  }
-
-  if (updatedContent === fileContent) {
-    throw new Error("替换前后文件内容未发生任何改变");
-  }
-
-  let targetBranch = (branch || "").trim() || fileBranch;
-  if (!targetBranch) {
-    const branchTool = findServerTool(serverInfo, ["list_branches"]);
-    if (branchTool) {
-      try {
-        const branchRes = await invokeMcpRawTool(serverInfo, branchTool.rawName, { owner, repo }, onWaitNotice, skipLogging, logCategory);
-        if (!branchRes.isToolError && branchRes.textContent) {
-          const names = Array.from(branchRes.textContent.matchAll(/"name"\s*:\s*"([^"]+)"/g), (m) => m[1]);
-          if (names.length > 0) {
-            targetBranch = names.includes("main") ? "main" : (names.includes("master") ? "master" : names[0]);
-          }
-        }
-      } catch {}
-    }
-  }
-  if (!targetBranch) {
-    targetBranch = "main";
-  }
-
-  const commitMsg = (message || "").trim() || `Update ${filePath}`;
-  const putArgs = {
-    owner,
-    repo,
-    path: filePath,
-    content: updatedContent,
-    message: commitMsg,
-    sha: fileSha,
-    branch: targetBranch
-  };
-
-  if (!skipLogging) {
-    addDebugLog("TOOL", `[局部编辑] 提交更新到 GitHub: ${owner}/${repo}/${filePath} (SHA: ${fileSha})`, { owner, repo, path: filePath, branch: targetBranch, message: commitMsg }, logCategory);
-  }
-  const putRes = await invokeMcpRawTool(serverInfo, writeToolRawName, putArgs, onWaitNotice, skipLogging, logCategory);
-  if (putRes.isToolError) {
-    throw new Error(`提交更新失败: ${putRes.textContent.slice(0, 300)}`);
-  }
-
-  if (failedErrors.length > 0) {
-    return {
-      isError: false,
-      content: `【部分修改已成功提交】已成功应用并提交了 ${appliedIndices.length}/${editList.length} 处修改（第 ${appliedIndices.map((a) => a.index).join(", ")} 处已生效并写入 GitHub，无需重复修改！）。\n但以下 ${failedErrors.length} 处未匹配成功，请仅针对未成功的项根据下方真实代码单独发起一次补充修改：\n\n${failedErrors.join("\n\n")}`
-    };
-  }
-
-  return {
-    isError: false,
-    content: `局部修改成功并已提交到 GitHub。仓库: ${owner}/${repo}，文件: ${filePath}，分支: ${targetBranch}，修改处数: ${appliedIndices.length}，原文件 SHA: ${fileSha}`
-  };
+export function extractMcpResultContent(result) {
+  const content = Array.isArray(result?.content) ? result.content : [];
+  return content.map((block) => {
+    if (typeof block?.text === "string") return block.text;
+    if (block?.resource?.text) return block.resource.text;
+    if (block?.type === "image") return "[image content]";
+    return "";
+  }).filter(Boolean).join("\n\n");
 }
 
-export function findServerTool(serverInfo, targetNames) {
-  if (!Array.isArray(serverInfo.tools)) return null;
-  return serverInfo.tools.find((t) =>
-    targetNames.some((n) => t.rawName === n || t.rawName.endsWith(`_${n}`))
-  );
+function parseRetryAfter(text) {
+  const match = String(text || "").match(/(?:retry after|wait)\s+(\d+)\s*(?:s|seconds?)/i);
+  if (match) {
+    const seconds = Number(match[1]);
+    if (seconds > 0 && seconds <= 120) return seconds;
+  }
+  return /rate limit exceeded|secondary rate limit|too many requests/i.test(String(text || "")) ? 35 : 0;
 }
 
-export function registerVirtualTools(serverInfo) {
-  if (!serverInfo || !Array.isArray(serverInfo.tools)) return;
-  const readTool = findServerTool(serverInfo, ["get_file_contents"]);
-  const writeTool = findServerTool(serverInfo, ["create_or_update_file"]);
-  if (!readTool || !writeTool) return;
-
-  const serverNameLower = (serverInfo.name || "").toLowerCase();
-  const safePrefix = serverNameLower.replace(/[^a-z0-9_]/g, "_");
-  const virtualRawName = readTool.rawName.startsWith("github_") || serverNameLower.includes("github")
-    ? "github_edit_file"
-    : "edit_file";
-
-  const toolKey = virtualRawName.startsWith(`${safePrefix}_`)
-    ? virtualRawName
-    : `${safePrefix}_${virtualRawName}`;
-
-  const virtualInputSchema = {
-    type: "object",
-    properties: {
-      owner: {
-        type: "string",
-        description: "仓库所有者 (用户名或组织名)"
-      },
-      repo: {
-        type: "string",
-        description: "仓库名称"
-      },
-      path: {
-        type: "string",
-        description: "要修改的文件路径"
-      },
-      old_str: {
-        type: "string",
-        description: "待替换的原始代码片段。必须在文件中唯一存在，建议包含周围几行上下文以确保唯一性。"
-      },
-      new_str: {
-        type: "string",
-        description: "替换后的新代码片段。"
-      },
-      edits: {
-        type: "array",
-        description: "可选的多处同时替换列表。每项包含 old_str 与 new_str。若提供此项则按顺序批量替换。",
-        items: {
-          type: "object",
-          properties: {
-            old_str: { type: "string", description: "待替换的代码片段" },
-            new_str: { type: "string", description: "替换后的新代码片段" }
-          },
-          required: ["old_str", "new_str"]
-        }
-      },
-      message: {
-        type: "string",
-        description: "Git 提交说明"
-      },
-      branch: {
-        type: "string",
-        description: "目标分支名称 (可选，默认使用仓库默认分支)"
-      }
-    },
-    required: ["owner", "repo", "path", "message"]
-  };
-
-  let virtualTool = serverInfo.tools.find((t) => t.key === toolKey || t.rawName === virtualRawName);
-  if (!virtualTool) {
-    virtualTool = {
-      key: toolKey,
-      rawName: virtualRawName,
-      description: "局部编辑 GitHub 仓库中的指定文件。通过比对替换指定的代码片段（old_str -> new_str），自动拉取最新文件、完成局部替换并提交更新，无需全量读取或全量重写。",
-      inputSchema: virtualInputSchema,
-      enabled: true,
-      status: "supported",
-      statusMessage: "支持",
-      isVirtual: true,
-      openAiTool: {
-        type: "function",
-        function: {
-          name: virtualRawName,
-          description: "局部编辑 GitHub 仓库中的指定文件。通过比对替换指定的代码片段（old_str -> new_str），自动拉取最新文件、完成局部替换并提交更新，无需全量读取或全量重写。",
-          parameters: virtualInputSchema
-        }
-      }
-    };
-    serverInfo.tools.unshift(virtualTool);
-    serverInfo.toolCount = serverInfo.tools.length;
-  } else {
-    virtualTool.isVirtual = true;
-    virtualTool.inputSchema = virtualInputSchema;
-    virtualTool.status = "supported";
-    virtualTool.statusMessage = "支持";
-    if (virtualTool.openAiTool?.function) {
-      virtualTool.openAiTool.function.name = virtualRawName;
-      virtualTool.openAiTool.function.description = "局部编辑 GitHub 仓库中的指定文件。通过比对替换指定的代码片段（old_str -> new_str），自动拉取最新文件、完成局部替换并提交更新，无需全量读取或全量重写。";
-      virtualTool.openAiTool.function.parameters = virtualInputSchema;
-    }
-  }
-
-  if (serverInfo.status === "active" && virtualTool.enabled !== false) {
-    const virtualHandler = async (args, onWaitNotice, skipLogging = false, logCategory = "chat") => {
-      return await executeGithubEditFile(serverInfo, readTool.rawName, writeTool.rawName, args, onWaitNotice, skipLogging, logCategory);
-    };
-    const regItem = {
-      serverId: serverInfo.id,
-      serverName: serverInfo.name,
-      rawName: virtualRawName,
-      isVirtual: true,
-      handler: virtualHandler
-    };
-    mcpToolRegistry.set(toolKey, regItem);
-    // 默认双向注册：原生名 edit_file 与 github_edit_file 均可被直接 O(1) 索引并调用
-    mcpToolRegistry.set(virtualRawName, regItem);
-    mcpToolRegistry.set("edit_file", regItem);
-    mcpToolRegistry.set("github_edit_file", regItem);
-  }
-}
-
-export async function callMcpTool(toolKey, args, onWaitNoticeOrOptions = null, maybeSkipLogging = false) {
-  let onWaitNotice = null;
-  let skipLogging = false;
-  let logCategory = "chat";
-
-  if (typeof onWaitNoticeOrOptions === "function") {
-    onWaitNotice = onWaitNoticeOrOptions;
-    skipLogging = Boolean(maybeSkipLogging);
-  } else if (onWaitNoticeOrOptions && typeof onWaitNoticeOrOptions === "object") {
-    onWaitNotice = onWaitNoticeOrOptions.onWaitNotice || null;
-    skipLogging = Boolean(onWaitNoticeOrOptions.skipLogging);
-    if (onWaitNoticeOrOptions.logCategory) {
-      logCategory = onWaitNoticeOrOptions.logCategory;
-    }
-  } else {
-    skipLogging = Boolean(maybeSkipLogging);
-  }
-
-  const info = findToolInfo(toolKey);
-  if (!info) throw new Error(`未找到工具：${toolKey}`);
-
-  // 1. 仅在内部 Agent 对话模式下拦截使用外部爬虫读取 GitHub 仓库代码；外部 MCP 模式完全保持原生不拦截
-  if (logCategory !== "mcp") {
-    const isWebCrawler =
-      /firecrawl|scrape|crawl|browser|puppeteer|page|web_search/i.test(toolKey) ||
-      /firecrawl|scrape|crawl|browser|puppeteer|page|web_search/i.test(info?.rawName || "");
-    const targetUrl = String(args?.url || args?.start_url || "").toLowerCase();
-    if (isWebCrawler && (targetUrl.includes("raw.githubusercontent.com") || targetUrl.includes("github.com"))) {
-      return {
-        isError: true,
-        content: JSON.stringify({
-          error:
-            "【工具使用规范拦截】严禁使用网络爬虫/网页抓取工具爬取 GitHub 仓库或 raw.githubusercontent.com 代码！当前已挂载官方 GitHub 工具，请必须直接调用 `get_file_contents(owner, repo, path)` 获取最新纯源码！"
-        })
-      };
-    }
-  }
-
-  const isCfExecute =
-    (toolKey.toLowerCase().includes("cloudflare") || (info?.serverName || "").toLowerCase().includes("cloudflare")) &&
-    (toolKey.endsWith("execute") || info?.rawName === "execute");
-
-  if (isCfExecute && logCategory !== "mcp") {
-    if (typeof args?.account_id === "string" && (args.account_id.includes("@") || args.account_id.includes(" ") || args.account_id.includes("Account"))) {
-      return {
-        isError: true,
-        content: JSON.stringify({
-          error: `【Cloudflare 参数错误】传入的 account_id ("${args.account_id}") 不是有效的 32 位十六进制 Account ID！切勿使用邮箱或账户名。请直接在 code 脚本中使用全局预置的 \`accountId\` 变量，或使用 32 位十六进制 ID。`
-        })
-      };
-    }
-  }
-
-  if (isCfExecute && typeof args?.code === "string" && logCategory !== "mcp") {
-    const rawCode = args.code;
-    if (
-      rawCode.includes("DEFAULT_BASE_URL") ||
-      /fetch\s*\(\s*[`'"]https?:\/\/api\.cloudflare\.com/i.test(rawCode) ||
-      /fetch\s*\(\s*DEFAULT_BASE_URL/i.test(rawCode)
-    ) {
-      return {
-        isError: true,
-        content: JSON.stringify({
-          error:
-            "【Cloudflare execute 规范拦截】检测到代码中试图自行定义 DEFAULT_BASE_URL 或使用原生 fetch 请求 Cloudflare API。沙箱中已内置注入了带有鉴权的全局客户端 `cloudflare.request({ method, path, body })` 与全局变量 `accountId`。直接使用原生 fetch 会因缺少内置鉴权被 Cloudflare 拦截并返回 403 Forbidden（导致 Unexpected token 'F' 报错）。请改用 `return await cloudflare.request({ method: 'GET', path: `/accounts/${accountId}/...` })` 格式。"
-        })
-      };
-    }
-  }
-
-  const startTime = Date.now();
-  if (typeof info.handler === "function") {
-    try {
-      const res = await info.handler(args, onWaitNotice, skipLogging, logCategory);
-      const duration = Date.now() - startTime;
-      const isError = Boolean(res && res.isError);
-      const content = typeof res?.content === "string" ? res.content : JSON.stringify(res || {});
-      const rawContent = Array.isArray(res?.content)
-        ? res.content
-        : [{ type: "text", text: content }];
-      if (!skipLogging) {
-        addDebugLog(
-          isError ? "ERROR" : "TOOL",
-          `虚拟 MCP 工具 [${info.rawName || toolKey}] 执行${isError ? "失败" : "成功"} - 耗时 ${duration}ms`,
-          {
-            arguments: args,
-            outputPreview: content.slice(0, 500)
-          },
-          logCategory
-        );
-      }
-      return { isError, content, rawContent };
-    } catch (err) {
-      const duration = Date.now() - startTime;
-      const msg = err instanceof Error ? err.message : String(err);
-      if (!skipLogging) {
-        addDebugLog("ERROR", `虚拟 MCP 工具 [${info.rawName || toolKey}] 异常 - 耗时 ${duration}ms`, msg, logCategory);
-      }
-      return {
-        isError: true,
-        content: JSON.stringify({ error: msg }),
-        rawContent: [{ type: "text", text: JSON.stringify({ error: msg }) }]
-      };
-    }
-  }
-
-  try {
-    const { rawResult, isToolError, textContent, rawContent } = await invokeMcpRawTool(info, info.rawName, args, onWaitNotice, skipLogging, logCategory);
-    const duration = Date.now() - startTime;
-    if (isToolError) {
-      let refinedContent = textContent;
-      if (logCategory !== "mcp") {
-        if (isCfExecute && (textContent.includes("Unexpected token 'F'") || textContent.includes("Forbidden"))) {
-          refinedContent = `${textContent}\n\n【诊断指引】此报错通常是因为在 execute 脚本中使用了原生 fetch 请求 Cloudflare 接口导致被 403 拦截并返回纯文本。请使用沙箱内置的 \`cloudflare.request({ method, path, body })\` 与全局变量 \`accountId\`，严禁在脚本中自拼 URL 或裸调 fetch。`;
-        } else if (isCfExecute && (textContent.includes("Invalid or unexpected token") || textContent.includes("SyntaxError"))) {
-          refinedContent = `${textContent}\n\n【语法错误自愈指引】execute 代码解析失败（通常是因为在 code 字符串中直接嵌套包含反引号、模板字符串 \${...} 或大段 HTML 的源码导致的转义冲突）。\n【正确做法】：严禁在 code 中全量硬编码几十 KB 源码！请改用内存局部替换流程：\n1. 先通过 GET 读取当前脚本：const raw = await cloudflare.request({ method: 'GET', path: \`/accounts/\${accountId}/workers/scripts/\${scriptName}\`, rawBody: true });\n2. 使用 raw.replace(oldCode, newCode) 替换目标片段；\n3. 再调用 PUT 将替换后的代码更新上传。这样无需转义完整脚本，避免语法错误。`;
-        } else if (isCfExecute && (textContent.includes("is not one of this session's accounts") || textContent.includes("Could not route to /client/v4/accounts"))) {
-          refinedContent = `${textContent}\n\n【账户ID诊断指引】account_id 错误！传入的 account_id 必须为 32 位十六进制字符串（如错误提示中给出的可用账户 ID），切勿使用账户邮箱或显示名称。亦可直接使用沙箱内置的全局变量 accountId。`;
-        } else if (isCfExecute && (textContent.includes("part 'metadata'") || textContent.includes("main_module") || textContent.includes("binding") || textContent.includes("10021"))) {
-          refinedContent = `${textContent}\n\n【Cloudflare Worker 部署格式自愈指引】Cloudflare Module Worker 上传失败。规范要求且仅要求提供两个 FormData 部件：\n1. metadata：必须为 JSON 字符串对象 \`JSON.stringify({ main_module: \"worker.js\" })\`。注意：【严禁在 metadata 中传入 bindings】（因为环境变量/密钥在 GET 接口中脱敏加密，传入会导致 missing text property 校验失败；留空 bindings 会自动保留云端所有现有环境变量与密钥）！\n2. worker.js：修改后的完整脚本代码 Blob。\n标准上传代码：\nconst form = new FormData();\nform.append(\"metadata\", new Blob([JSON.stringify({ main_module: \"worker.js\" })], { type: \"application/json\" }));\nform.append(\"worker.js\", new Blob([updatedCode], { type: \"application/javascript+module\" }), \"worker.js\");\nreturn await cloudflare.request({ method: \"PUT\", path: \`/accounts/\${accountId}/workers/scripts/\${scriptName}\`, body: form });`;
-        }
-      }
-      if (!skipLogging) {
-        addDebugLog(
-          "ERROR",
-          `MCP 工具 [${info.rawName || toolKey}] 返回错误 - 耗时 ${duration}ms`,
-          {
-            arguments: args,
-            errorOutput: refinedContent.slice(0, 500)
-          },
-          logCategory
-        );
-      }
-      return {
-        isError: true,
-        content: refinedContent,
-        rawContent: (rawContent && rawContent.length > 0 && refinedContent === textContent)
-          ? rawContent
-          : [{ type: "text", text: refinedContent }]
-      };
-    }
-    if (!skipLogging) {
-      addDebugLog(
-        "TOOL",
-        `MCP 工具 [${info.rawName || toolKey}] 执行成功 - 耗时 ${duration}ms, 输出 ${textContent.length} 字符`,
-        {
-          arguments: args,
-          outputPreview: textContent.slice(0, 500)
-        },
-        logCategory
-      );
-    }
-    return {
-      isError: false,
-      content: textContent,
-      rawContent: (rawContent && rawContent.length > 0)
-        ? rawContent
-        : [{ type: "text", text: textContent }]
-    };
-  } catch (err) {
-    const duration = Date.now() - startTime;
-    let msg = err instanceof Error ? err.message : String(err);
-    if (logCategory !== "mcp") {
-      if (isCfExecute && (msg.includes("Unexpected token 'F'") || msg.includes("Forbidden"))) {
-        msg = `${msg} (诊断指引: 请使用沙箱内置的 cloudflare.request 与 accountId，严禁使用原生 fetch 或自拼 DEFAULT_BASE_URL)`;
-      } else if (isCfExecute && (msg.includes("Invalid or unexpected token") || msg.includes("SyntaxError"))) {
-        msg = `${msg} (语法自愈指引: 请勿在 code 脚本中全量硬编码大段源码字符串！建议在内存中先 GET 读取现有代码，通过 .replace(旧逻辑, 新逻辑) 局部替换后再 PUT 上传)`;
-      } else if (isCfExecute && (msg.includes("is not one of this session's accounts") || msg.includes("Could not route to /client/v4/accounts"))) {
-        msg = `${msg} (账户ID指引: account_id 必须为 32 位十六进制字符串，切勿传入邮箱或名称，建议直接使用全局变量 accountId)`;
-      } else if (isCfExecute && (msg.includes("Cannot read properties of undefined") || msg.includes("split"))) {
-        msg = `${msg} (脚本解析指引: GET 返回的 multipart 文本中不含 metadata，切勿尝试从 GET 结果中提取 metadata！提取 worker.js 请直接使用: code = raw.split('name=\"worker.js\"')[1].split(/\\r?\\n\\r?\\n/)[1]，然后构造包含 { main_module: "worker.js" } 的 FormData 发送 PUT)`;
-      } else if (isCfExecute && (msg.includes("part 'metadata'") || msg.includes("main_module") || msg.includes("binding") || msg.includes("10021"))) {
-        msg = `${msg} (Worker部署指引: 请使用 FormData 且仅添加 metadata: { main_module: "worker.js" } 与 worker.js。切勿在 metadata 中传入 bindings，留空会自动保留云端环境变量)`;
-      }
-    }
-    if (!skipLogging) {
-      addDebugLog("ERROR", `MCP 工具 [${info.rawName || toolKey}] 异常 - 耗时 ${duration}ms`, msg, logCategory);
-    }
-    throw (err instanceof Error ? new Error(msg) : new Error(String(msg)));
-  }
-}
-
-export function getAllTools() {
-  const tools = [];
-  for (const s of mcpServers.values()) {
-    if (s.status === "active") {
-      for (const t of s.tools) {
-        if (t.enabled !== false) {
-          tools.push(t.openAiTool);
-        }
-      }
-    }
-  }
-  return tools;
-}
-
-export function selectRelevantTools(userText, allTools) {
-  if (!allTools || allTools.length === 0) {
-    return [];
-  }
-  if (!userText || typeof userText !== "string") {
-    return allTools;
-  }
-
-  const text = userText.toLowerCase();
-  const isGithubCodeTask = /(?:openmcp|仓库|代码|编译|打包|commit|github|pr|swift|ios|bug|函数|组件|页面)/i.test(text);
-
-  // 代码与 GitHub 任务完全屏蔽爬虫工具，不给模型任何跑偏或偷懒的机会
-  let candidateTools = allTools;
-  if (isGithubCodeTask) {
-    candidateTools = allTools.filter((t) => {
-      const name = (t.function?.name || t.name || "").toLowerCase();
-      return !/firecrawl|crawl|scrape/i.test(name);
-    });
-  }
-
-  const scored = candidateTools.map((t) => {
-    const name = (t.function?.name || "").toLowerCase();
-    const desc = (t.function?.description || "").toLowerCase();
-    let score = 0;
-
-    const parts = name.split(/[^a-z0-9]+/);
-    for (const p of parts) {
-      if (p.length >= 3 && text.includes(p)) {
-        score += 3;
-      }
-    }
-
-    if (text.includes("git") || text.includes("github") || text.includes("仓库") || text.includes("提交") || text.includes("push") || text.includes("openmcp")) {
-      if (name.includes("git") || name.includes("push") || name.includes("commit") || name.includes("file") || name.includes("branch")) {
-        score += 8;
-      }
-    }
-
-    if (text.includes("改") || text.includes("写") || text.includes("修") || text.includes("创建") || text.includes("更新") || text.includes("替换")) {
-      if (name.includes("write") || name.includes("push") || name.includes("create") || name.includes("update") || name.includes("edit")) {
-        score += 5;
-      }
-    }
-
-    if (text.includes("搜索") || text.includes("查") || text.includes("search")) {
-      if (name.includes("search") || desc.includes("search") || desc.includes("搜索")) {
-        score += 5;
-      }
-    }
-
-    return { tool: t, score };
-  });
-
-  scored.sort((a, b) => b.score - a.score);
-  return scored.map((item) => item.tool);
-}
-
-export function isWriteTool(toolName, args = null) {
-  if (!toolName || typeof toolName !== "string") return false;
-  const lower = toolName.toLowerCase();
-  const writePatterns = [
-    "write", "create", "update", "delete", "edit", "patch",
-    "push", "modify", "merge", "fork", "cancel", "rerun",
-    "trigger", "comment", "star", "unstar", "manage"
-  ];
-  if (writePatterns.some((pattern) => lower.includes(pattern))) return true;
-
-  if (lower.includes("execute") || lower.includes("exec") || lower.includes("run") || lower.includes("bash") || lower.includes("terminal")) {
-    if (args && typeof args === "object") {
-      const codeStr = String(args.code || args.command || args.cmd || "").toLowerCase();
-      const methodStr = String(args.method || "").toLowerCase();
-      if (methodStr === "put" || methodStr === "post" || methodStr === "patch" || methodStr === "delete") return true;
-      if (/method\s*:\s*['"](?:put|post|patch|delete)['"]/i.test(codeStr)) return true;
-      if (/(?:put|post|patch|delete)\s*\(/i.test(codeStr)) return true;
-      if (/(?:rm|mv|cp|mkdir|touch|sed|git\s+commit|git\s+push|npm\s+install|yarn\s+add)/i.test(codeStr)) return true;
-    }
-  }
-  return false;
-}
-
-export async function checkAllTools(modelName) {
-  const channel = getActiveChannel();
-  if (!channel) {
-    throw new Error("请先配置 UPSTREAM_1 等上游渠道环境变量");
-  }
-  const targetUrl = upstreamChatCompletionsUrl(channel);
-
-  let targetModel = (modelName || "").trim();
-  if (!targetModel && enabledModels.size > 0) {
-    for (const m of enabledModels) {
-      const clean = m.replace(/\*/g, "").trim();
-      if (clean) {
-        targetModel = clean;
-        break;
-      }
-    }
-  }
-
-  if (!targetModel) {
-    throw new Error("未指定检测模型，请在输入框中指定要测试的上游模型名称");
-  }
-
-  let pingRes;
-  try {
-    pingRes = await fetch(targetUrl, {
+async function invokeRemoteTool(server, rawName, args) {
+  for (let attempt = 0; attempt <= 2; attempt += 1) {
+    const response = await fetch(server.postEndpoint, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${channel.apiKey}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: targetModel,
-        messages: [{ role: "user", content: "ping" }],
-        max_tokens: 1
-      }),
-      signal: AbortSignal.timeout(20000)
+      headers: server.headers,
+      body: JSON.stringify({ jsonrpc: "2.0", id: crypto.randomUUID(), method: "tools/call", params: { name: rawName, arguments: args } }),
+      signal: AbortSignal.timeout(120000)
     });
-  } catch (err) {
-    throw new Error(`上游请求失败: ${err.message}。未修改任何工具状态`);
-  }
-
-  if (!pingRes.ok) {
-    const errText = await pingRes.text();
-    let msg = errText;
-    try {
-      const errJson = JSON.parse(errText);
-      msg = errJson.error?.message || errText;
-    } catch {}
-    throw new Error(`上游模型 [${targetModel}] 调用报错 (${pingRes.status}): ${msg.slice(0, 120)}。未修改任何工具状态`);
-  }
-
-  let total = 0;
-  let supported = 0;
-  let unsupported = 0;
-
-  for (const s of mcpServers.values()) {
-    if (!Array.isArray(s.tools) || s.tools.length === 0) continue;
-
-    for (const t of s.tools) {
-      total += 1;
-
-      if (t.isVirtual) {
-        supported += 1;
-        t.status = "supported";
-        t.statusMessage = "支持";
-        t.enabled = true;
-        if (s.status === "active") {
-          registerVirtualTools(s);
-        }
+    if (!response.ok) {
+      const text = await response.text();
+      const wait = parseRetryAfter(text);
+      if (wait && attempt < 2) {
+        await new Promise((resolve) => setTimeout(resolve, (wait + 1) * 1000));
         continue;
       }
-
-      let isSupported = true;
-      let reason = "";
-
-      try {
-        const testRes = await fetch(targetUrl, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${channel.apiKey}`,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            model: targetModel,
-            messages: [{ role: "user", content: "test" }],
-            tools: [t.openAiTool],
-            max_tokens: 1
-          }),
-          signal: AbortSignal.timeout(20000)
-        });
-
-        if (testRes.ok) {
-          isSupported = true;
-        } else {
-          const errText = await testRes.text();
-          let msg = errText;
-          try {
-            const errJson = JSON.parse(errText);
-            msg = errJson.error?.message || errText;
-          } catch {}
-          if (testRes.status === 400 || testRes.status === 422) {
-            isSupported = false;
-            reason = msg.slice(0, 100);
-          } else {
-            isSupported = true;
-          }
-        }
-      } catch {
-        isSupported = true;
-      }
-
-      if (isSupported) {
-        supported += 1;
-        t.status = "supported";
-        t.statusMessage = "支持";
-        t.enabled = true;
-        if (s.status === "active") {
-          mcpToolRegistry.set(t.key, {
-            serverId: s.id,
-            serverName: s.name,
-            rawName: t.rawName,
-            postEndpoint: s.postEndpoint,
-            headers: s.headers
-          });
-        }
-      } else {
-        unsupported += 1;
-        t.status = "unsupported";
-        t.statusMessage = reason || "参数格式不支持";
-        t.enabled = false;
-        mcpToolRegistry.delete(t.key);
-      }
+      throw new Error(`MCP HTTP ${response.status}: ${text.slice(0, 300)}`);
     }
-
-    await saveServerToStorage();
+    const data = await parseMcpResponse(response);
+    if (data.error) {
+      const text = data.error.message || JSON.stringify(data.error);
+      const wait = parseRetryAfter(text);
+      if (wait && attempt < 2) {
+        await new Promise((resolve) => setTimeout(resolve, (wait + 1) * 1000));
+        continue;
+      }
+      throw new Error(text);
+    }
+    const result = data.result !== undefined ? data.result : data;
+    const wait = result?.isError ? parseRetryAfter(extractMcpResultContent(result)) : 0;
+    if (wait && attempt < 2) {
+      await new Promise((resolve) => setTimeout(resolve, (wait + 1) * 1000));
+      continue;
+    }
+    return result;
   }
+  throw new Error("MCP 工具调用失败");
+}
 
-  addDebugLog("AGENT", `AI一键检测完成 - 渠道 [${channel.name}] - 测试模型 [${targetModel}] - 共 ${total} 个工具，支持 ${supported} 个，不支持已自动禁用 ${unsupported} 个`);
-  return { total, supported, unsupported, model: targetModel };
+export async function callMcpTool(toolKey, args) {
+  const info = mcpToolRegistry.get(toolKey) || Array.from(mcpToolRegistry.entries())
+    .find(([key]) => key.toLowerCase() === String(toolKey).toLowerCase())?.[1];
+  if (!info) throw new Error(`未找到工具：${toolKey}`);
+  const startTime = Date.now();
+  try {
+    const result = await invokeRemoteTool(info, info.rawName, args);
+    addDebugLog(result?.isError ? "ERROR" : "TOOL", `MCP 工具 [${info.rawName}] ${result?.isError ? "返回错误" : "调用完成"} - ${Date.now() - startTime}ms`, {
+      arguments: args,
+      outputPreview: extractMcpResultContent(result).slice(0, 500)
+    }, "mcp");
+    return result;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    addDebugLog("ERROR", `MCP 工具 [${info.rawName}] 调用失败 - ${Date.now() - startTime}ms`, {
+      arguments: args,
+      error: message
+    }, "mcp");
+    throw error;
+  }
 }
 
 export async function loadMcpServersFromStorage() {
-  const list = await getStoredServers();
-  for (const item of list) {
-    const status = item.status || "active";
-    item.status = status;
-    for (const t of item.tools || []) {
-      t.enabled = typeof t.enabled === "boolean" ? t.enabled : true;
-      t.status = t.status || "unchecked";
-      t.statusMessage = t.statusMessage || "";
-      // 保持 openAiTool 原生化与无噪描述
-      if (t.openAiTool?.function) {
-        t.openAiTool.function.name = t.rawName || t.openAiTool.function.name;
-        if (typeof t.openAiTool.function.description === "string") {
-          t.openAiTool.function.description = t.openAiTool.function.description.replace(/^\[[^\]]+\]\s*/, "");
-        }
-      }
+  const storedServers = await getStoredServers();
+  let changed = false;
+  for (const stored of storedServers) {
+    if (!stored || !stored.id || !stored.url || !Array.isArray(stored.tools)) continue;
+    const tools = stored.tools.filter((tool) => tool && !tool.isVirtual && tool.rawName !== "edit_file" && tool.rawName !== "github_edit_file");
+    if (tools.length !== stored.tools.length) changed = true;
+    for (const tool of tools) {
+      if (typeof tool.enabled !== "boolean") tool.enabled = true;
+      delete tool.isVirtual;
+      delete tool.openAiTool;
+      delete tool.status;
+      delete tool.statusMessage;
     }
-    mcpServers.set(item.id, item);
-    registerVirtualTools(item);
-    if (status === "active") {
-      for (const t of item.tools || []) {
-        if (t.enabled !== false && !t.isVirtual) {
-          const regItem = {
-            serverId: item.id,
-            serverName: item.name,
-            rawName: t.rawName,
-            postEndpoint: item.postEndpoint,
-            headers: item.headers
-          };
-          mcpToolRegistry.set(t.key, regItem);
-          if (!mcpToolRegistry.has(t.rawName)) {
-            mcpToolRegistry.set(t.rawName, regItem);
-          }
-        }
-      }
+    const headers = stored.headers && typeof stored.headers === "object" ? stored.headers : {
+      Accept: "application/json, text/event-stream",
+      "Content-Type": "application/json"
+    };
+    if (!headers.Authorization && stored.rawToken) {
+      headers.Authorization = /^Bearer\s/i.test(stored.rawToken) ? stored.rawToken : `Bearer ${stored.rawToken}`;
+      changed = true;
     }
+    const server = {
+      id: stored.id,
+      name: stored.name || stored.id,
+      url: stored.url,
+      status: stored.status || "active",
+      postEndpoint: stored.postEndpoint || stored.url,
+      headers,
+      toolCount: tools.length,
+      tools
+    };
+    delete stored.rawToken;
+    mcpServers.set(server.id, server);
   }
+  rebuildMcpToolRegistry();
+  if (changed) await saveServerToStorage();
 }
