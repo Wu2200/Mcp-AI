@@ -154,7 +154,7 @@ async function connectRemote({ id = crypto.randomUUID(), name, url, token, previ
   mcpServers.set(id, server);
   rebuildMcpToolRegistry();
   await saveServerToStorage();
-  addDebugLog("MCP_SERVER", `MCP 服务已连接: ${cleanName}`, { serverId: id, url: cleanUrl, toolCount: tools.length }, "mcp");
+  addDebugLog("MCP_SERVER", `MCP 服务已连接: ${cleanName}`, { serverId: id, url: cleanUrl, toolCount: tools.length });
   return server;
 }
 
@@ -174,7 +174,7 @@ export async function updateMcpServer({ id, name, url, token }) {
     previousTools: existing.tools,
     status: existing.status
   });
-  addDebugLog("MCP_SERVER", `MCP 服务配置已更新: ${updated.name}`, { serverId: id, url: updated.url, toolCount: updated.toolCount }, "mcp");
+  addDebugLog("MCP_SERVER", `MCP 服务配置已更新: ${updated.name}`, { serverId: id, url: updated.url, toolCount: updated.toolCount });
   return updated;
 }
 
@@ -245,14 +245,11 @@ export async function callMcpTool(toolKey, args) {
     addDebugLog(result?.isError ? "ERROR" : "TOOL", `MCP 工具 [${info.rawName}] ${result?.isError ? "返回错误" : "调用完成"} - ${Date.now() - startTime}ms`, {
       arguments: args,
       outputPreview: extractMcpResultContent(result).slice(0, 500)
-    }, "mcp");
+    });
     return result;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    addDebugLog("ERROR", `MCP 工具 [${info.rawName}] 调用失败 - ${Date.now() - startTime}ms`, {
-      arguments: args,
-      error: message
-    }, "mcp");
+    addDebugLog("ERROR", `MCP 工具 [${info.rawName}] 调用失败 - ${Date.now() - startTime}ms`, { arguments: args, error: message });
     throw error;
   }
 }
@@ -271,10 +268,7 @@ export async function loadMcpServersFromStorage() {
       delete tool.status;
       delete tool.statusMessage;
     }
-    const headers = stored.headers && typeof stored.headers === "object" ? stored.headers : {
-      Accept: "application/json, text/event-stream",
-      "Content-Type": "application/json"
-    };
+    const headers = stored.headers && typeof stored.headers === "object" ? stored.headers : { Accept: "application/json, text/event-stream", "Content-Type": "application/json" };
     if (!headers.Authorization && stored.rawToken) {
       headers.Authorization = /^Bearer\s/i.test(stored.rawToken) ? stored.rawToken : `Bearer ${stored.rawToken}`;
       changed = true;

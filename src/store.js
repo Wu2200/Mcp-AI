@@ -15,6 +15,7 @@ export const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
 
 const DATA_FILE = path.join(PROJECT_ROOT, "mcp-config.json");
 const SETTINGS_FILE = path.join(PROJECT_ROOT, "mcp-settings.json");
+const LEGACY_CHANNELS_FILE = path.join(PROJECT_ROOT, "mcp-channels.json");
 
 export const mcpServers = new Map();
 export const mcpToolRegistry = new Map();
@@ -54,10 +55,7 @@ if (DATABASE_URL) {
     parsedUrl.searchParams.delete("sslmode");
     connectionString = parsedUrl.toString();
   } catch {}
-  dbPool = new Pool({
-    connectionString,
-    ssl: DATABASE_URL.includes("sslmode=disable") ? false : { rejectUnauthorized: false }
-  });
+  dbPool = new Pool({ connectionString, ssl: DATABASE_URL.includes("sslmode=disable") ? false : { rejectUnauthorized: false } });
   dbPool.on("error", (error) => addDebugLog("ERROR", `数据库连接异常: ${error.message}`));
 }
 
@@ -125,6 +123,28 @@ export async function saveLoggingConfigToStorage(enabled) {
   await setStorageItem("settings", settings);
 }
 
+export async function clearLegacyAiConfiguration() {
+  if (dbPool) {
+    try {
+      await dbPool.query("DELETE FROM mcp_storage WHERE key = $1", ["upstream_channels"]);
+    } catch (error) {
+      addDebugLog("ERROR", `清理旧上游配置失败: ${error.message}`);
+    }
+  }
+  try {
+    if (fs.existsSync(LEGACY_CHANNELS_FILE)) fs.unlinkSync(LEGACY_CHANNELS_FILE);
+  } catch {}
+  const oldSettings = (dbPool ? await getStorageItem("settings") : null) || await readLocalJson(SETTINGS_FILE);
+  if (oldSettings && ("enabledModels" in oldSettings || "activeChannelId" in oldSettings)) {
+    const cleanSettings = { loggingEnabled: oldSettings.loggingEnabled !== false };
+    loggingEnabled = cleanSettings.loggingEnabled;
+    try {
+      fs.writeFileSync(SETTINGS_FILE, JSON.stringify(cleanSettings, null, 2), "utf8");
+    } catch {}
+    await setStorageItem("settings", cleanSettings);
+  }
+}
+
 export async function getStoredServers() {
   const stored = (dbPool ? await getStorageItem("servers") : null) || await readLocalJson(DATA_FILE);
   return Array.isArray(stored) ? stored : [];
@@ -154,10 +174,7 @@ export function setCorsHeaders(response) {
 export function sendJson(response, statusCode, body) {
   if (response.headersSent) return;
   setCorsHeaders(response);
-  response.writeHead(statusCode, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Cache-Control": "no-store"
-  });
+  response.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
   response.end(JSON.stringify(body));
 }
 
@@ -166,7 +183,7 @@ export function isProxyAuthorized(request) {
   const requestUrl = new URL(request.url, `http://${request.headers.host || "localhost"}`);
   const queryToken = requestUrl.searchParams.get("key") || requestUrl.searchParams.get("token") || requestUrl.searchParams.get("api_key") || "";
   if (queryToken.trim() === PROXY_API_KEY) return true;
-  const headerToken = request.headers["x-goog-api-key"] || request.headers["x-api-key"] || request.headers["api-key"] || "";
+  const headerToken = request.headers["x-api-key"] || request.headers["api-key"] || request.headers["x-goog-api-key"] || "";
   if (headerToken.trim() === PROXY_API_KEY) return true;
   return (request.headers.authorization || "").replace(/^Bearer\s+/i, "").trim() === PROXY_API_KEY;
 }

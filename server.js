@@ -10,6 +10,7 @@ import {
   dbPool,
   initDatabase,
   loadSettingsFromStorage,
+  clearLegacyAiConfiguration,
   loggingEnabled,
   saveLoggingConfigToStorage,
   mcpCallLogs,
@@ -32,7 +33,6 @@ import {
   connectToMcpServer,
   updateMcpServer,
   callMcpTool,
-  sanitizeToolSchema,
   rebuildMcpToolRegistry
 } from "./src/mcp.js";
 
@@ -93,6 +93,7 @@ function getLoginHtml() {
 if (dbPool) await initDatabase();
 await loadMcpServersFromStorage();
 await loadSettingsFromStorage();
+await clearLegacyAiConfiguration();
 
 function getExportedMcpTools(targetFilter = "") {
   const filter = String(targetFilter || "").trim().toLowerCase();
@@ -113,10 +114,8 @@ function getExportedMcpTools(targetFilter = "") {
         name,
         rawName: tool.rawName || name,
         key: tool.key,
-        serverId: server.id,
-        serverName: server.name,
         description: tool.description || tool.rawName || name,
-        inputSchema: sanitizeToolSchema(tool.inputSchema)
+        inputSchema: tool.inputSchema && typeof tool.inputSchema === "object" ? tool.inputSchema : { type: "object", properties: {} }
       });
     }
   }
@@ -133,11 +132,8 @@ async function handleMcpMessage(message, serverFilter, reqUrl, clientIp) {
   if (method === "initialize") {
     const protocolVersion = params?.protocolVersion === "2025-03-26" ? "2025-03-26" : "2024-11-05";
     addDebugLog("MCP_INIT", `MCP 客户端握手 -> ${reqUrl.pathname}`, {
-      clientInfo: params?.clientInfo || {},
-      protocolVersion,
-      serverFilter: serverFilter || "全部服务",
-      clientIp
-    }, "mcp");
+      clientInfo: params?.clientInfo || {}, protocolVersion, serverFilter: serverFilter || "全部服务", clientIp
+    });
     return {
       jsonrpc: "2.0",
       id,
@@ -154,41 +150,21 @@ async function handleMcpMessage(message, serverFilter, reqUrl, clientIp) {
   if (method === "tools/list") {
     const tools = getExportedMcpTools(serverFilter);
     addDebugLog("MCP_LIST", `返回 ${tools.length} 个 MCP 工具`, {
-      path: reqUrl.pathname,
-      serverFilter: serverFilter || "全部服务",
-      tools: tools.map((tool) => tool.name)
-    }, "mcp");
-    return {
-      jsonrpc: "2.0",
-      id,
-      result: {
-        tools: tools.map((tool) => ({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema }))
-      }
-    };
+      path: reqUrl.pathname, serverFilter: serverFilter || "全部服务", tools: tools.map((tool) => tool.name)
+    });
+    return { jsonrpc: "2.0", id, result: { tools: tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })) } };
   }
 
   if (method === "tools/call") {
     const requestedName = String(params?.name || "");
-    const tool = getExportedMcpTools(serverFilter).find((item) =>
-      item.name === requestedName || item.rawName === requestedName || item.key === requestedName
-    );
+    const tool = getExportedMcpTools(serverFilter).find((item) => item.name === requestedName || item.rawName === requestedName || item.key === requestedName);
     if (!tool) {
-      return {
-        jsonrpc: "2.0",
-        id,
-        result: { content: [{ type: "text", text: `未找到已启用的 MCP 工具：${requestedName}` }], isError: true }
-      };
+      return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `未找到已启用的 MCP 工具：${requestedName}` }], isError: true } };
     }
     const args = params?.arguments && typeof params.arguments === "object" && !Array.isArray(params.arguments) ? params.arguments : {};
-    addDebugLog("MCP_CALL", `调用 MCP 工具 [${requestedName}]`, {
-      requestedTool: requestedName,
-      resolvedKey: tool.key,
-      path: reqUrl.pathname,
-      clientIp
-    }, "mcp");
+    addDebugLog("MCP_CALL", `调用 MCP 工具 [${requestedName}]`, { requestedTool: requestedName, resolvedKey: tool.key, path: reqUrl.pathname, clientIp });
     try {
-      const result = await callMcpTool(tool.key, args);
-      return { jsonrpc: "2.0", id, result };
+      return { jsonrpc: "2.0", id, result: await callMcpTool(tool.key, args) };
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: detail }], isError: true } };
@@ -198,7 +174,6 @@ async function handleMcpMessage(message, serverFilter, reqUrl, clientIp) {
   if (method === "resources/list") return { jsonrpc: "2.0", id, result: { resources: [] } };
   if (method === "resources/templates/list") return { jsonrpc: "2.0", id, result: { resourceTemplates: [] } };
   if (method === "prompts/list") return { jsonrpc: "2.0", id, result: { prompts: [] } };
-
   return { jsonrpc: "2.0", id, error: { code: -32601, message: `Method not found: ${method}` } };
 }
 
@@ -212,7 +187,6 @@ const httpServer = http.createServer(async (request, response) => {
 
   try {
     const reqUrl = new URL(request.url, `http://${request.headers.host || "localhost"}`);
-
     if (request.method === "OPTIONS") {
       setCorsHeaders(response);
       if (reqUrl.pathname === "/mcp" || reqUrl.pathname.startsWith("/mcp/")) {
@@ -239,9 +213,7 @@ const httpServer = http.createServer(async (request, response) => {
     }
 
     if ((request.method === "GET" || request.method === "HEAD") && reqUrl.pathname === "/health") {
-      setCorsHeaders(response);
-      response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-      response.end(request.method === "HEAD" ? "" : JSON.stringify({ status: "ok" }));
+      sendJson(response, 200, { status: "ok" });
       return;
     }
 
@@ -257,10 +229,7 @@ const httpServer = http.createServer(async (request, response) => {
       if (!PANEL_PASSWORD || body.password === PANEL_PASSWORD) {
         const token = generateSessionToken();
         setCorsHeaders(response);
-        response.writeHead(200, {
-          "Content-Type": "application/json; charset=utf-8",
-          "Set-Cookie": `panel_auth=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`
-        });
+        response.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Set-Cookie": `panel_auth=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000` });
         response.end(JSON.stringify({ success: true }));
       } else {
         sendJson(response, 401, { error: "密码错误" });
@@ -270,10 +239,7 @@ const httpServer = http.createServer(async (request, response) => {
 
     if (request.method === "POST" && reqUrl.pathname === "/api/panel/logout") {
       setCorsHeaders(response);
-      response.writeHead(200, {
-        "Content-Type": "application/json; charset=utf-8",
-        "Set-Cookie": "panel_auth=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
-      });
+      response.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Set-Cookie": "panel_auth=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" });
       response.end(JSON.stringify({ success: true }));
       return;
     }
@@ -296,10 +262,7 @@ const httpServer = http.createServer(async (request, response) => {
         response.end(JSON.stringify({ error: "MCP endpoint only supports GET, POST, and DELETE" }));
         return;
       }
-
-      const serverFilter = mcpMatch[1]
-        ? decodeURIComponent(mcpMatch[1]).trim()
-        : (reqUrl.searchParams.get("server") || reqUrl.searchParams.get("name") || "").trim();
+      const serverFilter = mcpMatch[1] ? decodeURIComponent(mcpMatch[1]).trim() : (reqUrl.searchParams.get("server") || reqUrl.searchParams.get("name") || "").trim();
       const clientIp = request.headers["x-forwarded-for"] || request.socket.remoteAddress || "";
 
       if (request.method === "DELETE") {
@@ -317,11 +280,8 @@ const httpServer = http.createServer(async (request, response) => {
         const sessionId = activeSessionId || crypto.randomUUID();
         setCorsHeaders(response);
         response.writeHead(200, {
-          "Content-Type": "text/event-stream; charset=utf-8",
-          "Cache-Control": "no-cache, no-transform",
-          Connection: "keep-alive",
-          "X-Accel-Buffering": "no",
-          "MCP-Session-Id": sessionId
+          "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform",
+          Connection: "keep-alive", "X-Accel-Buffering": "no", "MCP-Session-Id": sessionId
         });
         const timer = setInterval(() => {
           if (response.writableEnded || response.destroyed) {
@@ -335,7 +295,7 @@ const httpServer = http.createServer(async (request, response) => {
         if (!headerSessionId) {
           const endpoint = `${reqUrl.pathname}?sessionId=${encodeURIComponent(sessionId)}`;
           response.write(`event: endpoint\ndata: ${endpoint}\n\n`);
-          addDebugLog("MCP_INIT", `MCP SSE 客户端连接 -> ${reqUrl.pathname}`, { sessionId, endpoint, clientIp }, "mcp");
+          addDebugLog("MCP_INIT", `MCP SSE 客户端连接 -> ${reqUrl.pathname}`, { sessionId, endpoint, clientIp });
         } else {
           response.write(": connected\n\n");
         }
@@ -354,13 +314,11 @@ const httpServer = http.createServer(async (request, response) => {
         return;
       }
       const isBatch = Array.isArray(body);
-      const messages = isBatch ? body : [body];
       const responses = [];
-      for (const message of messages) {
+      for (const message of (isBatch ? body : [body])) {
         const result = await handleMcpMessage(message, serverFilter, reqUrl, clientIp);
         if (result !== null) responses.push(result);
       }
-
       const sseSession = querySessionId ? mcpSseSessions.get(querySessionId) : null;
       if (sseSession && !sseSession.response.writableEnded && !sseSession.response.destroyed) {
         for (const result of responses) sseSession.response.write(`event: message\ndata: ${JSON.stringify(result)}\n\n`);
@@ -404,15 +362,10 @@ const httpServer = http.createServer(async (request, response) => {
         return;
       }
       if (request.method === "GET" && reqUrl.pathname === "/api/mcp/servers") {
-        const servers = Array.from(mcpServers.values()).map((server) => ({
-          id: server.id,
-          name: server.name,
-          url: server.url,
-          status: server.status,
-          toolCount: server.toolCount,
+        sendJson(response, 200, { servers: Array.from(mcpServers.values()).map((server) => ({
+          id: server.id, name: server.name, url: server.url, status: server.status, toolCount: server.toolCount,
           tools: (server.tools || []).map((tool) => ({ key: tool.key, rawName: tool.rawName, enabled: tool.enabled !== false }))
-        }));
-        sendJson(response, 200, { servers });
+        })) });
         return;
       }
       if (request.method === "POST" && reqUrl.pathname === "/api/mcp/connect") {
@@ -501,7 +454,7 @@ const httpServer = http.createServer(async (request, response) => {
   } catch (error) {
     if (["ECONNRESET", "EPIPE"].includes(error?.code) || error?.message === "aborted" || error?.name === "AbortError") return;
     console.error(`[ERROR] 服务请求异常: ${error?.message || error}`);
-    addDebugLog("ERROR", `服务请求异常: ${error?.message || error}`, error?.stack || "", "mcp");
+    addDebugLog("ERROR", `服务请求异常: ${error?.message || error}`, error?.stack || "");
     if (response.headersSent) {
       if (!response.writableEnded) response.end();
     } else {

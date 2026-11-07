@@ -13,10 +13,6 @@
   "dependencies": {
     "pg": "^8.13.1"
   },
-  "keywords": [
-    "mcp",
-    "proxy",
-    "aggregator"
-  ],
+  "keywords": ["mcp", "proxy", "aggregator"],
   "license": "MIT"
 }
