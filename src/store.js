@@ -12,6 +12,8 @@ export const PORT = Number(process.env.PORT || 10000);
 export const PROXY_API_KEY = (process.env.PROXY_API_KEY || "").trim();
 export const PANEL_PASSWORD = (process.env.PANEL_PASSWORD || "").trim();
 export const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
+export const GITHUB_TOKEN = (process.env.GITHUB_TOKEN || "").trim();
+export const GITHUB_API_URL = (process.env.GITHUB_API_URL || "https://api.github.com").trim().replace(/\/+$/, "");
 
 const DATA_FILE = path.join(PROJECT_ROOT, "mcp-config.json");
 const SETTINGS_FILE = path.join(PROJECT_ROOT, "mcp-settings.json");

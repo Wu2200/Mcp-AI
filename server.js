@@ -6,6 +6,7 @@ import {
   PORT,
   PROXY_API_KEY,
   PANEL_PASSWORD,
+  GITHUB_TOKEN,
   PROJECT_ROOT,
   dbPool,
   initDatabase,
@@ -35,6 +36,8 @@ import {
   syncMcpServers,
   matchesServerFilter,
   callMcpTool,
+  callStandaloneGitHubTool,
+  buildBuiltInGitHubTools,
   rebuildMcpToolRegistry
 } from "./src/mcp.js";
 
@@ -118,6 +121,21 @@ function getExportedMcpTools(targetFilter = "") {
       });
     }
   }
+  const normalizedFilter = String(targetFilter || "").trim().toLowerCase();
+  if (GITHUB_TOKEN && (!normalizedFilter || normalizedFilter === "all" || normalizedFilter === "github")) {
+    for (const def of buildBuiltInGitHubTools()) {
+      if (seenNames.has(def.name)) continue;
+      seenNames.add(def.name);
+      tools.push({
+        name: def.name,
+        rawName: def.name,
+        key: def.name,
+        description: def.description,
+        inputSchema: def.inputSchema,
+        isStandaloneBuiltIn: true
+      });
+    }
+  }
   return tools;
 }
 
@@ -164,7 +182,10 @@ async function handleMcpMessage(message, serverFilter, reqUrl, clientIp) {
     const args = params?.arguments && typeof params.arguments === "object" && !Array.isArray(params.arguments) ? params.arguments : {};
     addDebugLog("MCP_CALL", `调用 MCP 工具 [${requestedName}]`, { requestedTool: requestedName, resolvedKey: tool.key, path: reqUrl.pathname, clientIp });
     try {
-      return { jsonrpc: "2.0", id, result: await callMcpTool(tool.key, args) };
+      const result = tool.isStandaloneBuiltIn
+        ? await callStandaloneGitHubTool(tool.rawName, args)
+        : await callMcpTool(tool.key, args);
+      return { jsonrpc: "2.0", id, result };
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: detail }], isError: true } };
@@ -364,7 +385,7 @@ const httpServer = http.createServer(async (request, response) => {
       if (request.method === "GET" && reqUrl.pathname === "/api/mcp/servers") {
         sendJson(response, 200, { servers: Array.from(mcpServers.values()).map((server) => ({
           id: server.id, name: server.name, url: server.url, status: server.status, toolCount: server.toolCount,
-          tools: (server.tools || []).map((tool) => ({ key: tool.key, rawName: tool.rawName, enabled: tool.enabled !== false }))
+          tools: (server.tools || []).map((tool) => ({ key: tool.key, rawName: tool.rawName, enabled: tool.enabled !== false, isBuiltIn: Boolean(tool.isBuiltIn) }))
         })) });
         return;
       }

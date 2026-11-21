@@ -6,8 +6,13 @@ import {
   getStoredServers,
   saveServerToStorage
 } from "./store.js";
+import {
+  isGitHubMcpServer,
+  buildBuiltInGitHubTools,
+  executeBuiltInGitHubTool
+} from "./github-edit.js";
 
-export { mcpServers, mcpToolRegistry };
+export { mcpServers, mcpToolRegistry, buildBuiltInGitHubTools };
 
 const AUTO_SYNC_TIMEOUT_MS = 10000;
 const inflightSyncs = new Map();
@@ -60,6 +65,22 @@ function normalizeTool(serverName, tool) {
   };
 }
 
+function attachBuiltInTools(serverName, serverUrl, upstreamTools, previousTools = []) {
+  const cleanTools = upstreamTools.filter((tool) => tool && !tool.isBuiltIn);
+  if (!isGitHubMcpServer({ name: serverName, url: serverUrl, tools: cleanTools })) return cleanTools;
+  const preferences = new Map((previousTools || []).map((tool) => [tool.rawName, tool.enabled !== false]));
+  const existingNames = new Set(cleanTools.map((tool) => tool.rawName));
+  for (const def of buildBuiltInGitHubTools()) {
+    if (existingNames.has(def.name)) continue;
+    const normalized = normalizeTool(serverName, def);
+    if (!normalized) continue;
+    normalized.isBuiltIn = true;
+    if (preferences.has(normalized.rawName)) normalized.enabled = preferences.get(normalized.rawName);
+    cleanTools.push(normalized);
+  }
+  return cleanTools;
+}
+
 function registerServer(server) {
   if (server.status !== "active") return;
   for (const tool of server.tools || []) {
@@ -68,8 +89,10 @@ function registerServer(server) {
       serverId: server.id,
       serverName: server.name,
       rawName: tool.rawName,
+      isBuiltIn: Boolean(tool.isBuiltIn),
       postEndpoint: server.postEndpoint,
-      headers: server.headers
+      headers: server.headers,
+      serverTools: server.tools
     };
     mcpToolRegistry.set(tool.key, registryItem);
     if (!mcpToolRegistry.has(tool.rawName)) mcpToolRegistry.set(tool.rawName, registryItem);
@@ -153,14 +176,16 @@ async function connectRemote({
   const listData = await parseMcpResponse(listResponse);
   if (listData.error) throw new Error(listData.error.message || "获取 MCP 工具列表失败");
   const preferences = new Map((previousTools || []).map((tool) => [tool.rawName, tool.enabled !== false]));
-  const tools = (Array.isArray(listData.result?.tools) ? listData.result.tools : [])
+  const upstreamTools = (Array.isArray(listData.result?.tools) ? listData.result.tools : [])
     .map((tool) => {
       const normalized = normalizeTool(cleanName, tool);
       if (normalized && preferences.has(normalized.rawName)) normalized.enabled = preferences.get(normalized.rawName);
       return normalized;
     })
     .filter(Boolean);
-  if (tools.length === 0) throw new Error("该 MCP 服务未返回任何工具，请检查认证权限或服务地址。");
+  if (upstreamTools.length === 0) throw new Error("该 MCP 服务未返回任何工具，请检查认证权限或服务地址。");
+
+  const tools = attachBuiltInTools(cleanName, cleanUrl, upstreamTools, previousTools);
 
   const server = {
     id,
@@ -325,7 +350,15 @@ export async function callMcpTool(toolKey, args) {
   if (!info) throw new Error(`未找到工具：${toolKey}`);
   const startTime = Date.now();
   try {
-    const result = await invokeRemoteTool(info, info.rawName, args);
+    const result = info.isBuiltIn
+      ? await executeBuiltInGitHubTool({
+          rawName: info.rawName,
+          args,
+          headers: info.headers,
+          serverTools: info.serverTools,
+          invokeUpstream: (rawName, toolArgs) => invokeRemoteTool(info, rawName, toolArgs)
+        })
+      : await invokeRemoteTool(info, info.rawName, args);
     addDebugLog(result?.isError ? "ERROR" : "TOOL", `MCP 工具 [${info.rawName}] ${result?.isError ? "返回错误" : "调用完成"} - ${Date.now() - startTime}ms`, {
       arguments: args,
       outputPreview: extractMcpResultContent(result).slice(0, 500)
@@ -338,14 +371,30 @@ export async function callMcpTool(toolKey, args) {
   }
 }
 
+export async function callStandaloneGitHubTool(rawName, args) {
+  const startTime = Date.now();
+  try {
+    const result = await executeBuiltInGitHubTool({ rawName, args });
+    addDebugLog(result?.isError ? "ERROR" : "TOOL", `内置工具 [${rawName}] ${result?.isError ? "返回错误" : "调用完成"} - ${Date.now() - startTime}ms`, {
+      arguments: args,
+      outputPreview: extractMcpResultContent(result).slice(0, 500)
+    });
+    return result;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    addDebugLog("ERROR", `内置工具 [${rawName}] 调用失败 - ${Date.now() - startTime}ms`, { arguments: args, error: message });
+    throw error;
+  }
+}
+
 export async function loadMcpServersFromStorage() {
   const storedServers = await getStoredServers();
   let changed = false;
   for (const stored of storedServers) {
     if (!stored || !stored.id || !stored.url || !Array.isArray(stored.tools)) continue;
-    const tools = stored.tools.filter((tool) => tool && !tool.isVirtual && tool.rawName !== "edit_file" && tool.rawName !== "github_edit_file");
-    if (tools.length !== stored.tools.length) changed = true;
-    for (const tool of tools) {
+    const baseTools = stored.tools.filter((tool) => tool && !tool.isVirtual && !tool.isBuiltIn && tool.rawName !== "edit_file");
+    if (baseTools.length !== stored.tools.filter((t) => t && !t.isBuiltIn).length) changed = true;
+    for (const tool of baseTools) {
       if (typeof tool.enabled !== "boolean") tool.enabled = true;
       delete tool.isVirtual;
       delete tool.openAiTool;
@@ -357,9 +406,12 @@ export async function loadMcpServersFromStorage() {
       headers.Authorization = /^Bearer\s/i.test(stored.rawToken) ? stored.rawToken : `Bearer ${stored.rawToken}`;
       changed = true;
     }
+    const name = stored.name || stored.id;
+    const tools = attachBuiltInTools(name, stored.url, baseTools, stored.tools);
+    if (tools.length !== stored.tools.length) changed = true;
     const server = {
       id: stored.id,
-      name: stored.name || stored.id,
+      name,
       url: stored.url,
       status: stored.status || "active",
       postEndpoint: stored.postEndpoint || stored.url,

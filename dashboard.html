@@ -282,6 +282,7 @@
                 <div class="tool-left">
                   <input type="checkbox" class="tool-checkbox" data-action="toggle-tool" data-server-id="${escapeHtml(server.id)}" data-tool-key="${escapeHtml(tool.key)}" ${enabled ? "checked" : ""}>
                   <span class="tool-name" title="${escapeHtml(tool.rawName || tool.key)}">${escapeHtml(tool.rawName || tool.key)}</span>
+                  ${tool.isBuiltIn ? '<span class="badge badge-blue">内置增强</span>' : ""}
                 </div>
               </div>
             `;
