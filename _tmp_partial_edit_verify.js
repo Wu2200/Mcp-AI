@@ -1,6 +1,6 @@
 function demoGreet(name) {
-  return `hello, ${name}`;
+  return `hi, ${name}!`;
 }
 
-const value = 100;
+const value = 200;
 console.log(demoGreet("world"), value);
