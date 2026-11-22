@@ -1,0 +1,8 @@
+.git
+.github
+node_modules
+npm-debug.log
+mcp-config.json
+mcp-settings.json
+mcp-channels.json
+.env
