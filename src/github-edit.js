@@ -422,7 +422,7 @@ async function githubRestRequest(token, endpointPath, options = {}) {
     headers: {
       Accept: "application/vnd.github+json",
       Authorization: `Bearer ${token}`,
-      "User-Agent": "mcp-proxy/1.0.0",
+      "User-Agent": "mcp-ai/1.0.0",
       "X-GitHub-Api-Version": "2022-11-28",
       ...(options.headers || {})
     },
