@@ -129,7 +129,7 @@ async function connectRemote({
   const headers = {
     Accept: "application/json, text/event-stream",
     "Content-Type": "application/json",
-    "User-Agent": "mcp-proxy/1.0.0"
+    "User-Agent": "mcp-ai/1.0.0"
   };
   const normalizedToken = String(token || "").trim();
   if (normalizedToken) headers.Authorization = /^Bearer\s/i.test(normalizedToken) ? normalizedToken : `Bearer ${normalizedToken}`;
@@ -141,7 +141,7 @@ async function connectRemote({
       jsonrpc: "2.0",
       id: 1,
       method: "initialize",
-      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "mcp-proxy", version: "1.0.0" } }
+      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "mcp-ai", version: "1.0.0" } }
     }),
     signal: AbortSignal.timeout(timeoutMs)
   });
