@@ -4,7 +4,6 @@ import http from "node:http";
 import path from "node:path";
 import {
   PORT,
-  PROXY_API_KEY,
   PANEL_PASSWORD,
   GITHUB_TOKEN,
   PROJECT_ROOT,
@@ -22,7 +21,7 @@ import {
   generateSessionToken,
   verifySessionToken,
   parseCookies,
-  isProxyAuthorized,
+  isApiAuthorized,
   isPanelAuthorized,
   setCorsHeaders,
   sendJson,
@@ -157,7 +156,7 @@ async function handleMcpMessage(message, serverFilter, reqUrl, clientIp) {
       result: {
         protocolVersion,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: `mcp-proxy-${serverFilter || "hub"}`, version: "1.0.0" }
+        serverInfo: { name: `mcp-ai-${serverFilter || "hub"}`, version: "1.0.0" }
       }
     };
   }
@@ -271,7 +270,7 @@ const httpServer = http.createServer(async (request, response) => {
       const headerSessionId = String(request.headers["mcp-session-id"] || "").trim();
       const activeSessionId = querySessionId || headerSessionId;
       const hasValidSession = Boolean(activeSessionId && mcpSseSessions.has(activeSessionId));
-      if (!isProxyAuthorized(request) && !hasValidSession) {
+      if (!isApiAuthorized(request) && !hasValidSession) {
         setCorsHeaders(response);
         response.writeHead(401, { "Content-Type": "application/json; charset=utf-8", "WWW-Authenticate": "Bearer" });
         response.end(JSON.stringify({ error: "需要有效的 Bearer API Key" }));
@@ -471,7 +470,7 @@ const httpServer = http.createServer(async (request, response) => {
       return;
     }
 
-    sendJson(response, 404, { error: "此服务仅提供 MCP 反向代理功能" });
+    sendJson(response, 404, { error: "此服务仅提供 MCP 工具接口" });
   } catch (error) {
     if (["ECONNRESET", "EPIPE"].includes(error?.code) || error?.message === "aborted" || error?.name === "AbortError") return;
     console.error(`[ERROR] 服务请求异常: ${error?.message || error}`);
@@ -496,5 +495,5 @@ process.on("SIGINT", () => process.exit(0));
 
 httpServer.listen(PORT, "0.0.0.0", () => {
   const activeCount = Array.from(mcpServers.values()).filter((server) => server.status === "active").length;
-  console.log(`[MCP-AI] MCP 反向代理就绪 (端口: ${PORT} | 已挂载服务: ${activeCount}个)`);
+  console.log(`[MCP-AI] MCP 工具服务已就绪 (端口: ${PORT} | 已连接服务: ${activeCount}个)`);
 });

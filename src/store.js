@@ -9,7 +9,7 @@ const __filename = fileURLToPath(import.meta.url);
 export const PROJECT_ROOT = path.resolve(path.dirname(__filename), "..");
 
 export const PORT = Number(process.env.PORT || 10000);
-export const PROXY_API_KEY = (process.env.PROXY_API_KEY || "").trim();
+export const API_ACCESS_KEY = (process.env.MCP_API_KEY || process.env.PROXY_API_KEY || "").trim();
 export const PANEL_PASSWORD = (process.env.PANEL_PASSWORD || "").trim();
 export const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
 export const GITHUB_TOKEN = (process.env.GITHUB_TOKEN || "").trim();
@@ -180,14 +180,14 @@ export function sendJson(response, statusCode, body) {
   response.end(JSON.stringify(body));
 }
 
-export function isProxyAuthorized(request) {
-  if (!PROXY_API_KEY) return true;
+export function isApiAuthorized(request) {
+  if (!API_ACCESS_KEY) return true;
   const requestUrl = new URL(request.url, `http://${request.headers.host || "localhost"}`);
   const queryToken = requestUrl.searchParams.get("key") || requestUrl.searchParams.get("token") || requestUrl.searchParams.get("api_key") || "";
-  if (queryToken.trim() === PROXY_API_KEY) return true;
+  if (queryToken.trim() === API_ACCESS_KEY) return true;
   const headerToken = request.headers["x-api-key"] || request.headers["api-key"] || request.headers["x-goog-api-key"] || "";
-  if (headerToken.trim() === PROXY_API_KEY) return true;
-  return (request.headers.authorization || "").replace(/^Bearer\s+/i, "").trim() === PROXY_API_KEY;
+  if (headerToken.trim() === API_ACCESS_KEY) return true;
+  return (request.headers.authorization || "").replace(/^Bearer\s+/i, "").trim() === API_ACCESS_KEY;
 }
 
 export function isPanelAuthorized(request) {
@@ -197,7 +197,7 @@ export function isPanelAuthorized(request) {
 }
 
 const SESSION_SECRET = PANEL_PASSWORD
-  ? crypto.createHash("sha256").update(`mcp-proxy-session:${PANEL_PASSWORD}`).digest("hex")
+  ? crypto.createHash("sha256").update(`mcp-ai-session:${PANEL_PASSWORD}`).digest("hex")
   : crypto.randomBytes(32).toString("hex");
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 

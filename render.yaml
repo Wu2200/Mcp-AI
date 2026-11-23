@@ -1,15 +1,17 @@
 services:
   - type: web
-    name: mcp-agent-proxy
+    name: mcp-ai-workspace
     runtime: node
     plan: free
     buildCommand: npm install
     startCommand: npm start
     healthCheckPath: /health
     envVars:
-      - key: PROXY_API_KEY
+      - key: MCP_API_KEY
         sync: false
       - key: PANEL_PASSWORD
         sync: false
       - key: DATABASE_URL
+        sync: false
+      - key: GITHUB_TOKEN
         sync: false

@@ -1,7 +1,7 @@
 {
-  "name": "mcp-proxy",
+  "name": "mcp-ai-hub",
   "version": "1.0.0",
-  "description": "Remote MCP server reverse proxy and aggregator",
+  "description": "MCP tool workspace with GitHub partial file editing and multi-service integration",
   "main": "server.js",
   "type": "module",
   "scripts": {
@@ -13,6 +13,6 @@
   "dependencies": {
     "pg": "^8.13.1"
   },
-  "keywords": ["mcp", "proxy", "aggregator"],
+  "keywords": ["mcp", "github", "tools", "workspace"],
   "license": "MIT"
 }
