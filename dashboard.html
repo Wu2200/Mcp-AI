@@ -31,6 +31,7 @@
       font-size: 15px; font-weight: 600; color: #0f172a; margin-bottom: 12px; display: flex;
       flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px;
     }
+    .card .card-title.collapsed { margin-bottom: 0; }
     .card-title-left { display: flex; align-items: center; gap: 8px; flex: 1 1 200px; min-width: 0; }
     .card-title-left span { white-space: normal; word-break: break-word; }
     .badge {
@@ -213,44 +214,47 @@
     </div>
 
     <div class="card">
-      <div class="card-title">
+      <div id="oauth-card-title" class="card-title collapsed">
         <div class="card-title-left">
           <span>OAuth 接入信息</span>
           <span id="oauth-auth-badge" class="badge badge-gray">检测中</span>
         </div>
         <div class="server-toolbar">
           <button id="refresh-oauth" class="btn-action btn-start" type="button">刷新</button>
+          <button id="btn-toggle-oauth" class="btn-action btn-edit" type="button" aria-expanded="false" aria-controls="oauth-panel">展开</button>
         </div>
       </div>
-      <div class="group">
-        <label for="oauth-mcp-url">MCP 服务地址</label>
-        <div class="copy-row">
-          <input id="oauth-mcp-url" readonly>
-          <button class="btn-action btn-edit" type="button" data-copy-target="oauth-mcp-url">复制</button>
+      <div id="oauth-panel" hidden>
+        <div class="group">
+          <label for="oauth-mcp-url">MCP 服务地址</label>
+          <div class="copy-row">
+            <input id="oauth-mcp-url" readonly>
+            <button class="btn-action btn-edit" type="button" data-copy-target="oauth-mcp-url">复制</button>
+          </div>
         </div>
-      </div>
-      <div class="group">
-        <label for="oauth-client-id">客户端 ID</label>
-        <div class="copy-row">
-          <input id="oauth-client-id" readonly>
-          <button class="btn-action btn-edit" type="button" data-copy-target="oauth-client-id">复制</button>
+        <div class="group">
+          <label for="oauth-client-id">客户端 ID</label>
+          <div class="copy-row">
+            <input id="oauth-client-id" readonly>
+            <button class="btn-action btn-edit" type="button" data-copy-target="oauth-client-id">复制</button>
+          </div>
         </div>
-      </div>
-      <div class="group">
-        <label for="oauth-client-secret">客户端密钥</label>
-        <div class="copy-row">
-          <input id="oauth-client-secret" type="password" readonly>
-          <button id="btn-toggle-secret" class="btn-action btn-stop" type="button">显示</button>
-          <button class="btn-action btn-edit" type="button" data-copy-target="oauth-client-secret">复制</button>
+        <div class="group">
+          <label for="oauth-client-secret">客户端密钥</label>
+          <div class="copy-row">
+            <input id="oauth-client-secret" type="password" readonly>
+            <button id="btn-toggle-secret" class="btn-action btn-stop" type="button">显示</button>
+            <button class="btn-action btn-edit" type="button" data-copy-target="oauth-client-secret">复制</button>
+          </div>
         </div>
-      </div>
-      <div class="group">
-        <label for="oauth-redirects">重定向 URI 白名单</label>
-        <textarea id="oauth-redirects" placeholder="每行一个完整回调地址"></textarea>
-      </div>
-      <div style="display:flex;align-items:center;">
-        <button id="btn-save-oauth" class="btn" type="button">保存白名单</button>
-        <span id="oauth-msg" role="status"></span>
+        <div class="group">
+          <label for="oauth-redirects">重定向 URI 白名单</label>
+          <textarea id="oauth-redirects" placeholder="每行一个完整回调地址"></textarea>
+        </div>
+        <div style="display:flex;align-items:center;">
+          <button id="btn-save-oauth" class="btn" type="button">保存白名单</button>
+          <span id="oauth-msg" role="status"></span>
+        </div>
       </div>
     </div>
 
@@ -454,6 +458,23 @@
           msg.style.color = "#dc2626";
         }
       });
+    });
+
+    document.getElementById("btn-toggle-oauth").addEventListener("click", () => {
+      const panel = document.getElementById("oauth-panel");
+      const title = document.getElementById("oauth-card-title");
+      const button = document.getElementById("btn-toggle-oauth");
+      const open = panel.hidden;
+      panel.hidden = !open;
+      title.classList.toggle("collapsed", !open);
+      button.textContent = open ? "收起" : "展开";
+      button.setAttribute("aria-expanded", String(open));
+      if (!open) {
+        const secretInput = document.getElementById("oauth-client-secret");
+        const secretButton = document.getElementById("btn-toggle-secret");
+        secretInput.type = "password";
+        secretButton.textContent = "显示";
+      }
     });
 
     document.getElementById("btn-toggle-secret").addEventListener("click", () => {
