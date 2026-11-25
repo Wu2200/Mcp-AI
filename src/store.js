@@ -15,6 +15,7 @@ export const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
 export const GITHUB_TOKEN = (process.env.GITHUB_TOKEN || "").trim();
 export const GITHUB_API_URL = (process.env.GITHUB_API_URL || "https://api.github.com").trim().replace(/\/+$/, "");
 export const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").trim().replace(/\/+$/, "");
+export const SITE_ICON_URL = (process.env.SITE_ICON_URL || "").trim();
 export const OAUTH_CLIENT_ID = (process.env.OAUTH_CLIENT_ID || "").trim();
 export const OAUTH_CLIENT_SECRET = (process.env.OAUTH_CLIENT_SECRET || "").trim();
 export const OAUTH_REDIRECT_URIS = (process.env.OAUTH_REDIRECT_URIS || "").trim();
