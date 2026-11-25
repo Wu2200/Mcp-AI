@@ -21,7 +21,6 @@ import {
   readFormOrJsonBody,
   addDebugLog
 } from "./store.js";
-import { getHtmlIconLinks } from "./icons.js";
 
 const OAUTH_FILE = path.join(PROJECT_ROOT, "mcp-oauth.json");
 const DEFAULT_SCOPE = "mcp:tools";
@@ -428,7 +427,7 @@ function renderHtmlPage(response, statusCode, html) {
     "Cache-Control": "no-store",
     Pragma: "no-cache",
     "X-Frame-Options": "DENY",
-    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' https: data:; frame-ancestors 'none'"
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"
   });
   response.end(html);
 }
@@ -440,7 +439,6 @@ function renderOAuthErrorPage(response, title, detail) {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>授权请求失败</title>
-  ${getHtmlIconLinks()}
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f8fafc; color: #0f172a; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px; }
@@ -471,7 +469,6 @@ function renderAuthorizePage(response, { txId, tx, requirePassword, hasPanelSess
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>MCP 授权确认</title>
-  ${getHtmlIconLinks()}
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f8fafc; color: #0f172a; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px; }
