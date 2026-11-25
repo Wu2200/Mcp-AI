@@ -40,12 +40,18 @@ import {
 } from "./src/mcp.js";
 import {
   loadOAuthStateFromStorage,
+  getPublicOrigin,
   verifyMcpBearerAuth,
   buildWwwAuthenticateHeader,
   handleOAuthRequest,
   getOAuthPanelInfo,
   updateOAuthSettings
 } from "./src/oauth.js";
+import {
+  getHtmlIconLinks,
+  getMcpServerIcons,
+  handleIconRequest
+} from "./src/icons.js";
 
 process.on("uncaughtException", (error) => {
   if (["ECONNRESET", "EPIPE"].includes(error?.code) || error?.message === "aborted") return;
@@ -64,6 +70,7 @@ function getLoginHtml() {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>MCP 控制台认证</title>
+  ${getHtmlIconLinks()}
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f8fafc; color: #0f172a; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px; }
@@ -150,7 +157,7 @@ function getExportedMcpTools(targetFilter = "") {
 
 const mcpSseSessions = new Map();
 
-async function handleMcpMessage(message, serverFilter, reqUrl, clientIp) {
+async function handleMcpMessage(message, serverFilter, reqUrl, clientIp, origin) {
   if (!message || typeof message !== "object" || Array.isArray(message)) return null;
   const { id, method, params } = message;
   if (id === undefined || id === null) return null;
@@ -167,7 +174,11 @@ async function handleMcpMessage(message, serverFilter, reqUrl, clientIp) {
       result: {
         protocolVersion,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: `mcp-ai-${serverFilter || "hub"}`, version: "1.0.0" }
+        serverInfo: {
+          name: `mcp-ai-${serverFilter || "hub"}`,
+          version: "1.0.0",
+          icons: getMcpServerIcons(origin)
+        }
       }
     };
   }
@@ -246,10 +257,7 @@ const httpServer = http.createServer(async (request, response) => {
       return;
     }
 
-    if (reqUrl.pathname === "/favicon.ico") {
-      setCorsHeaders(response);
-      response.writeHead(204);
-      response.end();
+    if (handleIconRequest(request, response, reqUrl)) {
       return;
     }
 
@@ -362,9 +370,10 @@ const httpServer = http.createServer(async (request, response) => {
         return;
       }
       const isBatch = Array.isArray(body);
+      const origin = getPublicOrigin(request);
       const responses = [];
       for (const message of (isBatch ? body : [body])) {
-        const result = await handleMcpMessage(message, serverFilter, reqUrl, clientIp);
+        const result = await handleMcpMessage(message, serverFilter, reqUrl, clientIp, origin);
         if (result !== null) responses.push(result);
       }
       const sseSession = querySessionId ? mcpSseSessions.get(querySessionId) : null;
