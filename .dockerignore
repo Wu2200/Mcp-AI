@@ -5,4 +5,5 @@ npm-debug.log
 mcp-config.json
 mcp-settings.json
 mcp-channels.json
+mcp-oauth.json
 .env

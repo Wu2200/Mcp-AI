@@ -165,6 +165,9 @@ export function getPublicOrigin(request) {
       if (visitor?.scheme === "https" || visitor?.scheme === "http") proto = visitor.scheme;
     } catch {}
   }
+  if (!proto && (firstHeaderValue(request.headers["x-forwarded-ssl"]).toLowerCase() === "on" || firstHeaderValue(request.headers["front-end-https"]).toLowerCase() === "on")) {
+    proto = "https";
+  }
   if (proto !== "http" && proto !== "https") {
     proto = request.socket?.encrypted ? "https" : "http";
   }
@@ -424,7 +427,7 @@ function renderHtmlPage(response, statusCode, html) {
     "Cache-Control": "no-store",
     Pragma: "no-cache",
     "X-Frame-Options": "DENY",
-    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"
   });
   response.end(html);
 }
@@ -707,7 +710,7 @@ function handleAuthorizeGet(request, response, reqUrl) {
   cleanupExpiredMaps();
   const origin = getPublicOrigin(request);
   const clientId = (reqUrl.searchParams.get("client_id") || "").trim();
-  const redirectUri = (reqUrl.searchParams.get("redirect_uri") || "").trim();
+  const rawRedirectUri = (reqUrl.searchParams.get("redirect_uri") || "").trim();
   const responseType = (reqUrl.searchParams.get("response_type") || "").trim();
   const state = reqUrl.searchParams.get("state") || "";
   const scope = (reqUrl.searchParams.get("scope") || "").trim() || DEFAULT_SCOPE;
@@ -720,6 +723,7 @@ function handleAuthorizeGet(request, response, reqUrl) {
     renderOAuthErrorPage(response, "无效的客户端 ID", "未识别的 OAuth client_id，请核对配置或重新注册客户端。");
     return;
   }
+  const redirectUri = rawRedirectUri || (client.redirectUris.length === 1 ? client.redirectUris[0] : "");
   if (!isValidRedirectUri(redirectUri)) {
     renderOAuthErrorPage(response, "无效的重定向地址", "redirect_uri 必须为合法的 HTTPS 或本地回调地址。");
     return;
@@ -777,6 +781,7 @@ function handleAuthorizeGet(request, response, reqUrl) {
     clientId: client.clientId,
     clientName: client.clientName,
     redirectUri,
+    hasExplicitRedirectUri: Boolean(rawRedirectUri),
     state,
     scope,
     resource,
@@ -845,6 +850,7 @@ async function handleAuthorizePost(request, response) {
   authorizationCodes.set(code, {
     clientId: tx.clientId,
     redirectUri: tx.redirectUri,
+    hasExplicitRedirectUri: tx.hasExplicitRedirectUri,
     scope: tx.scope,
     resource: tx.resource,
     codeChallenge: tx.codeChallenge,
@@ -904,7 +910,7 @@ async function handleTokenPost(request, response) {
       sendOAuthError(response, 400, "invalid_grant", "Authorization code does not match client_id");
       return;
     }
-    if (record.redirectUri !== redirectUri) {
+    if ((record.hasExplicitRedirectUri || redirectUri) && record.redirectUri !== redirectUri) {
       sendOAuthError(response, 400, "invalid_grant", "redirect_uri mismatch");
       return;
     }
