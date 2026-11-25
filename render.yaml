@@ -15,3 +15,11 @@ services:
         sync: false
       - key: GITHUB_TOKEN
         sync: false
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: OAUTH_CLIENT_ID
+        sync: false
+      - key: OAUTH_CLIENT_SECRET
+        sync: false
+      - key: OAUTH_REDIRECT_URIS
+        sync: false

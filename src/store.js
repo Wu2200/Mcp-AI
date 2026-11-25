@@ -14,6 +14,12 @@ export const PANEL_PASSWORD = (process.env.PANEL_PASSWORD || "").trim();
 export const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
 export const GITHUB_TOKEN = (process.env.GITHUB_TOKEN || "").trim();
 export const GITHUB_API_URL = (process.env.GITHUB_API_URL || "https://api.github.com").trim().replace(/\/+$/, "");
+export const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").trim().replace(/\/+$/, "");
+export const OAUTH_CLIENT_ID = (process.env.OAUTH_CLIENT_ID || "").trim();
+export const OAUTH_CLIENT_SECRET = (process.env.OAUTH_CLIENT_SECRET || "").trim();
+export const OAUTH_REDIRECT_URIS = (process.env.OAUTH_REDIRECT_URIS || "").trim();
+export const OAUTH_SIGNING_SECRET = (process.env.OAUTH_SIGNING_SECRET || "").trim();
+export const OAUTH_REQUIRED = String(process.env.OAUTH_REQUIRED || "").trim().toLowerCase() === "true";
 
 const DATA_FILE = path.join(PROJECT_ROOT, "mcp-config.json");
 const SETTINGS_FILE = path.join(PROJECT_ROOT, "mcp-settings.json");
@@ -240,7 +246,7 @@ export function parseCookies(request) {
   return cookies;
 }
 
-export function readRequestBody(request, limit = 30 * 1024 * 1024) {
+export function readRawRequestBody(request, limit = 30 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
@@ -280,16 +286,49 @@ export function readRequestBody(request, limit = 30 * 1024 * 1024) {
       if (completed) return;
       completed = true;
       cleanup();
-      try {
-        const text = Buffer.concat(chunks).toString("utf8");
-        resolve(text ? JSON.parse(text) : {});
-      } catch {
-        reject(Object.assign(new Error("无效 JSON"), { statusCode: 400 }));
-      }
+      resolve(Buffer.concat(chunks).toString("utf8"));
     };
     request.on("data", onData);
     request.on("end", onEnd);
     request.on("error", onError);
     request.on("close", onClose);
   });
+}
+
+export async function readRequestBody(request, limit = 30 * 1024 * 1024) {
+  const text = await readRawRequestBody(request, limit);
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw Object.assign(new Error("无效 JSON"), { statusCode: 400 });
+  }
+}
+
+export async function readFormOrJsonBody(request, limit = 2 * 1024 * 1024) {
+  const text = await readRawRequestBody(request, limit);
+  if (!text.trim()) return {};
+  const contentType = String(request.headers["content-type"] || "").toLowerCase();
+  if (contentType.includes("application/x-www-form-urlencoded")) {
+    const params = new URLSearchParams(text);
+    const result = {};
+    for (const [key, value] of params.entries()) {
+      if (!(key in result)) result[key] = value;
+    }
+    return result;
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    const trimmed = text.trim();
+    if (!trimmed.startsWith("{") && !trimmed.startsWith("[") && trimmed.includes("=")) {
+      const params = new URLSearchParams(trimmed);
+      const result = {};
+      for (const [key, value] of params.entries()) {
+        if (!(key in result)) result[key] = value;
+      }
+      return result;
+    }
+    throw Object.assign(new Error("无效请求体格式"), { statusCode: 400 });
+  }
 }

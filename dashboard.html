@@ -44,11 +44,15 @@
     .group { margin-bottom: 14px; }
     .group:last-child { margin-bottom: 0; }
     label { display: block; font-size: 13px; font-weight: 500; color: #475569; margin-bottom: 6px; }
-    input {
+    input, textarea {
       width: 100%; background: #ffffff; border: 1px solid #cbd5e1; padding: 10px 12px; border-radius: 8px;
       color: #0f172a; font-size: 14px; outline: none; transition: border-color 0.15s, box-shadow 0.15s;
+      font-family: inherit;
     }
-    input:focus { border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1); }
+    textarea { min-height: 76px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    input:focus, textarea:focus { border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1); }
+    .copy-row { display: flex; gap: 8px; align-items: center; }
+    .copy-row input { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: #f8fafc; }
     .btn {
       display: inline-flex; align-items: center; justify-content: center; background: #2563eb; color: #ffffff;
       border: none; font-weight: 600; font-size: 14px; padding: 10px 20px; border-radius: 8px; cursor: pointer;
@@ -104,7 +108,7 @@
     .tool-left { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1; }
     .tool-checkbox { width: 15px; height: 15px; cursor: pointer; accent-color: #2563eb; flex-shrink: 0; }
     .tool-name { font-family: monospace; font-weight: 500; color: #0f172a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    #conn-msg, #log-msg { margin-left: 10px; font-size: 12px; font-weight: 500; }
+    #conn-msg, #log-msg, #oauth-msg { margin-left: 10px; font-size: 12px; font-weight: 500; }
     .empty-state { text-align: center; padding: 24px 10px; color: #94a3b8; font-size: 13px; }
     .log-panel-container {
       background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 10px;
@@ -208,6 +212,48 @@
       <div id="mcp-list"><div class="empty-state">正在加载服务列表...</div></div>
     </div>
 
+    <div class="card">
+      <div class="card-title">
+        <div class="card-title-left">
+          <span>OAuth 接入信息</span>
+          <span id="oauth-auth-badge" class="badge badge-gray">检测中</span>
+        </div>
+        <div class="server-toolbar">
+          <button id="refresh-oauth" class="btn-action btn-start" type="button">刷新</button>
+        </div>
+      </div>
+      <div class="group">
+        <label for="oauth-mcp-url">MCP 服务地址</label>
+        <div class="copy-row">
+          <input id="oauth-mcp-url" readonly>
+          <button class="btn-action btn-edit" type="button" data-copy-target="oauth-mcp-url">复制</button>
+        </div>
+      </div>
+      <div class="group">
+        <label for="oauth-client-id">客户端 ID</label>
+        <div class="copy-row">
+          <input id="oauth-client-id" readonly>
+          <button class="btn-action btn-edit" type="button" data-copy-target="oauth-client-id">复制</button>
+        </div>
+      </div>
+      <div class="group">
+        <label for="oauth-client-secret">客户端密钥</label>
+        <div class="copy-row">
+          <input id="oauth-client-secret" type="password" readonly>
+          <button id="btn-toggle-secret" class="btn-action btn-stop" type="button">显示</button>
+          <button class="btn-action btn-edit" type="button" data-copy-target="oauth-client-secret">复制</button>
+        </div>
+      </div>
+      <div class="group">
+        <label for="oauth-redirects">重定向 URI 白名单</label>
+        <textarea id="oauth-redirects" placeholder="每行一个完整回调地址"></textarea>
+      </div>
+      <div style="display:flex;align-items:center;">
+        <button id="btn-save-oauth" class="btn" type="button">保存白名单</button>
+        <span id="oauth-msg" role="status"></span>
+      </div>
+    </div>
+
   </div>
 
   <div id="edit-modal" class="modal-overlay">
@@ -265,6 +311,23 @@
       return data;
     }
 
+    async function loadOAuthInfo() {
+      try {
+        const data = await requestJson("/api/oauth/info");
+        const badge = document.getElementById("oauth-auth-badge");
+        badge.className = `badge ${data.authRequired ? "badge-green" : "badge-gray"}`;
+        badge.textContent = data.authRequired ? "已启用认证" : "未启用认证";
+        document.getElementById("oauth-mcp-url").value = data.githubMcpUrl || data.mcpUrl || "";
+        document.getElementById("oauth-client-id").value = data.clientId || "";
+        document.getElementById("oauth-client-secret").value = data.clientSecret || "";
+        document.getElementById("oauth-redirects").value = (data.allowedRedirectUris || []).join("\n");
+      } catch (error) {
+        const msg = document.getElementById("oauth-msg");
+        msg.textContent = `加载失败：${error.message}`;
+        msg.style.color = "#dc2626";
+      }
+    }
+
     async function loadServers() {
       try {
         const data = await requestJson("/api/mcp/servers");
@@ -316,7 +379,7 @@
     }
 
     function getLogTagClass(type) {
-      if (String(type).startsWith("MCP_")) return "tag-mcp";
+      if (String(type).startsWith("MCP_") || String(type).startsWith("OAUTH_")) return "tag-mcp";
       if (String(type).startsWith("TOOL")) return "tag-tool";
       if (String(type).startsWith("ERROR")) return "tag-error";
       return "tag-default";
@@ -375,6 +438,55 @@
     function closeEditModal() {
       editModal.classList.remove("open");
     }
+
+    document.querySelectorAll("[data-copy-target]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const input = document.getElementById(button.dataset.copyTarget);
+        if (!input || !input.value) return;
+        const msg = document.getElementById("oauth-msg");
+        try {
+          await navigator.clipboard.writeText(input.value);
+          msg.textContent = "已复制";
+          msg.style.color = "#16a34a";
+          setTimeout(() => { msg.textContent = ""; }, 2500);
+        } catch {
+          msg.textContent = "复制失败";
+          msg.style.color = "#dc2626";
+        }
+      });
+    });
+
+    document.getElementById("btn-toggle-secret").addEventListener("click", () => {
+      const input = document.getElementById("oauth-client-secret");
+      const button = document.getElementById("btn-toggle-secret");
+      const hidden = input.type === "password";
+      input.type = hidden ? "text" : "password";
+      button.textContent = hidden ? "隐藏" : "显示";
+    });
+
+    document.getElementById("btn-save-oauth").addEventListener("click", async () => {
+      const button = document.getElementById("btn-save-oauth");
+      const msg = document.getElementById("oauth-msg");
+      button.disabled = true;
+      msg.textContent = "保存中...";
+      msg.style.color = "#2563eb";
+      try {
+        const allowedRedirectUris = document.getElementById("oauth-redirects").value;
+        await requestJson("/api/oauth/settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ allowedRedirectUris })
+        });
+        msg.textContent = "已保存";
+        msg.style.color = "#16a34a";
+        await loadOAuthInfo();
+      } catch (error) {
+        msg.textContent = error.message;
+        msg.style.color = "#dc2626";
+      } finally {
+        button.disabled = false;
+      }
+    });
 
     document.getElementById("btn-show-connect").addEventListener("click", () => {
       const form = document.getElementById("connect-form");
@@ -558,6 +670,7 @@
 
     document.getElementById("refresh-servers").addEventListener("click", loadServers);
     document.getElementById("refresh-logs").addEventListener("click", loadLogs);
+    document.getElementById("refresh-oauth").addEventListener("click", loadOAuthInfo);
     document.getElementById("logout").addEventListener("click", async () => {
       await fetch("/api/panel/logout", { method: "POST" });
       location.reload();
@@ -569,6 +682,7 @@
     });
 
     loadServers();
+    loadOAuthInfo();
     loadLogs();
     setInterval(loadLogs, 2500);
   </script>

@@ -21,7 +21,6 @@ import {
   generateSessionToken,
   verifySessionToken,
   parseCookies,
-  isApiAuthorized,
   isPanelAuthorized,
   setCorsHeaders,
   sendJson,
@@ -39,6 +38,14 @@ import {
   buildBuiltInGitHubTools,
   rebuildMcpToolRegistry
 } from "./src/mcp.js";
+import {
+  loadOAuthStateFromStorage,
+  verifyMcpBearerAuth,
+  buildWwwAuthenticateHeader,
+  handleOAuthRequest,
+  getOAuthPanelInfo,
+  updateOAuthSettings
+} from "./src/oauth.js";
 
 process.on("uncaughtException", (error) => {
   if (["ECONNRESET", "EPIPE"].includes(error?.code) || error?.message === "aborted") return;
@@ -97,7 +104,10 @@ function getLoginHtml() {
 if (dbPool) await initDatabase();
 await loadMcpServersFromStorage();
 await loadSettingsFromStorage();
+await loadOAuthStateFromStorage();
 await clearLegacyAiConfiguration();
+
+const SUPPORTED_PROTOCOL_VERSIONS = new Set(["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]);
 
 function getExportedMcpTools(targetFilter = "") {
   const tools = [];
@@ -146,7 +156,8 @@ async function handleMcpMessage(message, serverFilter, reqUrl, clientIp) {
   if (id === undefined || id === null) return null;
 
   if (method === "initialize") {
-    const protocolVersion = params?.protocolVersion === "2025-03-26" ? "2025-03-26" : "2024-11-05";
+    const requestedVersion = String(params?.protocolVersion || "");
+    const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS.has(requestedVersion) ? requestedVersion : "2025-03-26";
     addDebugLog("MCP_INIT", `MCP 客户端握手 -> ${reqUrl.pathname}`, {
       clientInfo: params?.clientInfo || {}, protocolVersion, serverFilter: serverFilter || "全部服务", clientIp
     });
@@ -209,11 +220,9 @@ const httpServer = http.createServer(async (request, response) => {
     const reqUrl = new URL(request.url, `http://${request.headers.host || "localhost"}`);
     if (request.method === "OPTIONS") {
       setCorsHeaders(response);
-      if (reqUrl.pathname === "/mcp" || reqUrl.pathname.startsWith("/mcp/")) {
-        response.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-        response.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, MCP-Protocol-Version, MCP-Session-Id, Last-Event-ID");
-        response.setHeader("Access-Control-Expose-Headers", "MCP-Protocol-Version, MCP-Session-Id");
-      }
+      response.setHeader("Access-Control-Allow-Methods", "GET, HEAD, POST, DELETE, OPTIONS");
+      response.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, MCP-Protocol-Version, MCP-Session-Id, Last-Event-ID, X-Api-Key");
+      response.setHeader("Access-Control-Expose-Headers", "WWW-Authenticate, MCP-Protocol-Version, MCP-Session-Id");
       response.writeHead(204);
       response.end();
       return;
@@ -244,6 +253,10 @@ const httpServer = http.createServer(async (request, response) => {
       return;
     }
 
+    if (await handleOAuthRequest(request, response, reqUrl)) {
+      return;
+    }
+
     if (request.method === "POST" && reqUrl.pathname === "/api/panel/login") {
       const body = await readRequestBody(request);
       if (!PANEL_PASSWORD || body.password === PANEL_PASSWORD) {
@@ -270,15 +283,30 @@ const httpServer = http.createServer(async (request, response) => {
       const headerSessionId = String(request.headers["mcp-session-id"] || "").trim();
       const activeSessionId = querySessionId || headerSessionId;
       const hasValidSession = Boolean(activeSessionId && mcpSseSessions.has(activeSessionId));
-      if (!isApiAuthorized(request) && !hasValidSession) {
+      const auth = verifyMcpBearerAuth(request, reqUrl);
+      if (!auth.authorized && !hasValidSession) {
         setCorsHeaders(response);
-        response.writeHead(401, { "Content-Type": "application/json; charset=utf-8", "WWW-Authenticate": "Bearer" });
-        response.end(JSON.stringify({ error: "需要有效的 Bearer API Key" }));
+        response.setHeader("Access-Control-Expose-Headers", "WWW-Authenticate, MCP-Protocol-Version, MCP-Session-Id");
+        response.writeHead(401, {
+          "Content-Type": "application/json; charset=utf-8",
+          "Cache-Control": "no-store",
+          "WWW-Authenticate": buildWwwAuthenticateHeader(request, reqUrl, auth.error, auth.errorDescription)
+        });
+        response.end(request.method === "HEAD" ? "" : JSON.stringify({
+          error: auth.error || "unauthorized",
+          error_description: auth.errorDescription || "Authorization required"
+        }));
+        return;
+      }
+      if (request.method === "HEAD") {
+        setCorsHeaders(response);
+        response.writeHead(200);
+        response.end();
         return;
       }
       if (!["GET", "POST", "DELETE"].includes(request.method)) {
         setCorsHeaders(response);
-        response.writeHead(405, { Allow: "GET, POST, DELETE", "Content-Type": "application/json; charset=utf-8" });
+        response.writeHead(405, { Allow: "GET, HEAD, POST, DELETE", "Content-Type": "application/json; charset=utf-8" });
         response.end(JSON.stringify({ error: "MCP endpoint only supports GET, POST, and DELETE" }));
         return;
       }
@@ -355,7 +383,7 @@ const httpServer = http.createServer(async (request, response) => {
       }
       setCorsHeaders(response);
       response.setHeader("MCP-Session-Id", headerSessionId || crypto.randomUUID());
-      response.setHeader("Access-Control-Expose-Headers", "MCP-Protocol-Version, MCP-Session-Id");
+      response.setHeader("Access-Control-Expose-Headers", "WWW-Authenticate, MCP-Protocol-Version, MCP-Session-Id");
       response.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
       response.end(JSON.stringify(isBatch ? responses : responses[0]));
       return;
@@ -364,6 +392,20 @@ const httpServer = http.createServer(async (request, response) => {
     if (reqUrl.pathname.startsWith("/api/")) {
       if (!isPanelAuthorized(request)) {
         sendJson(response, 401, { error: "控制台未授权，请输入管理密码" });
+        return;
+      }
+      if (request.method === "GET" && reqUrl.pathname === "/api/oauth/info") {
+        sendJson(response, 200, getOAuthPanelInfo(request));
+        return;
+      }
+      if (request.method === "POST" && reqUrl.pathname === "/api/oauth/settings") {
+        try {
+          const body = await readRequestBody(request);
+          const allowedRedirectUris = await updateOAuthSettings({ allowedRedirectUris: body.allowedRedirectUris });
+          sendJson(response, 200, { success: true, allowedRedirectUris });
+        } catch (error) {
+          sendJson(response, 400, { error: error.message });
+        }
         return;
       }
       if (request.method === "GET" && reqUrl.pathname === "/api/logs") {
