@@ -9,7 +9,7 @@ const __filename = fileURLToPath(import.meta.url);
 export const PROJECT_ROOT = path.resolve(path.dirname(__filename), "..");
 
 export const PORT = Number(process.env.PORT || 10000);
-export const ACCESS_KEY = (process.env.MCP_API_KEY || process.env.PROXY_API_KEY || process.env.PANEL_PASSWORD || "").trim();
+export const ACCESS_KEY = (process.env.ACCESS_KEY || process.env.MCP_API_KEY || process.env.PROXY_API_KEY || process.env.PANEL_PASSWORD || "").trim();
 export const API_ACCESS_KEY = ACCESS_KEY;
 export const PANEL_PASSWORD = ACCESS_KEY;
 export const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
