@@ -7,7 +7,7 @@ services:
     startCommand: npm start
     healthCheckPath: /health
     envVars:
-      - key: MCP_API_KEY
+      - key: ACCESS_KEY
         sync: false
       - key: DATABASE_URL
         sync: false
