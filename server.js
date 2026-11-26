@@ -4,7 +4,8 @@ import http from "node:http";
 import path from "node:path";
 import {
   PORT,
-  PANEL_PASSWORD,
+  ACCESS_KEY,
+  safeEqual,
   GITHUB_TOKEN,
   PROJECT_ROOT,
   dbPool,
@@ -230,7 +231,7 @@ const httpServer = http.createServer(async (request, response) => {
 
     if ((request.method === "GET" || request.method === "HEAD") && (reqUrl.pathname === "/" || reqUrl.pathname === "")) {
       setCorsHeaders(response);
-      if (PANEL_PASSWORD && !verifySessionToken(parseCookies(request).panel_auth)) {
+      if (ACCESS_KEY && !verifySessionToken(parseCookies(request).panel_auth)) {
         response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
         response.end(request.method === "HEAD" ? "" : getLoginHtml());
         return;
@@ -259,7 +260,7 @@ const httpServer = http.createServer(async (request, response) => {
 
     if (request.method === "POST" && reqUrl.pathname === "/api/panel/login") {
       const body = await readRequestBody(request);
-      if (!PANEL_PASSWORD || body.password === PANEL_PASSWORD) {
+      if (!ACCESS_KEY || safeEqual(String(body.password || "").trim(), ACCESS_KEY)) {
         const token = generateSessionToken();
         setCorsHeaders(response);
         response.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Set-Cookie": `panel_auth=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000` });

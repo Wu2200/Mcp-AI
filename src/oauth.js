@@ -3,8 +3,8 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   PROJECT_ROOT,
-  API_ACCESS_KEY,
-  PANEL_PASSWORD,
+  ACCESS_KEY,
+  safeEqual,
   PUBLIC_BASE_URL,
   OAUTH_CLIENT_ID,
   OAUTH_CLIENT_SECRET,
@@ -39,12 +39,6 @@ const oauthState = {
 const pendingAuthorizations = new Map();
 const authorizationCodes = new Map();
 const revokedJtis = new Map();
-
-function safeEqual(a, b) {
-  const bufA = Buffer.from(String(a ?? ""), "utf8");
-  const bufB = Buffer.from(String(b ?? ""), "utf8");
-  return bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB);
-}
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({
@@ -92,8 +86,8 @@ function getSigningKey() {
   if (OAUTH_SIGNING_SECRET) {
     return crypto.createHash("sha256").update(`mcp-ai-oauth-secret:${OAUTH_SIGNING_SECRET}`).digest();
   }
-  if (PANEL_PASSWORD || API_ACCESS_KEY) {
-    return crypto.createHash("sha256").update(`mcp-ai-oauth-derived:${PANEL_PASSWORD}:${API_ACCESS_KEY}`).digest();
+  if (ACCESS_KEY) {
+    return crypto.createHash("sha256").update(`mcp-ai-oauth-derived:${ACCESS_KEY}:${ACCESS_KEY}`).digest();
   }
   if (!oauthState.signingSecret) {
     oauthState.signingSecret = crypto.randomBytes(32).toString("hex");
@@ -135,7 +129,7 @@ export async function loadOAuthStateFromStorage() {
       oauthState.clients = stored.clients;
     }
   }
-  if (!OAUTH_SIGNING_SECRET && !PANEL_PASSWORD && !API_ACCESS_KEY && !oauthState.signingSecret) {
+  if (!OAUTH_SIGNING_SECRET && !ACCESS_KEY && !oauthState.signingSecret) {
     oauthState.signingSecret = crypto.randomBytes(32).toString("hex");
     changed = true;
   }
@@ -143,7 +137,7 @@ export async function loadOAuthStateFromStorage() {
 }
 
 export function isMcpAuthRequired() {
-  return Boolean(API_ACCESS_KEY || OAUTH_CLIENT_ID || OAUTH_CLIENT_SECRET || OAUTH_REQUIRED);
+  return Boolean(ACCESS_KEY || OAUTH_CLIENT_ID || OAUTH_CLIENT_SECRET || OAUTH_REQUIRED);
 }
 
 export function getPublicOrigin(request) {
@@ -322,14 +316,14 @@ export function verifyMcpBearerAuth(request, reqUrl) {
   const bearerMatch = authHeader.match(/^Bearer\s+(.+)$/i);
   const bearerToken = bearerMatch ? bearerMatch[1].trim() : "";
 
-  if (API_ACCESS_KEY) {
-    if (queryToken && safeEqual(queryToken, API_ACCESS_KEY)) {
+  if (ACCESS_KEY) {
+    if (queryToken && safeEqual(queryToken, ACCESS_KEY)) {
       return { authorized: true, method: "api_key" };
     }
-    if (headerKey && safeEqual(headerKey, API_ACCESS_KEY)) {
+    if (headerKey && safeEqual(headerKey, ACCESS_KEY)) {
       return { authorized: true, method: "api_key" };
     }
-    if (bearerToken && safeEqual(bearerToken, API_ACCESS_KEY)) {
+    if (bearerToken && safeEqual(bearerToken, ACCESS_KEY)) {
       return { authorized: true, method: "api_key" };
     }
   }
@@ -462,7 +456,7 @@ function renderAuthorizePage(response, { txId, tx, requirePassword, hasPanelSess
   try {
     redirectHost = new URL(tx.redirectUri).host;
   } catch {}
-  const passwordLabel = PANEL_PASSWORD ? "管理密码" : "访问密钥";
+  const passwordLabel = "访问密码";
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -792,8 +786,8 @@ function handleAuthorizeGet(request, response, reqUrl) {
   };
   pendingAuthorizations.set(txId, tx);
 
-  const requirePassword = Boolean(PANEL_PASSWORD || API_ACCESS_KEY);
-  const hasPanelSession = Boolean(PANEL_PASSWORD && verifySessionToken(parseCookies(request).panel_auth));
+  const requirePassword = Boolean(ACCESS_KEY);
+  const hasPanelSession = Boolean(ACCESS_KEY && verifySessionToken(parseCookies(request).panel_auth));
   renderAuthorizePage(response, { txId, tx, requirePassword, hasPanelSession });
 }
 
@@ -828,12 +822,10 @@ async function handleAuthorizePost(request, response) {
     return;
   }
 
-  const requirePassword = Boolean(PANEL_PASSWORD || API_ACCESS_KEY);
-  const hasPanelSession = Boolean(PANEL_PASSWORD && verifySessionToken(parseCookies(request).panel_auth));
+  const requirePassword = Boolean(ACCESS_KEY);
+  const hasPanelSession = Boolean(ACCESS_KEY && verifySessionToken(parseCookies(request).panel_auth));
   if (requirePassword && !hasPanelSession) {
-    const validPanelPassword = Boolean(PANEL_PASSWORD && safeEqual(password, PANEL_PASSWORD));
-    const validApiKey = Boolean(API_ACCESS_KEY && safeEqual(password, API_ACCESS_KEY));
-    if (!validPanelPassword && !validApiKey) {
+    if (!safeEqual(password, ACCESS_KEY)) {
       renderAuthorizePage(response, {
         txId,
         tx,

@@ -9,8 +9,9 @@ const __filename = fileURLToPath(import.meta.url);
 export const PROJECT_ROOT = path.resolve(path.dirname(__filename), "..");
 
 export const PORT = Number(process.env.PORT || 10000);
-export const API_ACCESS_KEY = (process.env.MCP_API_KEY || process.env.PROXY_API_KEY || "").trim();
-export const PANEL_PASSWORD = (process.env.PANEL_PASSWORD || "").trim();
+export const ACCESS_KEY = (process.env.MCP_API_KEY || process.env.PROXY_API_KEY || process.env.PANEL_PASSWORD || "").trim();
+export const API_ACCESS_KEY = ACCESS_KEY;
+export const PANEL_PASSWORD = ACCESS_KEY;
 export const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
 export const GITHUB_TOKEN = (process.env.GITHUB_TOKEN || "").trim();
 export const GITHUB_API_URL = (process.env.GITHUB_API_URL || "https://api.github.com").trim().replace(/\/+$/, "");
@@ -186,45 +187,58 @@ export function sendJson(response, statusCode, body) {
   response.end(JSON.stringify(body));
 }
 
+export function safeEqual(a, b) {
+  const bufA = Buffer.from(String(a ?? ""), "utf8");
+  const bufB = Buffer.from(String(b ?? ""), "utf8");
+  return bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB);
+}
+
 export function isApiAuthorized(request) {
-  if (!API_ACCESS_KEY) return true;
+  if (!ACCESS_KEY) return true;
   const requestUrl = new URL(request.url, `http://${request.headers.host || "localhost"}`);
-  const queryToken = requestUrl.searchParams.get("key") || requestUrl.searchParams.get("token") || requestUrl.searchParams.get("api_key") || "";
-  if (queryToken.trim() === API_ACCESS_KEY) return true;
-  const headerToken = request.headers["x-api-key"] || request.headers["api-key"] || request.headers["x-goog-api-key"] || "";
-  if (headerToken.trim() === API_ACCESS_KEY) return true;
-  return (request.headers.authorization || "").replace(/^Bearer\s+/i, "").trim() === API_ACCESS_KEY;
+  const queryToken = (requestUrl.searchParams.get("key") || requestUrl.searchParams.get("token") || requestUrl.searchParams.get("api_key") || "").trim();
+  if (queryToken && safeEqual(queryToken, ACCESS_KEY)) return true;
+  const headerToken = String(request.headers["x-api-key"] || request.headers["api-key"] || request.headers["x-goog-api-key"] || "").trim();
+  if (headerToken && safeEqual(headerToken, ACCESS_KEY)) return true;
+  const bearerToken = String(request.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
+  return Boolean(bearerToken && safeEqual(bearerToken, ACCESS_KEY));
 }
 
 export function isPanelAuthorized(request) {
-  if (!PANEL_PASSWORD) return true;
+  if (!ACCESS_KEY) return true;
   if (verifySessionToken(parseCookies(request).panel_auth)) return true;
-  return String(request.headers["x-panel-password"] || "").trim() === PANEL_PASSWORD;
+  const panelHeader = String(request.headers["x-panel-password"] || "").trim();
+  if (panelHeader && safeEqual(panelHeader, ACCESS_KEY)) return true;
+  const apiHeader = String(request.headers["x-api-key"] || request.headers["api-key"] || "").trim();
+  if (apiHeader && safeEqual(apiHeader, ACCESS_KEY)) return true;
+  const authHeader = String(request.headers.authorization || "").trim();
+  const bearerMatch = authHeader.match(/^Bearer\s+(.+)$/i);
+  return Boolean(bearerMatch && safeEqual(bearerMatch[1].trim(), ACCESS_KEY));
 }
 
-const SESSION_SECRET = PANEL_PASSWORD
-  ? crypto.createHash("sha256").update(`mcp-ai-session:${PANEL_PASSWORD}`).digest("hex")
+const SESSION_SECRET = ACCESS_KEY
+  ? crypto.createHash("sha256").update(`mcp-ai-session:${ACCESS_KEY}`).digest("hex")
   : crypto.randomBytes(32).toString("hex");
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 export function generateSessionToken() {
-  const payload = `auth:${PANEL_PASSWORD}:${Date.now()}`;
+  const payload = `auth:${Date.now()}`;
   const signature = crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("hex");
   return Buffer.from(`${payload}:${signature}`).toString("base64url");
 }
 
 export function verifySessionToken(token) {
-  if (!PANEL_PASSWORD) return true;
+  if (!ACCESS_KEY) return true;
   if (!token) return false;
   try {
     const parts = Buffer.from(token, "base64url").toString("utf8").split(":");
-    if (parts.length !== 4 || parts[0] !== "auth" || parts[1] !== PANEL_PASSWORD) return false;
-    const issuedAt = Number(parts[2]);
+    if (parts.length !== 3 || parts[0] !== "auth") return false;
+    const issuedAt = Number(parts[1]);
     const now = Date.now();
     if (!Number.isFinite(issuedAt) || issuedAt <= 0 || now - issuedAt > SESSION_TTL_MS || issuedAt > now + 60000) return false;
-    const payload = `${parts[0]}:${parts[1]}:${parts[2]}`;
+    const payload = `${parts[0]}:${parts[1]}`;
     const expected = Buffer.from(crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("hex"));
-    const actual = Buffer.from(parts[3]);
+    const actual = Buffer.from(parts[2]);
     return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
   } catch {
     return false;
